@@ -1,0 +1,2 @@
+python-dotenv>=1.0  # Load .env file into environment variables
+google-genai>=1.0   # Gemini API client (replaces deprecated google-generativeai)
