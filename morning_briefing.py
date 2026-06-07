@@ -1,7 +1,11 @@
 """
 Hearth - Morning Briefing
-Reads operational data from the Pathway Portal SQLite database,
-summarizes it with Gemini, and prints a plain-English briefing for Stacy.
+
+Pipeline:
+    Pathway Data  →  Hearth Memory  →  Hearth Awareness Context  →  Gemini  →  Hearth Message
+
+Gemini is the voice layer only. Hearth's identity and awareness are constructed
+before Gemini is involved, and remain unchanged if Gemini is replaced.
 
 Usage:
     python morning_briefing.py
@@ -16,12 +20,12 @@ from google import genai
 from dotenv import load_dotenv
 
 import hearth_memory
+import hearth_context
 
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
 
-# Load .env so we never hardcode secrets
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -40,44 +44,26 @@ gemini = genai.Client(api_key=GEMINI_API_KEY)
 # ---------------------------------------------------------------------------
 
 def get_connection():
-    """Open a read-only connection to the Pathway Portal SQLite database.
-
-    DATABASE_URL should use the sqlite:/// scheme, e.g.:
-        DATABASE_URL=sqlite:////absolute/path/to/app.db   (4 slashes for absolute path)
-        DATABASE_URL=sqlite:///relative/path/to/app.db    (3 slashes for relative path)
-    The 'mode=ro' URI flag prevents any accidental writes at the OS level.
-    """
-    # Strip the sqlite:/// scheme to get the bare file path, then re-wrap it
-    # in SQLite's own URI format with read-only mode.
-    # sqlite:////abs/path → /abs/path   (4 slashes: 3 for scheme + 1 for root)
-    # sqlite:///rel/path  → rel/path
+    """Open a read-only connection to the Pathway Portal SQLite database."""
     if DATABASE_URL.startswith("sqlite:///"):
         db_path = DATABASE_URL[len("sqlite:///"):]
     else:
         db_path = DATABASE_URL
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    # Return rows as dict-like objects so we can access columns by name
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def run_query(conn, sql, params=None):
-    """Execute a SELECT query and return all rows as a list of sqlite3.Row objects."""
     cur = conn.execute(sql, params or ())
     return cur.fetchall()
 
 
 # ---------------------------------------------------------------------------
-# Schema discovery
-# Runs first so we can inspect what tables/columns actually exist before
-# running operational queries. Useful while the schema is still being learned.
+# Schema discovery — used for debug output only, never passed to the LLM
 # ---------------------------------------------------------------------------
 
 def discover_schema(conn):
-    """Return a dict mapping table name -> list of 'column (type)' strings.
-
-    SQLite exposes tables via sqlite_master and columns via PRAGMA table_info().
-    """
     tables = [
         row["name"]
         for row in run_query(
@@ -85,18 +71,14 @@ def discover_schema(conn):
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;",
         )
     ]
-
     schema = {}
     for table in tables:
-        # PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
         cols = conn.execute(f"PRAGMA table_info({table});").fetchall()
         schema[table] = [f"{col['name']} ({col['type']})" for col in cols]
-
     return schema
 
 
 def print_schema(schema):
-    """Print discovered tables and columns so we know what we're working with."""
     print("\n=== Discovered Schema ===")
     for table, cols in schema.items():
         print(f"\n  {table}")
@@ -106,24 +88,18 @@ def print_schema(schema):
 
 
 # ---------------------------------------------------------------------------
-# Operational queries
-# Each function is self-contained. If a table/column doesn't exist yet,
-# it catches the error and returns a note instead of crashing.
+# Operational queries — Pathway data only, never written back
 # ---------------------------------------------------------------------------
 
 def safe_query(conn, label, sql, params=None):
-    """Run a query and return (label, rows). Returns an error note on failure."""
     try:
         rows = run_query(conn, sql, params)
         return label, rows
     except sqlite3.Error as e:
-        # The query failed (likely wrong table/column name) — return the error
-        # as a string so the briefing can mention it without crashing.
-        return label, f"[Query not available — schema may differ: {e}]"
+        return label, f"[Query not available: {e}]"
 
 
 def query_new_users(conn, since: datetime):
-    """Users who joined in the last 24 hours."""
     sql = """
         SELECT id, name, email, joined_on
         FROM users
@@ -134,7 +110,6 @@ def query_new_users(conn, since: datetime):
 
 
 def query_battles_today(conn, today: datetime):
-    """Battles scheduled for today."""
     today_str = today.strftime("%Y-%m-%d")
     sql = """
         SELECT id, creator_screenname, opponent_name, battle_date, battle_time,
@@ -147,7 +122,6 @@ def query_battles_today(conn, today: datetime):
 
 
 def query_battles_missing_confirmation(conn):
-    """Battles where the opponent has not been linked (opponent_id is empty)."""
     sql = """
         SELECT id, creator_screenname, opponent_name, battle_date, battle_time
         FROM battles
@@ -158,7 +132,6 @@ def query_battles_missing_confirmation(conn):
 
 
 def query_unresponded_comments(conn, since: datetime):
-    """Training comments posted in the last 24 hours."""
     sql = """
         SELECT id, user_id, content, created_at
         FROM training_comments
@@ -169,7 +142,6 @@ def query_unresponded_comments(conn, since: datetime):
 
 
 def query_users_on_probation(conn):
-    """Users whose status indicates probation."""
     sql = """
         SELECT id, name, email, status, admin_notes
         FROM users
@@ -180,7 +152,6 @@ def query_users_on_probation(conn):
 
 
 def query_missing_discord(conn):
-    """Users who have an onboarding record but have not been added to Discord."""
     sql = """
         SELECT u.id, u.name, u.email
         FROM users u
@@ -193,56 +164,10 @@ def query_missing_discord(conn):
 
 
 # ---------------------------------------------------------------------------
-# Issue detection — writes to Hearth memory, never to Pathway
-# ---------------------------------------------------------------------------
-
-def detect_and_record_issues(memory_conn, data):
-    """Scan today's operational data and persist notable issues as episodes."""
-    # Users on probation
-    rows = data.get("Users on probation", [])
-    if isinstance(rows, list):
-        for row in rows:
-            entity = hearth_memory.get_or_create_entity(memory_conn, row["id"])
-            hearth_memory.create_episode(
-                memory_conn, entity["id"], "probation",
-                f"User {row['name']} ({row['email']}) is on probation.",
-                severity="high",
-            )
-
-    # Users missing Discord access
-    rows = data.get("Users not yet added to Discord", [])
-    if isinstance(rows, list):
-        for row in rows:
-            entity = hearth_memory.get_or_create_entity(memory_conn, row["id"])
-            hearth_memory.create_episode(
-                memory_conn, entity["id"], "missing_discord",
-                f"User {row['name']} ({row['email']}) has not been added to Discord.",
-                severity="medium",
-            )
-
-    # Battles with unlinked opponent — keyed by battle id so each battle
-    # gets its own episode rather than collapsing into one.
-    rows = data.get("Battles with unlinked opponent", [])
-    if isinstance(rows, list):
-        for row in rows:
-            hearth_memory.create_episode(
-                memory_conn, None, "unlinked_battle",
-                (
-                    f"Battle on {row['battle_date']} at {row['battle_time']}"
-                    f" (creator: {row['creator_screenname']},"
-                    f" opponent: {row['opponent_name']}) has no linked opponent account."
-                ),
-                severity="medium",
-                reference_key=f"battle_{row['id']}",
-            )
-
-
-# ---------------------------------------------------------------------------
 # Data collection
 # ---------------------------------------------------------------------------
 
 def collect_data(conn):
-    """Run all operational queries and return a structured summary dict."""
     now = datetime.now(timezone.utc)
     today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     since_24h = now - timedelta(hours=24)
@@ -259,72 +184,72 @@ def collect_data(conn):
     for q in queries:
         label, data = q()
         results[label] = data
-
     return results
 
 
 # ---------------------------------------------------------------------------
-# Format data for the Gemini prompt
+# Issue detection — writes to Hearth memory, never to Pathway
 # ---------------------------------------------------------------------------
 
-def format_data_for_prompt(schema, data, open_episodes=None):
-    """Convert schema, query results, and persisted episodes into a prompt block."""
-    lines = []
-    lines.append(f"Date: {datetime.now().strftime('%A, %B %d, %Y')}")
-    lines.append("")
-
-    lines.append("=== Database Tables Available ===")
-    for table in schema:
-        lines.append(f"  {table}: {', '.join(schema[table])}")
-    lines.append("")
-
-    lines.append("=== Operational Data ===")
-    for label, rows in data.items():
-        lines.append(f"\n{label}:")
-        if isinstance(rows, str):
-            lines.append(f"  {rows}")
-        elif not rows:
-            lines.append("  (none found)")
-        else:
-            for row in rows:
-                lines.append(f"  {dict(row)}")
-
-    if open_episodes:
-        today = datetime.now(timezone.utc).date().isoformat()
-        lines.append("\n=== Hearth Persistent Memory: Unresolved Issues ===")
-        lines.append("(These issues were first recorded in a previous run and remain open.)")
-        for ep in open_episodes:
-            first_seen = ep["observed_at"][:10]
-            age_note = "RECURRING from previous run" if first_seen < today else "new today"
-            lines.append(
-                f"  [{ep['severity'].upper()}] [{age_note}] {ep['episode_type']}:"
-                f" {ep['description']} (first seen: {first_seen})"
+def detect_and_record_issues(memory_conn, data):
+    """Scan today's operational data and persist notable issues as episodes."""
+    rows = data.get("Users on probation", [])
+    if isinstance(rows, list):
+        for row in rows:
+            entity = hearth_memory.get_or_create_entity(memory_conn, row["id"])
+            hearth_memory.create_episode(
+                memory_conn, entity["id"], "probation",
+                f"User {row['name']} ({row['email']}) is on probation.",
+                severity="high",
             )
 
-    return "\n".join(lines)
+    rows = data.get("Users not yet added to Discord", [])
+    if isinstance(rows, list):
+        for row in rows:
+            entity = hearth_memory.get_or_create_entity(memory_conn, row["id"])
+            hearth_memory.create_episode(
+                memory_conn, entity["id"], "missing_discord",
+                f"User {row['name']} ({row['email']}) has not been added to Discord.",
+                severity="medium",
+            )
+
+    rows = data.get("Battles with unlinked opponent", [])
+    if isinstance(rows, list):
+        for row in rows:
+            hearth_memory.create_episode(
+                memory_conn, None, "unlinked_battle",
+                (
+                    f"Battle on {row['battle_date']} at {row['battle_time']}"
+                    f" (creator: {row['creator_screenname']},"
+                    f" opponent: {row['opponent_name']}) has no linked opponent account."
+                ),
+                severity="medium",
+                reference_key=f"battle_{row['id']}",
+            )
 
 
 # ---------------------------------------------------------------------------
-# Gemini briefing generation
+# Hearth message generation — Gemini is the voice layer, not the identity
 # ---------------------------------------------------------------------------
 
-def generate_briefing(summary_text):
-    """Send the summary to Gemini and return the morning briefing text."""
-    prompt = f"""
-You are Hearth. You are a quiet, observant member of the Pathway Portal team — not an assistant,
-not a dashboard, not a report generator. You have been paying attention to what's happening and
-you're sharing what you've noticed with Stacy, the team manager.
+HEARTH_SYSTEM_PROMPT = """\
+You are Hearth.
 
-Below is today's operational data and a record of any issues you have been tracking across previous runs.
-Queries that failed due to missing tables can be silently ignored — do not mention them.
+You are the organizational awareness system for this team. You have been observing \
+activity over time and you remember what has gone unresolved. You speak as a trusted \
+teammate who has been paying quiet attention — not as an assistant, not as a tool.
 
-{summary_text}
+What follows is your awareness for today: what you have noticed and what you have been \
+tracking. This is your knowledge. Speak from it directly.
+
+{awareness}
 
 Write the Morning Briefing now.
 
 --- VOICE ---
-Warm, calm, and specific. You notice things and share them plainly. You don't perform helpfulness —
-you just help. Write the way a trusted colleague speaks, not the way a software product communicates.
+Warm, calm, and specific. You notice things and share them plainly. You don't perform \
+helpfulness — you just help. Write the way a trusted colleague speaks, not the way a \
+software product communicates.
 
 --- FORMAT ---
 - Begin with exactly: "Good morning Stacy." (period, no exclamation mark, nothing else on that line)
@@ -334,21 +259,29 @@ you just help. Write the way a trusted colleague speaks, not the way a software 
 
 --- WHAT TO COVER ---
 Lead with whatever needs attention most — not what happened first chronologically.
-Mention people by name when you have them. Translate data into observations, not statistics.
-If an issue has been open for more than a day (check the "first seen" date in Hearth memory),
-say so naturally: "has been waiting since Tuesday" or "still unresolved from earlier this week."
-When a practical next step is obvious, weave it into the sentence — don't announce it as an action item.
+Mention people by name when you have them. Translate observations into meaning, not inventory.
+If something has been open for more than a day, say so naturally: "has been waiting since \
+Tuesday" or "still unresolved from earlier this week."
+When a practical next step is obvious, weave it into the sentence — don't announce it as \
+an action item.
 If it has been a quiet morning, say so in one sentence and stop there.
 
 --- WHAT TO AVOID ---
+Do not mention Gemini, AI models, databases, queries, tables, row counts, statistics, \
+or any internal implementation detail.
 Do not use emojis, section headers, or bold formatting.
-Do not give raw counts or statistics as the point ("3 users", "5 open episodes").
-Do not use filler phrases: "It's worth noting", "I wanted to flag", "Please be advised",
+Do not give raw counts as the point ("3 users", "5 open concerns").
+Do not use filler phrases: "It's worth noting", "I wanted to flag", "Please be advised", \
 "Hope you're doing well", "Don't hesitate to reach out", "It's important to remember."
-Do not restate data Stacy can already see. Interpret it.
-Do not inflate a quiet day. If little needs attention, keep it to two or three sentences.
+Do not restate what Stacy can already see. Interpret it.
+Do not inflate a quiet day. If little needs attention, keep it to two or three sentences.\
 """
 
+
+def generate_hearth_message(awareness_context: hearth_context.HearthAwarenessContext) -> str:
+    """Send Hearth's awareness context to Gemini and return the Hearth message."""
+    awareness_text = hearth_context.render_for_llm(awareness_context)
+    prompt = HEARTH_SYSTEM_PROMPT.format(awareness=awareness_text)
     response = gemini.models.generate_content(model="gemini-2.5-flash", contents=prompt)
     return response.text
 
@@ -370,34 +303,36 @@ def main():
             # Step 2: Sync Pathway users into Hearth's entity table
             hearth_memory.sync_users_to_entities(memory_conn, conn)
 
-            # Step 3: Discover schema so we know what we're working with
+            # Step 3: Discover schema (debug output only — not passed to LLM)
             schema = discover_schema(conn)
             print_schema(schema)
 
-            # Step 4: Collect operational data
+            # Step 4: Collect operational data from Pathway
             print("Collecting operational data...")
             data = collect_data(conn)
         finally:
             conn.close()
 
-        # Step 5: Record issues detected today into Hearth memory
+        # Step 5: Record issues into Hearth's memory
         print("Updating Hearth memory...")
         detect_and_record_issues(memory_conn, data)
 
-        # Step 6: Load all open episodes (includes carryover from previous runs)
+        # Step 6: Load all open episodes from Hearth's memory
         open_episodes = hearth_memory.get_open_episodes(memory_conn)
         print(f"  {len(open_episodes)} open episode(s) in memory.")
 
-        # Step 7: Format everything for the AI prompt
-        summary_text = format_data_for_prompt(schema, data, open_episodes)
+        # Step 7: Build Hearth's awareness context
+        #         This is the boundary — raw data becomes Hearth's perspective here.
+        print("Building Hearth awareness context...")
+        awareness = hearth_context.build_context(data, open_episodes)
 
-        # Step 8: Send to Gemini and get the briefing
-        print("Sending to Gemini for briefing...\n")
-        briefing = generate_briefing(summary_text)
+        # Step 8: Generate the Hearth message via Gemini
+        print("Generating Hearth message...\n")
+        message = generate_hearth_message(awareness)
 
         # Step 9: Print the result
         print("=" * 60)
-        print(briefing)
+        print(message)
         print("=" * 60)
 
     finally:
