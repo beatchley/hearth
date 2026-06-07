@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 from google import genai
 from dotenv import load_dotenv
 
+import hearth_memory
+
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
@@ -191,6 +193,51 @@ def query_missing_discord(conn):
 
 
 # ---------------------------------------------------------------------------
+# Issue detection — writes to Hearth memory, never to Pathway
+# ---------------------------------------------------------------------------
+
+def detect_and_record_issues(memory_conn, data):
+    """Scan today's operational data and persist notable issues as episodes."""
+    # Users on probation
+    rows = data.get("Users on probation", [])
+    if isinstance(rows, list):
+        for row in rows:
+            entity = hearth_memory.get_or_create_entity(memory_conn, row["id"])
+            hearth_memory.create_episode(
+                memory_conn, entity["id"], "probation",
+                f"User {row['name']} ({row['email']}) is on probation.",
+                severity="high",
+            )
+
+    # Users missing Discord access
+    rows = data.get("Users not yet added to Discord", [])
+    if isinstance(rows, list):
+        for row in rows:
+            entity = hearth_memory.get_or_create_entity(memory_conn, row["id"])
+            hearth_memory.create_episode(
+                memory_conn, entity["id"], "missing_discord",
+                f"User {row['name']} ({row['email']}) has not been added to Discord.",
+                severity="medium",
+            )
+
+    # Battles with unlinked opponent — keyed by battle id so each battle
+    # gets its own episode rather than collapsing into one.
+    rows = data.get("Battles with unlinked opponent", [])
+    if isinstance(rows, list):
+        for row in rows:
+            hearth_memory.create_episode(
+                memory_conn, None, "unlinked_battle",
+                (
+                    f"Battle on {row['battle_date']} at {row['battle_time']}"
+                    f" (creator: {row['creator_screenname']},"
+                    f" opponent: {row['opponent_name']}) has no linked opponent account."
+                ),
+                severity="medium",
+                reference_key=f"battle_{row['id']}",
+            )
+
+
+# ---------------------------------------------------------------------------
 # Data collection
 # ---------------------------------------------------------------------------
 
@@ -220,8 +267,8 @@ def collect_data(conn):
 # Format data for the Gemini prompt
 # ---------------------------------------------------------------------------
 
-def format_data_for_prompt(schema, data):
-    """Convert schema and query results into a readable text block for Gemini."""
+def format_data_for_prompt(schema, data, open_episodes=None):
+    """Convert schema, query results, and persisted episodes into a prompt block."""
     lines = []
     lines.append(f"Date: {datetime.now().strftime('%A, %B %d, %Y')}")
     lines.append("")
@@ -235,13 +282,24 @@ def format_data_for_prompt(schema, data):
     for label, rows in data.items():
         lines.append(f"\n{label}:")
         if isinstance(rows, str):
-            # It's an error/unavailable message
             lines.append(f"  {rows}")
         elif not rows:
             lines.append("  (none found)")
         else:
             for row in rows:
                 lines.append(f"  {dict(row)}")
+
+    if open_episodes:
+        today = datetime.now(timezone.utc).date().isoformat()
+        lines.append("\n=== Hearth Persistent Memory: Unresolved Issues ===")
+        lines.append("(These issues were first recorded in a previous run and remain open.)")
+        for ep in open_episodes:
+            first_seen = ep["observed_at"][:10]
+            age_note = "RECURRING from previous run" if first_seen < today else "new today"
+            lines.append(
+                f"  [{ep['severity'].upper()}] [{age_note}] {ep['episode_type']}:"
+                f" {ep['description']} (first seen: {first_seen})"
+            )
 
     return "\n".join(lines)
 
@@ -256,7 +314,9 @@ def generate_briefing(summary_text):
 You are Hearth, an always-on AI teammate that helps small teams stay organized and informed.
 You are generating a Morning Briefing for Stacy, the team manager.
 
-Below is today's operational data pulled from the Pathway Portal database.
+Below is today's operational data pulled from the Pathway Portal database, followed by
+Hearth's persistent memory of unresolved issues from previous runs.
+
 Some queries may show errors if a table doesn't exist — note those as "data unavailable" rather than a concern.
 
 {summary_text}
@@ -270,10 +330,11 @@ Good morning Stacy,
 
 **Potential Concerns**
 (Anything that may need attention: missing confirmations, probation, missing Discord access, etc.
-Skip items where data was unavailable.)
+For any issue marked RECURRING in the persistent memory section, explicitly note how long it has
+been open, e.g. "still unresolved since June 5th." Skip items where data was unavailable.)
 
 **Recommended Follow-Up Actions**
-(3–5 specific, actionable steps Stacy should consider today.)
+(3–5 specific, actionable steps Stacy should consider today. Prioritize recurring issues.)
 
 Keep the tone friendly and supportive. Be concise — bullet points are fine.
 If data was unavailable for a section, briefly acknowledge it and move on.
@@ -290,30 +351,48 @@ If data was unavailable for a section, briefly acknowledge it and move on.
 def main():
     print("Hearth Morning Briefing — connecting to Pathway Portal...")
 
-    conn = get_connection()
+    memory_conn = hearth_memory.get_memory_connection()
     try:
-        # Step 1: Discover schema so we know what we're working with
-        schema = discover_schema(conn)
-        print_schema(schema)
+        # Step 1: Initialize Hearth's memory tables
+        hearth_memory.init_tables(memory_conn)
 
-        # Step 2: Collect operational data
-        print("Collecting operational data...")
-        data = collect_data(conn)
+        conn = get_connection()
+        try:
+            # Step 2: Sync Pathway users into Hearth's entity table
+            hearth_memory.sync_users_to_entities(memory_conn, conn)
 
-        # Step 3: Format everything for the AI prompt
-        summary_text = format_data_for_prompt(schema, data)
+            # Step 3: Discover schema so we know what we're working with
+            schema = discover_schema(conn)
+            print_schema(schema)
 
-        # Step 4: Send to Gemini and get the briefing
+            # Step 4: Collect operational data
+            print("Collecting operational data...")
+            data = collect_data(conn)
+        finally:
+            conn.close()
+
+        # Step 5: Record issues detected today into Hearth memory
+        print("Updating Hearth memory...")
+        detect_and_record_issues(memory_conn, data)
+
+        # Step 6: Load all open episodes (includes carryover from previous runs)
+        open_episodes = hearth_memory.get_open_episodes(memory_conn)
+        print(f"  {len(open_episodes)} open episode(s) in memory.")
+
+        # Step 7: Format everything for the AI prompt
+        summary_text = format_data_for_prompt(schema, data, open_episodes)
+
+        # Step 8: Send to Gemini and get the briefing
         print("Sending to Gemini for briefing...\n")
         briefing = generate_briefing(summary_text)
 
-        # Step 5: Print the result
+        # Step 9: Print the result
         print("=" * 60)
         print(briefing)
         print("=" * 60)
 
     finally:
-        conn.close()
+        memory_conn.close()
 
 
 if __name__ == "__main__":
