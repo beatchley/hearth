@@ -18,3 +18,4 @@ build/
 # IDE
 .vscode/
 .idea/
+*.db
