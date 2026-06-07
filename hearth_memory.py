@@ -8,7 +8,7 @@ SQLite file (hearth_memory.db) and never writes to Pathway tables.
 
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 MEMORY_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hearth_memory.db")
 
@@ -223,6 +223,34 @@ def get_recent_episodes(memory_conn, limit=50):
     ).fetchall()
 
 
+def resolve_episode(memory_conn, episode_id, resolved_at=None):
+    """Mark a single episode as resolved. Idempotent — safe to call twice."""
+    if resolved_at is None:
+        resolved_at = datetime.now(timezone.utc).isoformat()
+    memory_conn.execute(
+        "UPDATE hearth_episodes SET resolved = 1, resolved_at = ?"
+        " WHERE id = ? AND resolved = 0;",
+        (resolved_at, episode_id),
+    )
+    memory_conn.commit()
+
+
+def get_recent_resolutions(memory_conn, hours=24):
+    """Return episodes resolved in the last N hours, joined to entity display_name.
+
+    Used by the context builder so Hearth can mention positive progress alongside
+    open concerns rather than only ever surfacing problems.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    return memory_conn.execute(
+        "SELECT e.*, en.user_id, en.display_name FROM hearth_episodes e"
+        " LEFT JOIN hearth_entities en ON en.id = e.entity_id"
+        " WHERE e.resolved = 1 AND e.resolved_at >= ?"
+        " ORDER BY e.resolved_at DESC;",
+        (since,),
+    ).fetchall()
+
+
 # ---------------------------------------------------------------------------
 # Observation processor — builds learned memory from episode history
 # ---------------------------------------------------------------------------
@@ -246,6 +274,7 @@ def _build_entity_summary(all_episodes, open_episodes, type_counts, patterns):
 
     Only states what the episode record supports. Never asserts character,
     motivation, or anything not directly derivable from observed events.
+    Includes resolved history so the summary reflects the full lifecycle.
     """
     parts = []
 
@@ -255,14 +284,25 @@ def _build_entity_summary(all_episodes, open_episodes, type_counts, patterns):
     if patterns:
         parts.append("Recurring: " + "; ".join(patterns) + ".")
 
+    resolved_episodes = [e for e in all_episodes if e["resolved"]]
     open_count = len(open_episodes)
+
     if open_count == 0:
-        if len(all_episodes) > open_count:
+        if resolved_episodes:
+            resolved_labels = sorted({_episode_label(e["episode_type"]) for e in resolved_episodes})
+            parts.append(
+                f"Previously resolved: {'; '.join(resolved_labels)}. No current open concerns."
+            )
+        else:
             parts.append("No current open concerns.")
     elif open_count == 1:
         parts.append("1 open concern.")
+        if resolved_episodes:
+            parts.append(f"{len(resolved_episodes)} previously resolved.")
     else:
         parts.append(f"{open_count} open concerns.")
+        if resolved_episodes:
+            parts.append(f"{len(resolved_episodes)} previously resolved.")
 
     return " ".join(parts)
 

@@ -40,6 +40,16 @@ class OpenConcern:
 
 
 @dataclass
+class RecentResolution:
+    """An issue Hearth had been tracking that is now resolved — progress worth noting."""
+    description: str
+    episode_type: str
+    person_name: Optional[str]   # display_name of the linked person, if any
+    resolved_at: str             # ISO timestamp
+    days_open: int               # How long it was open before resolving
+
+
+@dataclass
 class PersonContext:
     """Hearth's accumulated knowledge about one person.
 
@@ -69,13 +79,19 @@ class PersonContext:
 class HearthAwarenessContext:
     """Hearth's complete awareness for a briefing moment."""
     date: str
-    observations: list = field(default_factory=list)         # List[Observation]
-    person_contexts: list = field(default_factory=list)      # List[PersonContext]
-    unattached_concerns: list = field(default_factory=list)  # List[OpenConcern] — no linked person
+    observations: list = field(default_factory=list)          # List[Observation]
+    person_contexts: list = field(default_factory=list)       # List[PersonContext]
+    unattached_concerns: list = field(default_factory=list)   # List[OpenConcern] — no linked person
+    recent_resolutions: list = field(default_factory=list)    # List[RecentResolution]
 
     @property
     def is_quiet(self):
-        return not self.observations and not self.person_contexts and not self.unattached_concerns
+        return (
+            not self.observations
+            and not self.person_contexts
+            and not self.unattached_concerns
+            and not self.recent_resolutions
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -238,11 +254,30 @@ def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAw
         [_make_concern(ep, today, today_str) for ep in unattached_eps]
     )
 
+    # Recent resolutions: issues Hearth was tracking that have since been fixed
+    recent_resolutions = []
+    if memory_conn:
+        for ep in hearth_memory.get_recent_resolutions(memory_conn, hours=24):
+            try:
+                opened = date.fromisoformat(ep["observed_at"][:10])
+                closed = date.fromisoformat(ep["resolved_at"][:10])
+                days_open = max(0, (closed - opened).days)
+            except (ValueError, TypeError):
+                days_open = 0
+            recent_resolutions.append(RecentResolution(
+                description=ep["description"],
+                episode_type=ep["episode_type"],
+                person_name=ep["display_name"] or None,
+                resolved_at=ep["resolved_at"],
+                days_open=days_open,
+            ))
+
     return HearthAwarenessContext(
         date=datetime.now().strftime("%A, %B %d, %Y"),
         observations=observations,
         person_contexts=person_contexts,
         unattached_concerns=unattached_concerns,
+        recent_resolutions=recent_resolutions,
     )
 
 
@@ -279,6 +314,18 @@ def render_for_llm(context: HearthAwarenessContext) -> str:
         lines.append("What I'm noticing today:")
         for obs in context.observations:
             lines.append(f"  - {obs.text}")
+        lines.append("")
+
+    if context.recent_resolutions:
+        lines.append("What's been resolved:")
+        for res in context.recent_resolutions:
+            if res.days_open > 1:
+                duration = f" (was open for {res.days_open} days)"
+            elif res.days_open == 1:
+                duration = " (was open since yesterday)"
+            else:
+                duration = ""
+            lines.append(f"  - {res.description}{duration}")
         lines.append("")
 
     if context.person_contexts:

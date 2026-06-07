@@ -182,6 +182,69 @@ def collect_data(conn):
 
 
 # ---------------------------------------------------------------------------
+# Resolution detection — closes episodes no longer present in Pathway
+# ---------------------------------------------------------------------------
+
+def resolve_stale_issues(memory_conn, data):
+    """
+    Compare current Pathway data against open Hearth episodes and resolve
+    any episode whose condition is no longer present.
+
+    Each episode type has a defined resolution condition:
+      probation      — user is no longer on probation
+      missing_discord — user now has Discord access
+      unlinked_battle — battle now has a linked opponent
+
+    If a query failed (returned a string instead of rows), that type is
+    skipped entirely so we never accidentally close valid open episodes
+    due to a schema difference.
+
+    Historical episodes are never deleted — resolved = 1 preserves them
+    for pattern detection and the full-lifecycle summary.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Build the set of user_ids still on probation
+    probation_rows = data.get("Users on probation", [])
+    if isinstance(probation_rows, list):
+        current_probation_ids = {row["id"] for row in probation_rows}
+    else:
+        current_probation_ids = None  # query failed — skip this type
+
+    # Build the set of user_ids still missing Discord
+    discord_rows = data.get("Users not yet added to Discord", [])
+    if isinstance(discord_rows, list):
+        current_missing_discord_ids = {row["id"] for row in discord_rows}
+    else:
+        current_missing_discord_ids = None
+
+    # Build the set of battle reference_keys still unlinked
+    battle_rows = data.get("Battles with unlinked opponent", [])
+    if isinstance(battle_rows, list):
+        current_unlinked_keys = {f"battle_{row['id']}" for row in battle_rows}
+    else:
+        current_unlinked_keys = None
+
+    for ep in hearth_memory.get_open_episodes(memory_conn):
+        ep_type = ep["episode_type"]
+        user_id = ep["user_id"]
+        ref_key = ep["reference_key"]
+        should_resolve = False
+
+        if ep_type == "probation" and current_probation_ids is not None:
+            should_resolve = user_id is not None and user_id not in current_probation_ids
+
+        elif ep_type == "missing_discord" and current_missing_discord_ids is not None:
+            should_resolve = user_id is not None and user_id not in current_missing_discord_ids
+
+        elif ep_type == "unlinked_battle" and current_unlinked_keys is not None:
+            should_resolve = ref_key is not None and ref_key not in current_unlinked_keys
+
+        if should_resolve:
+            hearth_memory.resolve_episode(memory_conn, ep["id"], now)
+
+
+# ---------------------------------------------------------------------------
 # Issue detection — writes to Hearth memory, never to Pathway
 # ---------------------------------------------------------------------------
 
@@ -307,6 +370,7 @@ def run_pipeline(db_path: str, gemini_api_key: str) -> str:
         finally:
             conn.close()
 
+        resolve_stale_issues(memory_conn, data)
         detect_and_record_issues(memory_conn, data)
         hearth_memory.process_all_entities(memory_conn)
         open_episodes = hearth_memory.get_open_episodes(memory_conn)
@@ -357,27 +421,30 @@ def main():
         finally:
             conn.close()
 
-        # Step 6: Record issues into Hearth's memory
+        # Step 6: Close episodes whose conditions are no longer present in Pathway
+        resolve_stale_issues(memory_conn, data)
+
+        # Step 7: Record new issues into Hearth's memory
         print("Updating Hearth memory...")
         detect_and_record_issues(memory_conn, data)
 
-        # Step 7: Update learned observations for all entities
+        # Step 8: Update learned observations for all entities
         hearth_memory.process_all_entities(memory_conn)
 
-        # Step 8: Load all open episodes from Hearth's memory
+        # Step 9: Load all open episodes from Hearth's memory
         open_episodes = hearth_memory.get_open_episodes(memory_conn)
         print(f"  {len(open_episodes)} open episode(s) in memory.")
 
-        # Step 9: Build Hearth's awareness context
+        # Step 10: Build Hearth's awareness context
         print("Building Hearth awareness context...")
         awareness = hearth_context.build_context(data, open_episodes, memory_conn)
 
-        # Step 10: Generate the Hearth message via Gemini
+        # Step 11: Generate the Hearth message via Gemini
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         print("Generating Hearth message...\n")
         message = generate_hearth_message(awareness, gemini_client=gemini_client)
 
-        # Step 11: Print the result
+        # Step 12: Print the result
         print("=" * 60)
         print(message)
         print("=" * 60)
