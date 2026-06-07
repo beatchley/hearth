@@ -36,6 +36,7 @@ def init_tables(conn):
         CREATE TABLE IF NOT EXISTS hearth_entities (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id          INTEGER UNIQUE,
+            display_name     TEXT,
             summary          TEXT,
             patterns_noticed TEXT,
             concerns         TEXT,
@@ -60,7 +61,12 @@ def init_tables(conn):
         CREATE INDEX IF NOT EXISTS idx_episodes_open
             ON hearth_episodes (episode_type, resolved);
     """)
-    conn.commit()
+    # Migrate existing databases: add display_name if the column isn't there yet
+    try:
+        conn.execute("ALTER TABLE hearth_entities ADD COLUMN display_name TEXT;")
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
 
 
 # ---------------------------------------------------------------------------
@@ -68,17 +74,23 @@ def init_tables(conn):
 # ---------------------------------------------------------------------------
 
 def sync_users_to_entities(memory_conn, pathway_conn):
-    """Ensure every current Pathway user has a hearth_entities row."""
+    """Ensure every current Pathway user has a hearth_entities row.
+
+    Caches display_name from Pathway as a convenience for rendering. This is
+    the only Pathway field stored here — everything else in hearth_entities is
+    Hearth's own learned memory, not a copy of Pathway's source of truth.
+    """
     try:
-        users = pathway_conn.execute("SELECT id FROM users;").fetchall()
+        users = pathway_conn.execute("SELECT id, name FROM users;").fetchall()
     except sqlite3.Error:
         return
     now = datetime.now(timezone.utc).isoformat()
     for user in users:
         memory_conn.execute(
-            "INSERT INTO hearth_entities (user_id, created_at) VALUES (?, ?)"
-            " ON CONFLICT(user_id) DO NOTHING;",
-            (user["id"], now),
+            "INSERT INTO hearth_entities (user_id, display_name, created_at)"
+            " VALUES (?, ?, ?)"
+            " ON CONFLICT(user_id) DO UPDATE SET display_name = excluded.display_name;",
+            (user["id"], user["name"], now),
         )
     memory_conn.commit()
 
@@ -99,6 +111,35 @@ def get_or_create_entity(memory_conn, user_id):
     return memory_conn.execute(
         "SELECT * FROM hearth_entities WHERE id = ?;", (cur.lastrowid,)
     ).fetchone()
+
+
+def get_entity_by_user_id(memory_conn, user_id):
+    """Return the hearth_entities row for a Pathway user_id, or None."""
+    return memory_conn.execute(
+        "SELECT * FROM hearth_entities WHERE user_id = ?;", (user_id,)
+    ).fetchone()
+
+
+def get_entity_context(memory_conn, entity_id):
+    """Return a dict with the entity row, its open episodes, and total episode count.
+
+    Used by the context builder to enrich PersonContext beyond what the open_episodes
+    query already carries. Returns None if the entity doesn't exist.
+    """
+    entity = memory_conn.execute(
+        "SELECT * FROM hearth_entities WHERE id = ?;", (entity_id,)
+    ).fetchone()
+    if not entity:
+        return None
+    open_episodes = get_open_episodes(memory_conn, entity_id=entity_id)
+    total_count = memory_conn.execute(
+        "SELECT COUNT(*) FROM hearth_episodes WHERE entity_id = ?;", (entity_id,)
+    ).fetchone()[0]
+    return {
+        "entity": entity,
+        "open_episodes": open_episodes,
+        "total_episode_count": total_count,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -145,17 +186,21 @@ def create_episode(memory_conn, entity_id, episode_type, description,
 
 
 def get_open_episodes(memory_conn, entity_id=None):
-    """Return all unresolved episodes, optionally filtered to one entity."""
+    """Return all unresolved episodes, optionally filtered to one entity.
+
+    Each row includes user_id and display_name from hearth_entities so the
+    context builder can group by person without extra queries.
+    """
     if entity_id is not None:
         return memory_conn.execute(
-            "SELECT e.*, en.user_id FROM hearth_episodes e"
+            "SELECT e.*, en.user_id, en.display_name FROM hearth_episodes e"
             " LEFT JOIN hearth_entities en ON en.id = e.entity_id"
             " WHERE e.entity_id = ? AND e.resolved = 0"
             " ORDER BY e.observed_at;",
             (entity_id,),
         ).fetchall()
     return memory_conn.execute(
-        "SELECT e.*, en.user_id FROM hearth_episodes e"
+        "SELECT e.*, en.user_id, en.display_name FROM hearth_episodes e"
         " LEFT JOIN hearth_entities en ON en.id = e.entity_id"
         " WHERE e.resolved = 0"
         " ORDER BY e.observed_at;"

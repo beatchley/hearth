@@ -40,33 +40,95 @@ class OpenConcern:
 
 
 @dataclass
+class PersonContext:
+    """Hearth's accumulated knowledge about one person.
+
+    Pathway owns the source-of-truth fields (name, email, role, status).
+    Hearth owns what it has noticed over time: episodes, patterns, concerns.
+    display_name is the only Pathway field cached here, purely for rendering.
+    """
+    user_id: int
+    display_name: str
+    open_concerns: list          # List[OpenConcern] for this person
+    total_episode_count: int     # All episodes including resolved — depth of history
+    hearth_summary: Optional[str] = None  # From entity.summary if Hearth has learned something
+
+    @property
+    def has_multiple_issues(self):
+        return len(self.open_concerns) > 1
+
+    @property
+    def has_history(self):
+        """True if Hearth has seen this person in resolved episodes, not just open ones."""
+        return self.total_episode_count > len(self.open_concerns)
+
+
+@dataclass
 class HearthAwarenessContext:
     """Hearth's complete awareness for a briefing moment."""
     date: str
-    observations: list = field(default_factory=list)   # List[Observation]
-    open_concerns: list = field(default_factory=list)  # List[OpenConcern]
+    observations: list = field(default_factory=list)         # List[Observation]
+    person_contexts: list = field(default_factory=list)      # List[PersonContext]
+    unattached_concerns: list = field(default_factory=list)  # List[OpenConcern] — no linked person
 
     @property
     def is_quiet(self):
-        return not self.observations and not self.open_concerns
+        return not self.observations and not self.person_contexts and not self.unattached_concerns
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+_SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+
+def _make_concern(ep, today: date, today_str: str) -> OpenConcern:
+    first_seen_str = ep["observed_at"][:10]
+    try:
+        age_days = (today - date.fromisoformat(first_seen_str)).days
+    except (ValueError, TypeError):
+        age_days = 0
+    return OpenConcern(
+        description=ep["description"],
+        first_seen=first_seen_str,
+        age_days=age_days,
+        severity=ep["severity"],
+        episode_type=ep["episode_type"],
+        is_recurring=(first_seen_str < today_str),
+    )
+
+
+def _sort_concerns(concerns: list) -> list:
+    return sorted(
+        concerns,
+        key=lambda c: (_SEVERITY_ORDER.get(c.severity, 1), -c.age_days),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Builder
 # ---------------------------------------------------------------------------
 
-def build_context(data: dict, open_episodes: list) -> HearthAwarenessContext:
+def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAwarenessContext:
     """
     Transform Pathway operational data and Hearth memory episodes into
     a HearthAwarenessContext — Hearth's assembled awareness.
 
     Separation of concerns:
     - observations: informational items from today (new joins, scheduled battles,
-      recent comments) — things that are not tracked as persistent episodes.
-    - open_concerns: everything recorded in Hearth's memory (probation, missing
-      Discord, unlinked battles), both new today and carrying over from prior runs.
-      These are never duplicated in observations.
+      recent comments) that are not tracked as persistent episodes.
+    - person_contexts: one PersonContext per person with open episodes, grouping
+      all their concerns together so Hearth can speak about the whole person.
+    - unattached_concerns: open episodes not tied to a specific person (e.g.
+      battles with unlinked opponents).
+
+    memory_conn is optional. If provided, each PersonContext is enriched with
+    the person's total historical episode count and any Hearth summary notes.
+    Without it, the context is still person-aware — just less historically deep.
     """
+    import hearth_memory  # local import to avoid circular dependency
+
     today = datetime.now(timezone.utc).date()
     today_str = today.isoformat()
     observations = []
@@ -98,43 +160,60 @@ def build_context(data: dict, open_episodes: list) -> HearthAwarenessContext:
     if isinstance(comments, list) and comments:
         count = len(comments)
         if count == 1:
-            observations.append(Observation(
-                text="One training comment came in over the last day."
-            ))
+            observations.append(Observation(text="One training comment came in over the last day."))
         else:
-            observations.append(Observation(
-                text=f"{count} training comments came in over the last day."
-            ))
+            observations.append(Observation(text=f"{count} training comments came in over the last day."))
 
-    # Open concerns — from Hearth's memory only (episodes handle deduplication)
-    open_concerns = []
+    # Group episodes by entity_id — None means no linked person
+    by_entity = {}  # entity_id (int) -> list of episode rows
+    unattached_eps = []
+
     for ep in (open_episodes or []):
-        first_seen_str = ep["observed_at"][:10]
-        try:
-            first_seen_date = date.fromisoformat(first_seen_str)
-            age_days = (today - first_seen_date).days
-        except (ValueError, TypeError):
-            age_days = 0
+        eid = ep["entity_id"]
+        if eid is None:
+            unattached_eps.append(ep)
+        else:
+            by_entity.setdefault(eid, []).append(ep)
 
-        open_concerns.append(OpenConcern(
-            description=ep["description"],
-            first_seen=first_seen_str,
-            age_days=age_days,
-            severity=ep["severity"],
-            episode_type=ep["episode_type"],
-            is_recurring=(first_seen_str < today_str),
+    # Build PersonContext for each entity group
+    person_contexts = []
+    for entity_id, episodes in by_entity.items():
+        display_name = episodes[0]["display_name"] or "a team member"
+        concerns = _sort_concerns([_make_concern(ep, today, today_str) for ep in episodes])
+
+        total_count = len(episodes)
+        hearth_summary = None
+        if memory_conn:
+            ctx = hearth_memory.get_entity_context(memory_conn, entity_id)
+            if ctx:
+                total_count = ctx["total_episode_count"]
+                entity_row = ctx["entity"]
+                if entity_row["summary"]:
+                    hearth_summary = entity_row["summary"]
+
+        person_contexts.append(PersonContext(
+            user_id=episodes[0]["user_id"],
+            display_name=display_name,
+            open_concerns=concerns,
+            total_episode_count=total_count,
+            hearth_summary=hearth_summary,
         ))
 
-    # Sort: high severity first, then by age descending (oldest = most urgent)
-    open_concerns.sort(key=lambda c: (
-        {"high": 0, "medium": 1, "low": 2}.get(c.severity, 1),
-        -c.age_days,
+    # Sort people: multiple issues first (escalation signal), then by highest severity
+    person_contexts.sort(key=lambda p: (
+        -len(p.open_concerns),
+        _SEVERITY_ORDER.get(p.open_concerns[0].severity if p.open_concerns else "low", 1),
     ))
+
+    unattached_concerns = _sort_concerns(
+        [_make_concern(ep, today, today_str) for ep in unattached_eps]
+    )
 
     return HearthAwarenessContext(
         date=datetime.now().strftime("%A, %B %d, %Y"),
         observations=observations,
-        open_concerns=open_concerns,
+        person_contexts=person_contexts,
+        unattached_concerns=unattached_concerns,
     )
 
 
@@ -142,12 +221,24 @@ def build_context(data: dict, open_episodes: list) -> HearthAwarenessContext:
 # Renderer
 # ---------------------------------------------------------------------------
 
+def _age_note(concern: OpenConcern) -> str:
+    if not concern.is_recurring:
+        return "new today"
+    age = concern.age_days
+    if age == 1:
+        return "since yesterday"
+    if age < 7:
+        return f"for {age} days"
+    return f"for {age} days — worth escalating"
+
+
 def render_for_llm(context: HearthAwarenessContext) -> str:
     """
     Render a HearthAwarenessContext into the text block the language model receives.
 
     Uses Hearth's language. No table names, column names, SQL dicts, row counts,
-    or schema information appears here.
+    or schema information appears here. Issues are grouped by person so Hearth
+    can speak about the whole person rather than a list of independent incidents.
     """
     lines = [f"Date: {context.date}", ""]
 
@@ -161,25 +252,36 @@ def render_for_llm(context: HearthAwarenessContext) -> str:
             lines.append(f"  - {obs.text}")
         lines.append("")
 
-    if context.open_concerns:
-        lines.append("What I've been tracking:")
-        for concern in context.open_concerns:
-            if concern.is_recurring:
-                age = concern.age_days
-                if age == 1:
-                    age_note = "since yesterday"
-                elif age < 7:
-                    age_note = f"for {age} days"
-                else:
-                    age_note = f"for {age} days — worth escalating"
-                lines.append(
-                    f"  - [{concern.severity.upper()}] {concern.description}"
-                    f" (open {age_note})"
-                )
+    if context.person_contexts:
+        lines.append("Who I'm watching:")
+        for person in context.person_contexts:
+            if person.has_multiple_issues:
+                lines.append(f"\n  {person.display_name} — {len(person.open_concerns)} open concerns:")
             else:
+                lines.append(f"\n  {person.display_name}:")
+
+            for concern in person.open_concerns:
                 lines.append(
-                    f"  - [{concern.severity.upper()}] {concern.description} (new today)"
+                    f"    - [{concern.severity.upper()}] {concern.description}"
+                    f" ({_age_note(concern)})"
                 )
+
+            if person.hearth_summary:
+                lines.append(f"    [Hearth notes: {person.hearth_summary}]")
+            elif person.has_history:
+                resolved = person.total_episode_count - len(person.open_concerns)
+                lines.append(
+                    f"    [Hearth has seen {resolved} resolved issue(s) for this person before]"
+                )
+        lines.append("")
+
+    if context.unattached_concerns:
+        lines.append("Other open concerns:")
+        for concern in context.unattached_concerns:
+            lines.append(
+                f"  - [{concern.severity.upper()}] {concern.description}"
+                f" ({_age_note(concern)})"
+            )
         lines.append("")
 
     return "\n".join(lines)
