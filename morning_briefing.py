@@ -31,13 +31,6 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-if not GEMINI_API_KEY:
-    sys.exit("ERROR: GEMINI_API_KEY is missing. Add it to your .env file.")
-if not DATABASE_URL:
-    sys.exit("ERROR: DATABASE_URL is missing. Add it to your .env file.")
-
-gemini = genai.Client(api_key=GEMINI_API_KEY)
-
 
 # ---------------------------------------------------------------------------
 # Database helpers — read-only throughout
@@ -278,12 +271,45 @@ Do not inflate a quiet day. If little needs attention, keep it to two or three s
 """
 
 
-def generate_hearth_message(awareness_context: hearth_context.HearthAwarenessContext) -> str:
+def generate_hearth_message(awareness_context: hearth_context.HearthAwarenessContext,
+                            gemini_client) -> str:
     """Send Hearth's awareness context to Gemini and return the Hearth message."""
     awareness_text = hearth_context.render_for_llm(awareness_context)
     prompt = HEARTH_SYSTEM_PROMPT.format(awareness=awareness_text)
-    response = gemini.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    response = gemini_client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
     return response.text
+
+
+def run_pipeline(db_path: str, gemini_api_key: str) -> str:
+    """
+    Run the full Hearth briefing pipeline and return the generated message.
+
+    Safe to call from external code (no sys.exit, no module-level side effects).
+    Raises on failure — the caller is responsible for graceful error handling.
+
+    Pipeline:
+        Pathway Data → Hearth Memory → Hearth Awareness Context → Gemini → Hearth Message
+    """
+    gemini_client = genai.Client(api_key=gemini_api_key)
+
+    memory_conn = hearth_memory.get_memory_connection()
+    try:
+        hearth_memory.init_tables(memory_conn)
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            hearth_memory.sync_users_to_entities(memory_conn, conn)
+            data = collect_data(conn)
+        finally:
+            conn.close()
+
+        detect_and_record_issues(memory_conn, data)
+        open_episodes = hearth_memory.get_open_episodes(memory_conn)
+        awareness = hearth_context.build_context(data, open_episodes)
+        return generate_hearth_message(awareness, gemini_client=gemini_client)
+    finally:
+        memory_conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +317,16 @@ def generate_hearth_message(awareness_context: hearth_context.HearthAwarenessCon
 # ---------------------------------------------------------------------------
 
 def main():
+    if not GEMINI_API_KEY:
+        sys.exit("ERROR: GEMINI_API_KEY is missing. Add it to your .env file.")
+    if not DATABASE_URL:
+        sys.exit("ERROR: DATABASE_URL is missing. Add it to your .env file.")
+
+    if DATABASE_URL.startswith("sqlite:///"):
+        db_path = DATABASE_URL[len("sqlite:///"):]
+    else:
+        db_path = DATABASE_URL
+
     print("Hearth Morning Briefing — connecting to Pathway Portal...")
 
     memory_conn = hearth_memory.get_memory_connection()
@@ -322,13 +358,13 @@ def main():
         print(f"  {len(open_episodes)} open episode(s) in memory.")
 
         # Step 7: Build Hearth's awareness context
-        #         This is the boundary — raw data becomes Hearth's perspective here.
         print("Building Hearth awareness context...")
         awareness = hearth_context.build_context(data, open_episodes)
 
         # Step 8: Generate the Hearth message via Gemini
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         print("Generating Hearth message...\n")
-        message = generate_hearth_message(awareness)
+        message = generate_hearth_message(awareness, gemini_client=gemini_client)
 
         # Step 9: Print the result
         print("=" * 60)
