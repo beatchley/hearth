@@ -51,7 +51,8 @@ class PersonContext:
     display_name: str
     open_concerns: list          # List[OpenConcern] for this person
     total_episode_count: int     # All episodes including resolved — depth of history
-    hearth_summary: Optional[str] = None  # From entity.summary if Hearth has learned something
+    hearth_summary: Optional[str] = None       # From entity.summary
+    patterns_noticed: Optional[str] = None     # From entity.patterns_noticed (recurring patterns)
 
     @property
     def has_multiple_issues(self):
@@ -183,13 +184,14 @@ def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAw
 
         total_count = len(episodes)
         hearth_summary = None
+        patterns_noticed = None
         if memory_conn:
             ctx = hearth_memory.get_entity_context(memory_conn, entity_id)
             if ctx:
                 total_count = ctx["total_episode_count"]
                 entity_row = ctx["entity"]
-                if entity_row["summary"]:
-                    hearth_summary = entity_row["summary"]
+                hearth_summary = entity_row["summary"] or None
+                patterns_noticed = entity_row["patterns_noticed"] or None
 
         person_contexts.append(PersonContext(
             user_id=episodes[0]["user_id"],
@@ -197,6 +199,7 @@ def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAw
             open_concerns=concerns,
             total_episode_count=total_count,
             hearth_summary=hearth_summary,
+            patterns_noticed=patterns_noticed,
         ))
 
     # Sort people: multiple issues first (escalation signal), then by highest severity
@@ -266,9 +269,11 @@ def render_for_llm(context: HearthAwarenessContext) -> str:
                     f" ({_age_note(concern)})"
                 )
 
+            if person.patterns_noticed:
+                lines.append(f"    [Recurring pattern: {person.patterns_noticed}]")
             if person.hearth_summary:
-                lines.append(f"    [Hearth notes: {person.hearth_summary}]")
-            elif person.has_history:
+                lines.append(f"    [Hearth memory: {person.hearth_summary}]")
+            elif person.has_history and not person.patterns_noticed:
                 resolved = person.total_episode_count - len(person.open_concerns)
                 lines.append(
                     f"    [Hearth has seen {resolved} resolved issue(s) for this person before]"

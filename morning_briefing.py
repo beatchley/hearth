@@ -305,6 +305,7 @@ def run_pipeline(db_path: str, gemini_api_key: str) -> str:
             conn.close()
 
         detect_and_record_issues(memory_conn, data)
+        hearth_memory.process_all_entities(memory_conn)
         open_episodes = hearth_memory.get_open_episodes(memory_conn)
         awareness = hearth_context.build_context(data, open_episodes, memory_conn)
         return generate_hearth_message(awareness, gemini_client=gemini_client)
@@ -353,20 +354,23 @@ def main():
         print("Updating Hearth memory...")
         detect_and_record_issues(memory_conn, data)
 
-        # Step 6: Load all open episodes from Hearth's memory
+        # Step 6: Update learned observations for all entities
+        hearth_memory.process_all_entities(memory_conn)
+
+        # Step 7: Load all open episodes from Hearth's memory
         open_episodes = hearth_memory.get_open_episodes(memory_conn)
         print(f"  {len(open_episodes)} open episode(s) in memory.")
 
-        # Step 7: Build Hearth's awareness context
+        # Step 8: Build Hearth's awareness context
         print("Building Hearth awareness context...")
         awareness = hearth_context.build_context(data, open_episodes, memory_conn)
 
-        # Step 8: Generate the Hearth message via Gemini
+        # Step 9: Generate the Hearth message via Gemini
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         print("Generating Hearth message...\n")
         message = generate_hearth_message(awareness, gemini_client=gemini_client)
 
-        # Step 9: Print the result
+        # Step 10: Print the result
         print("=" * 60)
         print(message)
         print("=" * 60)

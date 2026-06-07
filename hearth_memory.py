@@ -42,6 +42,7 @@ def init_tables(conn):
             concerns         TEXT,
             strengths        TEXT,
             importance_score REAL    DEFAULT 0.5,
+            first_observed_at TEXT,
             last_observed_at TEXT,
             created_at       TEXT    NOT NULL
         );
@@ -61,12 +62,16 @@ def init_tables(conn):
         CREATE INDEX IF NOT EXISTS idx_episodes_open
             ON hearth_episodes (episode_type, resolved);
     """)
-    # Migrate existing databases: add display_name if the column isn't there yet
-    try:
-        conn.execute("ALTER TABLE hearth_entities ADD COLUMN display_name TEXT;")
-        conn.commit()
-    except Exception:
-        pass  # Column already exists
+    # Migrate existing databases — add columns introduced after initial release
+    for migration in (
+        "ALTER TABLE hearth_entities ADD COLUMN display_name TEXT;",
+        "ALTER TABLE hearth_entities ADD COLUMN first_observed_at TEXT;",
+    ):
+        try:
+            conn.execute(migration)
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
 
 
 # ---------------------------------------------------------------------------
@@ -216,3 +221,112 @@ def get_recent_episodes(memory_conn, limit=50):
         " ORDER BY e.observed_at DESC LIMIT ?;",
         (limit,),
     ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Observation processor — builds learned memory from episode history
+# ---------------------------------------------------------------------------
+
+# Human-readable labels for episode types used in summaries and pattern text.
+# Never includes IDs, table names, or internal implementation language.
+_EPISODE_TYPE_LABELS = {
+    "probation":       "account on probation",
+    "missing_discord": "Discord onboarding delay",
+    "unlinked_battle": "battle with unlinked opponent",
+}
+
+
+def _episode_label(episode_type: str) -> str:
+    return _EPISODE_TYPE_LABELS.get(episode_type, episode_type.replace("_", " "))
+
+
+def _build_entity_summary(all_episodes, open_episodes, type_counts, patterns):
+    """
+    Return a short, factual summary of what Hearth has observed about this entity.
+
+    Only states what the episode record supports. Never asserts character,
+    motivation, or anything not directly derivable from observed events.
+    """
+    parts = []
+
+    first_date = all_episodes[0]["observed_at"][:10]
+    parts.append(f"First observed {first_date}.")
+
+    if patterns:
+        parts.append("Recurring: " + "; ".join(patterns) + ".")
+
+    open_count = len(open_episodes)
+    if open_count == 0:
+        if len(all_episodes) > open_count:
+            parts.append("No current open concerns.")
+    elif open_count == 1:
+        parts.append("1 open concern.")
+    else:
+        parts.append(f"{open_count} open concerns.")
+
+    return " ".join(parts)
+
+
+def process_entity_observations(memory_conn, entity_id):
+    """
+    Examine all episodes for one entity and update its learned memory fields.
+
+    Patterns are only recorded when the same episode type has appeared more than
+    once — never from a single data point. Concerns reflect currently open
+    episodes. Strengths are left for future phases when positive signal types
+    exist. Summary is factual and evidence-backed.
+    """
+    all_episodes = memory_conn.execute(
+        "SELECT episode_type, severity, resolved, observed_at"
+        " FROM hearth_episodes WHERE entity_id = ? ORDER BY observed_at;",
+        (entity_id,),
+    ).fetchall()
+
+    if not all_episodes:
+        return
+
+    open_episodes = [e for e in all_episodes if not e["resolved"]]
+
+    # Timestamps span the full episode history
+    first_observed_at = all_episodes[0]["observed_at"]
+    last_observed_at = all_episodes[-1]["observed_at"]
+
+    # Count all-time occurrences per episode type
+    type_counts = {}
+    for ep in all_episodes:
+        type_counts[ep["episode_type"]] = type_counts.get(ep["episode_type"], 0) + 1
+
+    # Patterns: only types seen more than once (repeated evidence rule)
+    patterns = []
+    for ep_type, count in sorted(type_counts.items()):
+        if count > 1:
+            patterns.append(f"{_episode_label(ep_type)} ({count} times)")
+    patterns_noticed = "; ".join(patterns) if patterns else None
+
+    # Concerns: open episodes with actionable severity
+    concern_labels = [
+        _episode_label(ep["episode_type"])
+        for ep in open_episodes
+        if ep["severity"] in ("high", "medium")
+    ]
+    concerns = "; ".join(concern_labels) if concern_labels else None
+
+    summary = _build_entity_summary(all_episodes, open_episodes, type_counts, patterns)
+
+    memory_conn.execute(
+        "UPDATE hearth_entities"
+        " SET summary = ?, patterns_noticed = ?, concerns = ?,"
+        "     first_observed_at = ?, last_observed_at = ?"
+        " WHERE id = ?;",
+        (summary, patterns_noticed, concerns, first_observed_at, last_observed_at, entity_id),
+    )
+    memory_conn.commit()
+
+
+def process_all_entities(memory_conn):
+    """Update learned memory fields for every entity that has at least one episode."""
+    entity_ids = memory_conn.execute(
+        "SELECT DISTINCT entity_id FROM hearth_episodes WHERE entity_id IS NOT NULL;"
+    ).fetchall()
+    for row in entity_ids:
+        process_entity_observations(memory_conn, row["entity_id"])
