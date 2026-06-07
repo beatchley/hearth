@@ -81,16 +81,17 @@ def sync_users_to_entities(memory_conn, pathway_conn):
     Hearth's own learned memory, not a copy of Pathway's source of truth.
     """
     try:
-        users = pathway_conn.execute("SELECT id, name FROM users;").fetchall()
+        users = pathway_conn.execute("SELECT id, name, tiktok_handle FROM users;").fetchall()
     except sqlite3.Error:
         return
     now = datetime.now(timezone.utc).isoformat()
     for user in users:
+        display_name = user["tiktok_handle"] or user["name"] or "a team member"
         memory_conn.execute(
             "INSERT INTO hearth_entities (user_id, display_name, created_at)"
             " VALUES (?, ?, ?)"
             " ON CONFLICT(user_id) DO UPDATE SET display_name = excluded.display_name;",
-            (user["id"], user["name"], now),
+            (user["id"], display_name, now),
         )
     memory_conn.commit()
 
