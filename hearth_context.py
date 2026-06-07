@@ -53,6 +53,7 @@ class PersonContext:
     total_episode_count: int     # All episodes including resolved — depth of history
     hearth_summary: Optional[str] = None       # From entity.summary
     patterns_noticed: Optional[str] = None     # From entity.patterns_noticed (recurring patterns)
+    coach_name: Optional[str] = None           # Display name of assigned coach if known
 
     @property
     def has_multiple_issues(self):
@@ -128,7 +129,8 @@ def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAw
     the person's total historical episode count and any Hearth summary notes.
     Without it, the context is still person-aware — just less historically deep.
     """
-    import hearth_memory  # local import to avoid circular dependency
+    import hearth_memory       # local imports to avoid circular dependency
+    import hearth_relationships
 
     today = datetime.now(timezone.utc).date()
     today_str = today.isoformat()
@@ -185,6 +187,7 @@ def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAw
         total_count = len(episodes)
         hearth_summary = None
         patterns_noticed = None
+        coach_name = None
         if memory_conn:
             ctx = hearth_memory.get_entity_context(memory_conn, entity_id)
             if ctx:
@@ -193,6 +196,12 @@ def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAw
                 hearth_summary = entity_row["summary"] or None
                 patterns_noticed = entity_row["patterns_noticed"] or None
 
+            coaches = hearth_relationships.get_related_entities(
+                memory_conn, entity_id, "coached_by"
+            )
+            if coaches:
+                coach_name = coaches[0]["display_name"] or "a team member"
+
         person_contexts.append(PersonContext(
             user_id=episodes[0]["user_id"],
             display_name=display_name,
@@ -200,6 +209,7 @@ def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAw
             total_episode_count=total_count,
             hearth_summary=hearth_summary,
             patterns_noticed=patterns_noticed,
+            coach_name=coach_name,
         ))
 
     # Sort people: multiple issues first (escalation signal), then by highest severity
@@ -207,6 +217,22 @@ def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAw
         -len(p.open_concerns),
         _SEVERITY_ORDER.get(p.open_concerns[0].severity if p.open_concerns else "low", 1),
     ))
+
+    # Shared-coach group signal: if 2+ people with the same coach have open concerns,
+    # surface that as an observation so the briefing can mention the pattern.
+    coach_groups = {}
+    for pc in person_contexts:
+        if pc.coach_name:
+            coach_groups.setdefault(pc.coach_name, []).append(pc.display_name)
+    for coach_name, members in coach_groups.items():
+        if len(members) >= 2:
+            names = ", ".join(members)
+            observations.append(Observation(
+                text=(
+                    f"Multiple members connected to {coach_name} have open concerns: {names}."
+                ),
+                person=coach_name,
+            ))
 
     unattached_concerns = _sort_concerns(
         [_make_concern(ep, today, today_str) for ep in unattached_eps]
@@ -269,6 +295,8 @@ def render_for_llm(context: HearthAwarenessContext) -> str:
                     f" ({_age_note(concern)})"
                 )
 
+            if person.coach_name:
+                lines.append(f"    [Assigned coach: {person.coach_name}]")
             if person.patterns_noticed:
                 lines.append(f"    [Recurring pattern: {person.patterns_noticed}]")
             if person.hearth_summary:

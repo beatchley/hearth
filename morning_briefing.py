@@ -20,6 +20,7 @@ from google import genai
 from dotenv import load_dotenv
 
 import hearth_memory
+import hearth_relationships
 import hearth_context
 
 # ---------------------------------------------------------------------------
@@ -300,6 +301,8 @@ def run_pipeline(db_path: str, gemini_api_key: str) -> str:
         conn.row_factory = sqlite3.Row
         try:
             hearth_memory.sync_users_to_entities(memory_conn, conn)
+            hearth_relationships.init_relationship_tables(memory_conn)
+            hearth_relationships.discover_relationships(memory_conn, conn)
             data = collect_data(conn)
         finally:
             conn.close()
@@ -340,37 +343,41 @@ def main():
             # Step 2: Sync Pathway users into Hearth's entity table
             hearth_memory.sync_users_to_entities(memory_conn, conn)
 
-            # Step 3: Discover schema (debug output only — not passed to LLM)
+            # Step 3: Discover and store relationship roads from Pathway
+            hearth_relationships.init_relationship_tables(memory_conn)
+            hearth_relationships.discover_relationships(memory_conn, conn)
+
+            # Step 4: Discover schema (debug output only — not passed to LLM)
             schema = discover_schema(conn)
             print_schema(schema)
 
-            # Step 4: Collect operational data from Pathway
+            # Step 5: Collect operational data from Pathway
             print("Collecting operational data...")
             data = collect_data(conn)
         finally:
             conn.close()
 
-        # Step 5: Record issues into Hearth's memory
+        # Step 6: Record issues into Hearth's memory
         print("Updating Hearth memory...")
         detect_and_record_issues(memory_conn, data)
 
-        # Step 6: Update learned observations for all entities
+        # Step 7: Update learned observations for all entities
         hearth_memory.process_all_entities(memory_conn)
 
-        # Step 7: Load all open episodes from Hearth's memory
+        # Step 8: Load all open episodes from Hearth's memory
         open_episodes = hearth_memory.get_open_episodes(memory_conn)
         print(f"  {len(open_episodes)} open episode(s) in memory.")
 
-        # Step 8: Build Hearth's awareness context
+        # Step 9: Build Hearth's awareness context
         print("Building Hearth awareness context...")
         awareness = hearth_context.build_context(data, open_episodes, memory_conn)
 
-        # Step 9: Generate the Hearth message via Gemini
+        # Step 10: Generate the Hearth message via Gemini
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         print("Generating Hearth message...\n")
         message = generate_hearth_message(awareness, gemini_client=gemini_client)
 
-        # Step 10: Print the result
+        # Step 11: Print the result
         print("=" * 60)
         print(message)
         print("=" * 60)
