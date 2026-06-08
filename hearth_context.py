@@ -165,7 +165,7 @@ def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAw
     battles_today = data.get("Battles scheduled today", [])
     if isinstance(battles_today, list):
         for row in battles_today:
-            time_part = f" at {row['battle_time']}" if row.get("battle_time") else ""
+            time_part = f" at {row['battle_time']}" if row["battle_time"] else ""
             observations.append(Observation(
                 text=(
                     f"{row['creator_screenname']} has a battle{time_part}"
