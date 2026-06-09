@@ -128,7 +128,8 @@ def _sort_concerns(concerns: list) -> list:
 # Builder
 # ---------------------------------------------------------------------------
 
-def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAwarenessContext:
+def build_context(data: dict, open_episodes: list, memory_conn=None,
+                  tracer=None) -> HearthAwarenessContext:
     """
     Transform Pathway operational data and Hearth memory episodes into
     a HearthAwarenessContext — Hearth's assembled awareness.
@@ -147,6 +148,10 @@ def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAw
     """
     import hearth_memory       # local imports to avoid circular dependency
     import hearth_relationships
+    import hearth_trace as _ht
+
+    if tracer is None:
+        tracer = _ht.NULL_TRACER
 
     today = datetime.now(timezone.utc).date()
     today_str = today.isoformat()
@@ -161,7 +166,7 @@ def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAw
                 person=row["name"],
             ))
 
-    # Battles scheduled today — informational
+    # Battles scheduled today — informational; trace each with full battle fields
     battles_today = data.get("Battles scheduled today", [])
     if isinstance(battles_today, list):
         for row in battles_today:
@@ -173,6 +178,31 @@ def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAw
                 ),
                 person=row["creator_screenname"],
             ))
+            try:
+                tracer.record(_ht.TraceEntry(
+                    rule_name="battles_today_observation",
+                    episode_type="battle_observation",
+                    action_taken="included_in_briefing",
+                    reason="battles.battle_date matches today — included as observation",
+                    source_table="battles",
+                    source_record_id=row["id"],
+                    source_fields={
+                        "battle_id": row["id"],
+                        "battle_date": row["battle_date"],
+                        "battle_time": row["battle_time"],
+                        "timezone": "none in source — stored as text",
+                        "creator_screenname": row["creator_screenname"],
+                        "opponent_name": row["opponent_name"],
+                        "opponent_id": row["opponent_id"],
+                        "battle_format": row["battle_format"],
+                        "linked_status": "linked" if row["opponent_id"] else "unlinked",
+                        "considered_as": "today",
+                    },
+                    entity_display_name=row["creator_screenname"],
+                    confidence="high",
+                ))
+            except Exception:
+                pass
 
     # Recent training comments — informational
     comments = data.get("Recent training comments (last 24 h)", [])
@@ -228,6 +258,32 @@ def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAw
             coach_name=coach_name,
         ))
 
+        # Trace each open episode being included for this person
+        for ep in episodes:
+            try:
+                first_seen = ep["observed_at"][:10]
+                try:
+                    age_days = (today - date.fromisoformat(first_seen)).days
+                except (ValueError, TypeError):
+                    age_days = 0
+                is_recurring = first_seen < today_str
+                tracer.record(_ht.TraceEntry(
+                    rule_name="context_inclusion",
+                    episode_type=ep["episode_type"],
+                    action_taken="included_in_briefing",
+                    reason=(
+                        f"open episode, severity={ep['severity']}, "
+                        f"age={age_days}d, recurring={is_recurring}, "
+                        f"entity={display_name}"
+                    ),
+                    reference_key=ep["reference_key"],
+                    entity_user_id=ep["user_id"],
+                    entity_display_name=display_name,
+                    confidence="high",
+                ))
+            except Exception:
+                pass
+
     # Sort people: multiple issues first (escalation signal), then by highest severity
     person_contexts.sort(key=lambda p: (
         -len(p.open_concerns),
@@ -250,9 +306,24 @@ def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAw
                 person=coach_name,
             ))
 
+    # Trace unattached concerns (no linked person)
     unattached_concerns = _sort_concerns(
         [_make_concern(ep, today, today_str) for ep in unattached_eps]
     )
+    for ep in unattached_eps:
+        try:
+            tracer.record(_ht.TraceEntry(
+                rule_name="context_inclusion_unattached",
+                episode_type=ep["episode_type"],
+                action_taken="included_in_briefing",
+                reason=f"open episode, no linked entity, severity={ep['severity']}",
+                reference_key=ep["reference_key"],
+                entity_user_id=None,
+                entity_display_name=None,
+                confidence="high",
+            ))
+        except Exception:
+            pass
 
     # Recent resolutions: issues Hearth was tracking that have since been fixed
     recent_resolutions = []
@@ -271,6 +342,19 @@ def build_context(data: dict, open_episodes: list, memory_conn=None) -> HearthAw
                 resolved_at=ep["resolved_at"],
                 days_open=days_open,
             ))
+            try:
+                tracer.record(_ht.TraceEntry(
+                    rule_name="recent_resolution_inclusion",
+                    episode_type=ep["episode_type"],
+                    action_taken="included_in_briefing",
+                    reason=f"resolved in last 24h, was open {days_open}d",
+                    reference_key=ep["reference_key"],
+                    entity_user_id=ep["user_id"],
+                    entity_display_name=ep["display_name"] or None,
+                    confidence="high",
+                ))
+            except Exception:
+                pass
 
     return HearthAwarenessContext(
         date=datetime.now().strftime("%A, %B %d, %Y"),

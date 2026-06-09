@@ -14,7 +14,10 @@ Usage:
 import os
 import sqlite3
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
+from zoneinfo import ZoneInfo
+
+CT = ZoneInfo("America/Chicago")
 
 from google import genai
 from dotenv import load_dotenv
@@ -22,6 +25,7 @@ from dotenv import load_dotenv
 import hearth_memory
 import hearth_relationships
 import hearth_context
+import hearth_trace
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -31,6 +35,7 @@ load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
+HEARTH_TRACE = os.getenv("HEARTH_TRACE", "0").strip() == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -103,26 +108,37 @@ def query_new_users(conn, since: datetime):
     return safe_query(conn, "New users (last 24 h)", sql, (since.isoformat(),))
 
 
-def query_battles_today(conn, today: datetime):
-    today_str = today.strftime("%Y-%m-%d")
+def query_battles_today(conn, today_str: str):
     sql = """
-        SELECT id, creator_screenname, opponent_name, battle_date, battle_time,
-               battle_format, opponent_id
-        FROM battles
-        WHERE battle_date = ?
-        ORDER BY battle_time;
+        SELECT b.id,
+               COALESCE(NULLIF(b.creator_screenname, ''), u.tiktok_handle, u.name) AS creator_screenname,
+               b.creator_user_id,
+               b.opponent_name, b.battle_date, b.battle_time,
+               b.battle_format, b.opponent_id
+        FROM battles b
+        LEFT JOIN users u ON u.id = b.creator_user_id
+        WHERE b.battle_date = ?
+        ORDER BY b.battle_time;
     """
     return safe_query(conn, "Battles scheduled today", sql, (today_str,))
 
 
-def query_battles_missing_confirmation(conn):
+def query_battles_missing_confirmation(conn, today_str: str):
+    window_end = (date.fromisoformat(today_str) + timedelta(days=7)).isoformat()
     sql = """
-        SELECT id, creator_screenname, opponent_name, battle_date, battle_time
-        FROM battles
-        WHERE opponent_id IS NULL OR opponent_id = ''
-        ORDER BY battle_date, battle_time;
+        SELECT b.id,
+               COALESCE(NULLIF(b.creator_screenname, ''), u.tiktok_handle, u.name) AS creator_screenname,
+               b.creator_user_id,
+               b.opponent_name, b.battle_date, b.battle_time,
+               b.battle_format, b.opponent_id
+        FROM battles b
+        LEFT JOIN users u ON u.id = b.creator_user_id
+        WHERE (b.opponent_id IS NULL OR b.opponent_id = '')
+          AND b.battle_date >= ?
+          AND b.battle_date <= ?
+        ORDER BY b.battle_date, b.battle_time;
     """
-    return safe_query(conn, "Battles with unlinked opponent", sql)
+    return safe_query(conn, "Battles with unlinked opponent", sql, (today_str, window_end))
 
 
 def query_unresponded_comments(conn, since: datetime):
@@ -162,15 +178,17 @@ def query_missing_discord(conn):
 # ---------------------------------------------------------------------------
 
 def collect_data(conn):
-    now = datetime.now(timezone.utc)
-    today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    since_24h = now - timedelta(hours=24)
+    now_utc = datetime.now(timezone.utc)
+    # Battles are scheduled in Central Time; compute today's date there so
+    # Render (UTC) doesn't roll over to the next day prematurely.
+    today_ct_str = datetime.now(CT).date().isoformat()
+    since_24h = now_utc - timedelta(hours=24)
 
     results = {}
     queries = [
         lambda: query_new_users(conn, since_24h),
-        lambda: query_battles_today(conn, today_midnight),
-        lambda: query_battles_missing_confirmation(conn),
+        lambda: query_battles_today(conn, today_ct_str),
+        lambda: query_battles_missing_confirmation(conn, today_ct_str),
         lambda: query_unresponded_comments(conn, since_24h),
         lambda: query_users_on_probation(conn),
         lambda: query_missing_discord(conn),
@@ -185,13 +203,13 @@ def collect_data(conn):
 # Resolution detection — closes episodes no longer present in Pathway
 # ---------------------------------------------------------------------------
 
-def resolve_stale_issues(memory_conn, data):
+def resolve_stale_issues(memory_conn, data, tracer=None):
     """
     Compare current Pathway data against open Hearth episodes and resolve
     any episode whose condition is no longer present.
 
     Each episode type has a defined resolution condition:
-      probation      — user is no longer on probation
+      probation       — user is no longer on probation
       missing_discord — user now has Discord access
       unlinked_battle — battle now has a linked opponent
 
@@ -202,6 +220,9 @@ def resolve_stale_issues(memory_conn, data):
     Historical episodes are never deleted — resolved = 1 preserves them
     for pattern detection and the full-lifecycle summary.
     """
+    if tracer is None:
+        tracer = hearth_trace.NULL_TRACER
+
     now = datetime.now(timezone.utc).isoformat()
 
     # Build the set of user_ids still on probation
@@ -230,50 +251,126 @@ def resolve_stale_issues(memory_conn, data):
         user_id = ep["user_id"]
         ref_key = ep["reference_key"]
         should_resolve = False
+        resolve_reason = None
 
         if ep_type == "probation" and current_probation_ids is not None:
             should_resolve = user_id is not None and user_id not in current_probation_ids
+            if should_resolve:
+                resolve_reason = "user no longer on probation in Pathway"
 
         elif ep_type == "missing_discord" and current_missing_discord_ids is not None:
             should_resolve = user_id is not None and user_id not in current_missing_discord_ids
+            if should_resolve:
+                resolve_reason = "user now has Discord access"
 
         elif ep_type == "unlinked_battle" and current_unlinked_keys is not None:
             should_resolve = ref_key is not None and ref_key not in current_unlinked_keys
+            if should_resolve:
+                resolve_reason = "battle now has a linked opponent"
 
         if should_resolve:
             hearth_memory.resolve_episode(memory_conn, ep["id"], now)
+            try:
+                # Extract battle_id from reference_key for unlinked_battle traces
+                src_id = None
+                if ref_key and ref_key.startswith("battle_"):
+                    try:
+                        src_id = int(ref_key[len("battle_"):])
+                    except ValueError:
+                        pass
+                elif user_id is not None:
+                    src_id = user_id
+                tracer.record(hearth_trace.TraceEntry(
+                    rule_name=f"resolve_{ep_type}",
+                    episode_type=ep_type,
+                    action_taken="resolved_episode",
+                    reason=resolve_reason,
+                    reference_key=ref_key,
+                    source_table=(
+                        "battles" if ep_type == "unlinked_battle"
+                        else "users" if ep_type in ("probation", "missing_discord")
+                        else None
+                    ),
+                    source_record_id=src_id,
+                    entity_user_id=user_id,
+                    entity_display_name=ep["display_name"],
+                    confidence="high",
+                ))
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
 # Issue detection — writes to Hearth memory, never to Pathway
 # ---------------------------------------------------------------------------
 
-def detect_and_record_issues(memory_conn, data):
+def detect_and_record_issues(memory_conn, data, tracer=None):
     """Scan today's operational data and persist notable issues as episodes."""
+    if tracer is None:
+        tracer = hearth_trace.NULL_TRACER
+
     rows = data.get("Users on probation", [])
     if isinstance(rows, list):
         for row in rows:
             entity = hearth_memory.get_or_create_entity(memory_conn, row["id"])
-            hearth_memory.create_episode(
+            _ep_id, action = hearth_memory.create_episode(
                 memory_conn, entity["id"], "probation",
                 f"User {row['name']} ({row['email']}) is on probation.",
                 severity="high",
             )
+            try:
+                tracer.record(hearth_trace.TraceEntry(
+                    rule_name="probation_status",
+                    episode_type="probation",
+                    action_taken=action,
+                    reason="users.status == 'probation'",
+                    source_table="users",
+                    source_record_id=row["id"],
+                    source_fields={
+                        "name": row["name"],
+                        "email": row["email"],
+                        "status": "probation",
+                    },
+                    entity_user_id=entity["user_id"],
+                    entity_display_name=entity["display_name"],
+                    confidence="high",
+                ))
+            except Exception:
+                pass
 
     rows = data.get("Users not yet added to Discord", [])
     if isinstance(rows, list):
         for row in rows:
             entity = hearth_memory.get_or_create_entity(memory_conn, row["id"])
-            hearth_memory.create_episode(
+            _ep_id, action = hearth_memory.create_episode(
                 memory_conn, entity["id"], "missing_discord",
                 f"User {row['name']} ({row['email']}) has not been added to Discord.",
                 severity="medium",
             )
+            try:
+                tracer.record(hearth_trace.TraceEntry(
+                    rule_name="missing_discord",
+                    episode_type="missing_discord",
+                    action_taken=action,
+                    reason="onboarding_records.added_discord is NULL or 0",
+                    source_table="users + onboarding_records",
+                    source_record_id=row["id"],
+                    source_fields={
+                        "name": row["name"],
+                        "email": row["email"],
+                    },
+                    entity_user_id=entity["user_id"],
+                    entity_display_name=entity["display_name"],
+                    confidence="high",
+                ))
+            except Exception:
+                pass
 
     rows = data.get("Battles with unlinked opponent", [])
     if isinstance(rows, list):
         for row in rows:
-            hearth_memory.create_episode(
+            ref_key = f"battle_{row['id']}"
+            _ep_id, action = hearth_memory.create_episode(
                 memory_conn, None, "unlinked_battle",
                 (
                     f"Battle on {row['battle_date']} at {row['battle_time']}"
@@ -281,8 +378,34 @@ def detect_and_record_issues(memory_conn, data):
                     f" opponent: {row['opponent_name']}) has no linked opponent account."
                 ),
                 severity="medium",
-                reference_key=f"battle_{row['id']}",
+                reference_key=ref_key,
             )
+            try:
+                tracer.record(hearth_trace.TraceEntry(
+                    rule_name="unlinked_battle",
+                    episode_type="unlinked_battle",
+                    action_taken=action,
+                    reason="battles.opponent_id is NULL or empty",
+                    source_table="battles",
+                    source_record_id=row["id"],
+                    reference_key=ref_key,
+                    source_fields={
+                        "battle_id": row["id"],
+                        "battle_date": row["battle_date"],
+                        "battle_time": row["battle_time"],
+                        "timezone": "none in source — stored as text",
+                        "creator_screenname": row["creator_screenname"],
+                        "opponent_name": row["opponent_name"],
+                        "opponent_id": row["opponent_id"],
+                        "battle_format": row["battle_format"],
+                        "linked_status": "unlinked",
+                    },
+                    entity_user_id=None,
+                    entity_display_name=None,
+                    confidence="high",
+                ))
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +478,7 @@ def run_pipeline(db_path: str, gemini_api_key: str) -> str:
         Pathway Data → Hearth Memory → Hearth Awareness Context → Gemini → Hearth Message
     """
     gemini_client = genai.Client(api_key=gemini_api_key)
+    tracer = hearth_trace.Tracer()
 
     memory_conn = hearth_memory.get_memory_connection()
     try:
@@ -370,12 +494,15 @@ def run_pipeline(db_path: str, gemini_api_key: str) -> str:
         finally:
             conn.close()
 
-        resolve_stale_issues(memory_conn, data)
-        detect_and_record_issues(memory_conn, data)
+        resolve_stale_issues(memory_conn, data, tracer)
+        detect_and_record_issues(memory_conn, data, tracer)
         hearth_memory.process_all_entities(memory_conn)
         open_episodes = hearth_memory.get_open_episodes(memory_conn)
-        awareness = hearth_context.build_context(data, open_episodes, memory_conn)
-        return generate_hearth_message(awareness, gemini_client=gemini_client)
+        awareness = hearth_context.build_context(data, open_episodes, memory_conn, tracer)
+        message = generate_hearth_message(awareness, gemini_client=gemini_client)
+        if HEARTH_TRACE:
+            tracer.print_report()
+        return message
     finally:
         memory_conn.close()
 
@@ -396,6 +523,7 @@ def main():
         db_path = DATABASE_URL
 
     print("Hearth Morning Briefing — connecting to Pathway Portal...")
+    tracer = hearth_trace.Tracer()
 
     memory_conn = hearth_memory.get_memory_connection()
     try:
@@ -422,11 +550,11 @@ def main():
             conn.close()
 
         # Step 6: Close episodes whose conditions are no longer present in Pathway
-        resolve_stale_issues(memory_conn, data)
+        resolve_stale_issues(memory_conn, data, tracer)
 
         # Step 7: Record new issues into Hearth's memory
         print("Updating Hearth memory...")
-        detect_and_record_issues(memory_conn, data)
+        detect_and_record_issues(memory_conn, data, tracer)
 
         # Step 8: Update learned observations for all entities
         hearth_memory.process_all_entities(memory_conn)
@@ -437,7 +565,7 @@ def main():
 
         # Step 10: Build Hearth's awareness context
         print("Building Hearth awareness context...")
-        awareness = hearth_context.build_context(data, open_episodes, memory_conn)
+        awareness = hearth_context.build_context(data, open_episodes, memory_conn, tracer)
 
         # Step 11: Generate the Hearth message via Gemini
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -448,6 +576,10 @@ def main():
         print("=" * 60)
         print(message)
         print("=" * 60)
+
+        # Step 13: Print full trace report if requested
+        if HEARTH_TRACE:
+            tracer.print_report()
 
     finally:
         memory_conn.close()

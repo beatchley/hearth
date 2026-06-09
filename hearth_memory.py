@@ -178,7 +178,7 @@ def create_episode(memory_conn, entity_id, episode_type, description,
         ).fetchone()
 
     if existing:
-        return existing["id"]
+        return existing["id"], "reused_open_episode"
 
     now = datetime.now(timezone.utc).isoformat()
     cur = memory_conn.execute(
@@ -188,7 +188,7 @@ def create_episode(memory_conn, entity_id, episode_type, description,
         (entity_id, episode_type, reference_key, description, severity, now),
     )
     memory_conn.commit()
-    return cur.lastrowid
+    return cur.lastrowid, "created_episode"
 
 
 def get_open_episodes(memory_conn, entity_id=None):
