@@ -139,8 +139,7 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
       recent comments) that are not tracked as persistent episodes.
     - person_contexts: one PersonContext per person with open episodes, grouping
       all their concerns together so Hearth can speak about the whole person.
-    - unattached_concerns: open episodes not tied to a specific person (e.g.
-      battles with unlinked opponents).
+    - unattached_concerns: open episodes not tied to a specific person.
 
     memory_conn is optional. If provided, each PersonContext is enriched with
     the person's total historical episode count and any Hearth summary notes.

@@ -123,23 +123,6 @@ def query_battles_today(conn, today_str: str):
     return safe_query(conn, "Battles scheduled today", sql, (today_str,))
 
 
-def query_battles_missing_confirmation(conn, today_str: str):
-    window_end = (date.fromisoformat(today_str) + timedelta(days=7)).isoformat()
-    sql = """
-        SELECT b.id,
-               COALESCE(NULLIF(b.creator_screenname, ''), u.tiktok_handle, u.name) AS creator_screenname,
-               b.creator_user_id,
-               b.opponent_name, b.battle_date, b.battle_time,
-               b.battle_format, b.opponent_id
-        FROM battles b
-        LEFT JOIN users u ON u.id = b.creator_user_id
-        WHERE (b.opponent_id IS NULL OR b.opponent_id = '')
-          AND b.battle_date >= ?
-          AND b.battle_date <= ?
-        ORDER BY b.battle_date, b.battle_time;
-    """
-    return safe_query(conn, "Battles with unlinked opponent", sql, (today_str, window_end))
-
 
 def query_unresponded_comments(conn, since: datetime):
     sql = """
@@ -149,6 +132,20 @@ def query_unresponded_comments(conn, since: datetime):
         ORDER BY created_at DESC;
     """
     return safe_query(conn, "Recent training comments (last 24 h)", sql, (since.isoformat(),))
+
+
+def query_training_comments_recent(conn, since: datetime):
+    """Fetch recent training comments with user role info for response-need detection."""
+    sql = """
+        SELECT tc.id, tc.training_id, tc.user_id, tc.content, tc.created_at,
+               COALESCE(NULLIF(u.tiktok_handle, ''), u.name) AS display_name,
+               u.role, u.permissions
+        FROM training_comments tc
+        LEFT JOIN users u ON u.id = tc.user_id
+        WHERE tc.created_at >= ?
+        ORDER BY tc.created_at DESC;
+    """
+    return safe_query(conn, "Training comments for review (48 h)", sql, (since.isoformat(),))
 
 
 def query_users_on_probation(conn):
@@ -173,6 +170,177 @@ def query_missing_discord(conn):
     return safe_query(conn, "Users not yet added to Discord", sql)
 
 
+def query_trainings_no_engagement(conn, since: datetime, cutoff: datetime):
+    """Trainings at least 24 h old (but no more than 7 days) with zero comments."""
+    sql = """
+        SELECT t.id, t.title, t.created_at, t.created_by,
+               COALESCE(NULLIF(u.tiktok_handle, ''), u.name) AS creator_name
+        FROM trainings t
+        LEFT JOIN users u ON u.id = t.created_by
+        WHERE t.created_at >= ?
+          AND t.created_at <= ?
+          AND NOT EXISTS (
+              SELECT 1 FROM training_comments tc WHERE tc.training_id = t.id
+          )
+        ORDER BY t.created_at DESC;
+    """
+    return safe_query(conn, "Trainings with no engagement (1–7 days old)", sql,
+                      (since.isoformat(), cutoff.isoformat()))
+
+
+def query_checkins_not_submitted(conn):
+    """Check-in submissions still in Assigned state on a Sent check-in, 7+ days old."""
+    sql = """
+        SELECT
+            cs.id                                               AS submission_id,
+            cs.checkin_id,
+            cs.user_id,
+            ci.title                                            AS checkin_title,
+            ci.updated_at                                       AS sent_at,
+            COALESCE(NULLIF(u.tiktok_handle, ''), u.name)      AS display_name,
+            u.email,
+            CAST(julianday('now') - julianday(ci.updated_at) AS INTEGER) AS days_overdue
+        FROM checkin_submissions cs
+        JOIN checkins ci ON ci.id = cs.checkin_id
+        JOIN users u    ON u.id  = cs.user_id
+        WHERE ci.status = 'Sent'
+          AND cs.status = 'Assigned'
+          AND (julianday('now') - julianday(ci.updated_at)) >= 7
+        ORDER BY days_overdue DESC;
+    """
+    return safe_query(conn, "Check-ins not submitted (7+ days)", sql)
+
+
+def query_creator_quiet(conn):
+    """
+    Approved pathway/shop creators with no meaningful activity for 14+ days.
+
+    Excludes manager, ceo, it, and coach roles — they are not tracked as
+    creators even if is_pathway_creator or is_shop_creator happens to be set.
+
+    A single UNION ALL collects every activity signal; one MAX() per user
+    finds their most recent timestamp without Python-side loops.
+
+    battle_date is a DATE column; appending ' 23:59:59' makes it sort
+    correctly alongside DATETIME strings from all other tables.
+    """
+    sql = """
+        WITH creators AS (
+            SELECT id,
+                   COALESCE(NULLIF(tiktok_handle, ''), name) AS display_name
+            FROM users
+            WHERE status = 'approved'
+              AND (is_pathway_creator = 1 OR is_shop_creator = 1)
+              AND role NOT IN ('ceo', 'it', 'manager', 'coach')
+        ),
+        activity AS (
+            SELECT user_id,         visited_at                    AS activity_at,
+                   'page_visit'     AS activity_type
+            FROM page_visits
+            WHERE user_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT user_id,         submitted_at,
+                   'checkin_submitted'
+            FROM checkin_submissions
+            WHERE user_id IN (SELECT id FROM creators)
+              AND submitted_at IS NOT NULL
+
+            UNION ALL
+            SELECT creator_user_id, battle_date || ' 23:59:59',
+                   'battle'
+            FROM battles
+            WHERE creator_user_id IN (SELECT id FROM creators)
+              AND battle_date <= date('now')
+
+            UNION ALL
+            SELECT creator_id,      created_at,
+                   'battle_request'
+            FROM battle_requests
+            WHERE creator_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT creator_id,      updated_at,
+                   'battle_request'
+            FROM battle_requests
+            WHERE creator_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT user_id,         created_at,
+                   'training_comment'
+            FROM training_comments
+            WHERE user_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT user_id,         created_at,
+                   'training_comment_reply'
+            FROM training_comment_replies
+            WHERE user_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT author_id,       created_at,
+                   'post'
+            FROM posts
+            WHERE author_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT author_id,       created_at,
+                   'comment'
+            FROM comments
+            WHERE author_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT sender_id,       created_at,
+                   'private_message'
+            FROM private_messages
+            WHERE sender_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT author_id,       created_at,
+                   'support_message'
+            FROM support_messages
+            WHERE author_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT user_id,         created_at,
+                   'event_signup'
+            FROM pathway_event_signups
+            WHERE user_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT user_id,         created_at,
+                   'chat_message'
+            FROM role_hub_chat_messages
+            WHERE user_id IN (SELECT id FROM creators)
+        ),
+        max_ts AS (
+            SELECT user_id, MAX(activity_at) AS last_activity_at
+            FROM activity
+            GROUP BY user_id
+        ),
+        last_activity AS (
+            SELECT a.user_id, a.activity_at AS last_activity_at, a.activity_type
+            FROM activity a
+            INNER JOIN max_ts m
+                    ON a.user_id = m.user_id
+                   AND a.activity_at = m.last_activity_at
+            GROUP BY a.user_id
+        )
+        SELECT
+            c.id                                                                      AS user_id,
+            c.display_name,
+            CAST(julianday('now') - julianday(la.last_activity_at) AS INTEGER)        AS days_quiet,
+            la.last_activity_at,
+            la.activity_type                                                           AS last_activity_type
+        FROM creators c
+        LEFT JOIN last_activity la ON la.user_id = c.id
+        WHERE la.last_activity_at IS NULL
+           OR CAST(julianday('now') - julianday(la.last_activity_at) AS INTEGER) >= 14
+        ORDER BY days_quiet DESC;
+    """
+    return safe_query(conn, "Creator quiet period (14+ days)", sql)
+
+
 # ---------------------------------------------------------------------------
 # Data collection
 # ---------------------------------------------------------------------------
@@ -183,15 +351,20 @@ def collect_data(conn):
     # Render (UTC) doesn't roll over to the next day prematurely.
     today_ct_str = datetime.now(CT).date().isoformat()
     since_24h = now_utc - timedelta(hours=24)
+    since_48h = now_utc - timedelta(hours=48)
+    since_7d = now_utc - timedelta(days=7)
 
     results = {}
     queries = [
         lambda: query_new_users(conn, since_24h),
         lambda: query_battles_today(conn, today_ct_str),
-        lambda: query_battles_missing_confirmation(conn, today_ct_str),
         lambda: query_unresponded_comments(conn, since_24h),
+        lambda: query_training_comments_recent(conn, since_48h),
         lambda: query_users_on_probation(conn),
         lambda: query_missing_discord(conn),
+        lambda: query_trainings_no_engagement(conn, since_7d, since_24h),
+        lambda: query_checkins_not_submitted(conn),
+        lambda: query_creator_quiet(conn),
     ]
     for q in queries:
         label, data = q()
@@ -209,9 +382,11 @@ def resolve_stale_issues(memory_conn, data, tracer=None):
     any episode whose condition is no longer present.
 
     Each episode type has a defined resolution condition:
-      probation       — user is no longer on probation
-      missing_discord — user now has Discord access
-      unlinked_battle — battle now has a linked opponent
+      probation                      — user is no longer on probation
+      missing_discord                — user now has Discord access
+      training_comment_needs_response — stays open until manually resolved; auto-resolution
+                                        requires a Pathway query for subsequent manager responses
+                                        on the same training (TODO for a future version)
 
     If a query failed (returned a string instead of rows), that type is
     skipped entirely so we never accidentally close valid open episodes
@@ -239,12 +414,26 @@ def resolve_stale_issues(memory_conn, data, tracer=None):
     else:
         current_missing_discord_ids = None
 
-    # Build the set of battle reference_keys still unlinked
-    battle_rows = data.get("Battles with unlinked opponent", [])
-    if isinstance(battle_rows, list):
-        current_unlinked_keys = {f"battle_{row['id']}" for row in battle_rows}
+    # Build the set of training reference_keys still in the zero-comment window
+    no_engagement_rows = data.get("Trainings with no engagement (1–7 days old)", [])
+    if isinstance(no_engagement_rows, list):
+        current_no_engagement_keys = {f"training_{row['id']}" for row in no_engagement_rows}
     else:
-        current_unlinked_keys = None
+        current_no_engagement_keys = None  # query failed — skip this type
+
+    # Build the set of submission reference_keys still overdue (Sent + Assigned + 7+ days)
+    overdue_rows = data.get("Check-ins not submitted (7+ days)", [])
+    if isinstance(overdue_rows, list):
+        current_overdue_keys = {f"checkin_submission_{row['submission_id']}" for row in overdue_rows}
+    else:
+        current_overdue_keys = None  # query failed — skip this type
+
+    # Build the set of reference_keys for creators still quiet 14+ days
+    quiet_rows = data.get("Creator quiet period (14+ days)", [])
+    if isinstance(quiet_rows, list):
+        current_quiet_keys = {f"creator_quiet_user_{row['user_id']}" for row in quiet_rows}
+    else:
+        current_quiet_keys = None  # query failed — skip this type
 
     for ep in hearth_memory.get_open_episodes(memory_conn):
         ep_type = ep["episode_type"]
@@ -263,41 +452,157 @@ def resolve_stale_issues(memory_conn, data, tracer=None):
             if should_resolve:
                 resolve_reason = "user now has Discord access"
 
-        elif ep_type == "unlinked_battle" and current_unlinked_keys is not None:
-            should_resolve = ref_key is not None and ref_key not in current_unlinked_keys
+        elif ep_type == "training_no_engagement" and current_no_engagement_keys is not None:
+            should_resolve = ref_key is not None and ref_key not in current_no_engagement_keys
             if should_resolve:
-                resolve_reason = "battle now has a linked opponent"
+                resolve_reason = "training has received comments"
+
+        elif ep_type == "checkin_not_submitted" and current_overdue_keys is not None:
+            should_resolve = ref_key is not None and ref_key not in current_overdue_keys
+            if should_resolve:
+                resolve_reason = "check-in submitted or check-in no longer active"
+
+        elif ep_type == "creator_quiet" and current_quiet_keys is not None:
+            should_resolve = ref_key is not None and ref_key not in current_quiet_keys
+            if should_resolve:
+                resolve_reason = "creator_activity_resumed"
 
         if should_resolve:
             hearth_memory.resolve_episode(memory_conn, ep["id"], now)
             try:
-                # Extract battle_id from reference_key for unlinked_battle traces
-                src_id = None
-                if ref_key and ref_key.startswith("battle_"):
-                    try:
-                        src_id = int(ref_key[len("battle_"):])
-                    except ValueError:
-                        pass
-                elif user_id is not None:
-                    src_id = user_id
                 tracer.record(hearth_trace.TraceEntry(
                     rule_name=f"resolve_{ep_type}",
                     episode_type=ep_type,
                     action_taken="resolved_episode",
                     reason=resolve_reason,
                     reference_key=ref_key,
-                    source_table=(
-                        "battles" if ep_type == "unlinked_battle"
-                        else "users" if ep_type in ("probation", "missing_discord")
-                        else None
-                    ),
-                    source_record_id=src_id,
+                    source_table="users" if ep_type in ("probation", "missing_discord") else None,
+                    source_record_id=user_id,
                     entity_user_id=user_id,
                     entity_display_name=ep["display_name"],
                     confidence="high",
                 ))
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Legacy migration — resolves episodes created under incorrect assumptions
+# ---------------------------------------------------------------------------
+
+def resolve_legacy_unlinked_battles(memory_conn, tracer=None):
+    """
+    Resolve all open unlinked_battle episodes. Idempotent — safe to run every startup.
+
+    Business rule: External opponents (e.g. Fresh Start Agency, RealOnes, Evolve, other
+    outside agencies) do not have Pathway accounts. A NULL opponent_id is normal and does
+    not indicate an operational problem. These episodes were created under an incorrect
+    assumption that NULL opponent_id == concern.
+    """
+    if tracer is None:
+        tracer = hearth_trace.NULL_TRACER
+
+    now = datetime.now(timezone.utc).isoformat()
+    open_unlinked = memory_conn.execute(
+        "SELECT * FROM hearth_episodes WHERE episode_type = 'unlinked_battle' AND resolved = 0;"
+    ).fetchall()
+
+    for ep in open_unlinked:
+        hearth_memory.resolve_episode(memory_conn, ep["id"], now)
+        try:
+            ref_key = ep["reference_key"]
+            src_id = None
+            if ref_key and ref_key.startswith("battle_"):
+                try:
+                    src_id = int(ref_key[len("battle_"):])
+                except ValueError:
+                    pass
+            tracer.record(hearth_trace.TraceEntry(
+                rule_name="resolve_legacy_unlinked_battle",
+                episode_type="unlinked_battle",
+                action_taken="resolved_episode",
+                reason="legacy: external opponents without Pathway accounts are expected behavior",
+                source_table="battles",
+                source_record_id=src_id,
+                reference_key=ref_key,
+                entity_user_id=None,
+                entity_display_name=None,
+                confidence="high",
+            ))
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Training comment analysis — helpers for response-need detection
+# ---------------------------------------------------------------------------
+
+# Phrases that suggest a creator may need help or has a question.
+_COMMENT_FLAG_KEYWORDS = [
+    "?",
+    "help",
+    "how do i",
+    "i can't",
+    "i cant",
+    "not working",
+    "confused",
+    "what do i",
+    "where do i",
+    "need help",
+]
+
+# Positive/grateful phrases that suppress keyword flags — unless the comment
+# also contains "?" (a direct question overrides positive context).
+_COMMENT_POSITIVE_SIGNALS = [
+    "thank",
+    "thanks",
+    "helpful",
+    "this helped",
+    "great job",
+    "good job",
+    "nice work",
+    "awesome",
+    "love this",
+    "love it",
+    "perfect",
+]
+
+_STAFF_ROLES = frozenset({"admin", "manager", "coach"})
+
+
+def _comment_needs_response(content, role, permissions):
+    """
+    Return (should_flag: bool, reason: str) for a single training comment.
+
+    Conservative by design — only flags when there is a clear signal the creator
+    needs help. Staff comments are always skipped. Positive/thank-you comments
+    are skipped unless they also contain a "?" (direct question overrides).
+    """
+    role_lower = (role or "").lower().strip()
+    perms_lower = (permissions or "").lower().strip()
+    if role_lower in _STAFF_ROLES or perms_lower in _STAFF_ROLES:
+        return False, "staff_role"
+
+    text = (content or "").strip()
+    if len(text) < 10:
+        return False, "too_short"
+
+    lower = text.lower()
+
+    matched_kw = None
+    for kw in _COMMENT_FLAG_KEYWORDS:
+        if kw in lower:
+            matched_kw = kw
+            break
+
+    if matched_kw is None:
+        return False, "no_signal"
+
+    # "?" always counts even in a positive comment; other keywords can be suppressed.
+    if matched_kw != "?" and any(pos in lower for pos in _COMMENT_POSITIVE_SIGNALS):
+        return False, "positive_context"
+
+    return True, f"keyword:{matched_kw}"
 
 
 # ---------------------------------------------------------------------------
@@ -366,46 +671,245 @@ def detect_and_record_issues(memory_conn, data, tracer=None):
             except Exception:
                 pass
 
-    rows = data.get("Battles with unlinked opponent", [])
+    rows = data.get("Training comments for review (48 h)", [])
     if isinstance(rows, list):
         for row in rows:
-            ref_key = f"battle_{row['id']}"
+            content = row["content"] or ""
+            display_name = row["display_name"] or "a creator"
+            should_flag, flag_reason = _comment_needs_response(
+                content, row["role"], row["permissions"]
+            )
+
+            if not should_flag:
+                try:
+                    tracer.record(hearth_trace.TraceEntry(
+                        rule_name="training_comment_review",
+                        episode_type="training_comment_needs_response",
+                        action_taken="skipped_comment",
+                        reason=flag_reason,
+                        source_table="training_comments",
+                        source_record_id=row["id"],
+                        source_fields={
+                            "comment_id": row["id"],
+                            "training_id": row["training_id"],
+                            "created_at": row["created_at"],
+                            "display_name": display_name,
+                        },
+                        entity_user_id=row["user_id"],
+                        entity_display_name=display_name,
+                        confidence="high",
+                    ))
+                except Exception:
+                    pass
+                continue
+
+            ref_key = f"training_comment_{row['id']}"
+            entity_id = None
+            entity_user_id = row["user_id"]
+
+            if row["user_id"]:
+                entity = hearth_memory.get_or_create_entity(memory_conn, row["user_id"])
+                entity_id = entity["id"]
+                display_name = entity["display_name"] or display_name
+
+            desc = f"@{display_name} may need a response to a training comment."
+
             _ep_id, action = hearth_memory.create_episode(
-                memory_conn, None, "unlinked_battle",
-                (
-                    f"Battle on {row['battle_date']} at {row['battle_time']}"
-                    f" (creator: {row['creator_screenname']},"
-                    f" opponent: {row['opponent_name']}) has no linked opponent account."
-                ),
-                severity="medium",
+                memory_conn, entity_id, "training_comment_needs_response",
+                desc,
+                severity="low",
                 reference_key=ref_key,
             )
             try:
                 tracer.record(hearth_trace.TraceEntry(
-                    rule_name="unlinked_battle",
-                    episode_type="unlinked_battle",
+                    rule_name="training_comment_needs_response",
+                    episode_type="training_comment_needs_response",
                     action_taken=action,
-                    reason="battles.opponent_id is NULL or empty",
-                    source_table="battles",
+                    reason=f"comment flagged: {flag_reason}",
+                    source_table="training_comments",
                     source_record_id=row["id"],
                     reference_key=ref_key,
                     source_fields={
-                        "battle_id": row["id"],
-                        "battle_date": row["battle_date"],
-                        "battle_time": row["battle_time"],
-                        "timezone": "none in source — stored as text",
-                        "creator_screenname": row["creator_screenname"],
-                        "opponent_name": row["opponent_name"],
-                        "opponent_id": row["opponent_id"],
-                        "battle_format": row["battle_format"],
-                        "linked_status": "unlinked",
+                        "comment_id": row["id"],
+                        "training_id": row["training_id"],
+                        "created_at": row["created_at"],
+                        "display_name": display_name,
+                        "flag_reason": flag_reason,
+                        "content_preview": content[:80],
                     },
-                    entity_user_id=None,
-                    entity_display_name=None,
+                    entity_user_id=entity_user_id,
+                    entity_display_name=display_name,
+                    confidence="medium",
+                ))
+            except Exception:
+                pass
+
+    rows = data.get("Trainings with no engagement (1–7 days old)", [])
+    if isinstance(rows, list):
+        for row in rows:
+            ref_key = f"training_{row['id']}"
+            entity_id = None
+            creator_user_id = row["created_by"]
+            creator_name = row["creator_name"] or "a staff member"
+
+            if creator_user_id:
+                entity = hearth_memory.get_or_create_entity(memory_conn, creator_user_id)
+                entity_id = entity["id"]
+                creator_name = entity["display_name"] or creator_name
+
+            desc = f"Training \"{row['title']}\" by {creator_name} has no comments yet."
+
+            _ep_id, action = hearth_memory.create_episode(
+                memory_conn, entity_id, "training_no_engagement",
+                desc,
+                severity="low",
+                reference_key=ref_key,
+            )
+            try:
+                tracer.record(hearth_trace.TraceEntry(
+                    rule_name="training_no_engagement",
+                    episode_type="training_no_engagement",
+                    action_taken=action,
+                    reason="training has no comments after 24+ hours",
+                    source_table="trainings",
+                    source_record_id=row["id"],
+                    reference_key=ref_key,
+                    source_fields={
+                        "training_id": row["id"],
+                        "title": row["title"],
+                        "created_at": row["created_at"],
+                        "creator_name": creator_name,
+                    },
+                    entity_user_id=creator_user_id,
+                    entity_display_name=creator_name,
                     confidence="high",
                 ))
             except Exception:
                 pass
+
+    rows = data.get("Check-ins not submitted (7+ days)", [])
+    if isinstance(rows, list):
+        for row in rows:
+            ref_key = f"checkin_submission_{row['submission_id']}"
+            entity = hearth_memory.get_or_create_entity(memory_conn, row["user_id"])
+            days = row["days_overdue"]
+            severity = "medium" if days >= 14 else "low"
+            desc = (
+                f"@{row['display_name']} has not submitted \"{row['checkin_title']}\" "
+                f"({days} days overdue)."
+            )
+            _ep_id, action = hearth_memory.create_episode(
+                memory_conn, entity["id"], "checkin_not_submitted",
+                desc,
+                severity=severity,
+                reference_key=ref_key,
+            )
+            try:
+                tracer.record(hearth_trace.TraceEntry(
+                    rule_name="checkin_not_submitted",
+                    episode_type="checkin_not_submitted",
+                    action_taken=action,
+                    reason=f"submission.status == 'Assigned', checkin.status == 'Sent', {days} days overdue",
+                    source_table="checkin_submissions + checkins",
+                    source_record_id=row["submission_id"],
+                    reference_key=ref_key,
+                    source_fields={
+                        "submission_id": row["submission_id"],
+                        "checkin_id": row["checkin_id"],
+                        "checkin_title": row["checkin_title"],
+                        "days_overdue": days,
+                        "sent_at": row["sent_at"],
+                        "display_name": row["display_name"],
+                    },
+                    entity_user_id=row["user_id"],
+                    entity_display_name=entity["display_name"],
+                    confidence="high",
+                ))
+            except Exception:
+                pass
+
+    # ── Watcher: creator_quiet ────────────────────────────────────────────────
+    # Friendly labels for the last-activity type shown in the episode description.
+    _ACTIVITY_TYPE_LABELS = {
+        "page_visit":               "page visit",
+        "checkin_submitted":        "check-in submission",
+        "battle":                   "battle",
+        "battle_request":           "battle request",
+        "training_comment":         "training comment",
+        "training_comment_reply":   "training comment reply",
+        "post":                     "post",
+        "comment":                  "comment",
+        "private_message":          "message",
+        "support_message":          "support message",
+        "event_signup":             "event signup",
+        "chat_message":             "chat message",
+    }
+
+    rows = data.get("Creator quiet period (14+ days)", [])
+    if isinstance(rows, list):
+        for row in rows:
+            user_id      = row["user_id"]
+            display_name = row["display_name"] or "a creator"
+            days         = row["days_quiet"] if row["days_quiet"] is not None else 9999
+            last_at      = row["last_activity_at"]
+            last_type    = row["last_activity_type"]
+            ref_key      = f"creator_quiet_user_{user_id}"
+
+            severity = "high" if days >= 30 else ("medium" if days >= 21 else "low")
+
+            if last_at:
+                activity_label = _ACTIVITY_TYPE_LABELS.get(
+                    last_type, (last_type or "unknown").replace("_", " ")
+                )
+                desc = (
+                    f"@{display_name} has had no meaningful activity for {days} days. "
+                    f"Last activity: {activity_label} on {last_at[:10]}."
+                )
+            else:
+                desc = (
+                    f"@{display_name} has had no meaningful activity on record."
+                )
+
+            entity = hearth_memory.get_or_create_entity(memory_conn, user_id)
+            _ep_id, action = hearth_memory.create_episode(
+                memory_conn, entity["id"], "creator_quiet",
+                desc,
+                severity=severity,
+                reference_key=ref_key,
+            )
+            try:
+                tracer.record(hearth_trace.TraceEntry(
+                    rule_name="creator_quiet",
+                    episode_type="creator_quiet",
+                    action_taken=action,
+                    reason=f"no activity for {days} days",
+                    source_table="users + activity signals",
+                    source_record_id=user_id,
+                    reference_key=ref_key,
+                    source_fields={
+                        "user_id": user_id,
+                        "display_name": display_name,
+                        "days_quiet": days,
+                        "last_activity_at": last_at,
+                        "last_activity_type": last_type,
+                    },
+                    entity_user_id=user_id,
+                    entity_display_name=entity["display_name"],
+                    confidence="high",
+                ))
+            except Exception:
+                pass
+
+    # Battle concern detection is intentionally absent here.
+    # External opponents (Fresh Start Agency, RealOnes, Evolve, outside agencies) do not
+    # have Pathway accounts. NULL opponent_id is normal — not an operational concern.
+    #
+    # TODO — future battle concern signals worth implementing:
+    #   - battle missing assigned Pathway creator (creator_user_id is NULL)
+    #   - creator double-booked (same creator, overlapping battle date/time)
+    #   - battle awaiting confirmation past a reasonable window
+    #   - battle missing required internal assignment
+    #   - overlapping battle schedule for the same opponent
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +999,7 @@ def run_pipeline(db_path: str, gemini_api_key: str) -> str:
             conn.close()
 
         resolve_stale_issues(memory_conn, data, tracer)
+        resolve_legacy_unlinked_battles(memory_conn, tracer)
         detect_and_record_issues(memory_conn, data, tracer)
         hearth_memory.process_all_entities(memory_conn)
         open_episodes = hearth_memory.get_open_episodes(memory_conn)
@@ -551,6 +1056,9 @@ def main():
 
         # Step 6: Close episodes whose conditions are no longer present in Pathway
         resolve_stale_issues(memory_conn, data, tracer)
+
+        # Step 6b: Resolve open unlinked_battle episodes — rule disabled (see function docstring)
+        resolve_legacy_unlinked_battles(memory_conn, tracer)
 
         # Step 7: Record new issues into Hearth's memory
         print("Updating Hearth memory...")

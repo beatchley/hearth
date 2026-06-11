@@ -10,7 +10,8 @@ import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-MEMORY_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hearth_memory.db")
+_LOCAL_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hearth_memory.db")
+MEMORY_DB_PATH = os.environ.get("HEARTH_DB_PATH", _LOCAL_DB_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -258,9 +259,11 @@ def get_recent_resolutions(memory_conn, hours=24):
 # Human-readable labels for episode types used in summaries and pattern text.
 # Never includes IDs, table names, or internal implementation language.
 _EPISODE_TYPE_LABELS = {
-    "probation":       "account on probation",
-    "missing_discord": "Discord onboarding delay",
-    "unlinked_battle": "battle with unlinked opponent",
+    "probation":                        "account on probation",
+    "missing_discord":                  "Discord onboarding delay",
+    "training_no_engagement":           "training posted with no engagement",
+    "training_comment_needs_response":  "training comment may need a response",
+    "creator_quiet":                    "creator quiet period",
 }
 
 
