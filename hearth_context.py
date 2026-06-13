@@ -100,6 +100,35 @@ class HearthAwarenessContext:
 
 _SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
+_PATTERN_COOLDOWN_DAYS = 3
+
+
+def _should_brief(ep, now_utc) -> bool:
+    """Return True if this episode should appear in today's briefing.
+
+    awareness  → always False (tracked in memory, never surfaced in briefings)
+    pattern    → True only if never briefed or last briefed 3+ days ago
+    action_needed / critical → always True
+    NULL / unrecognized      → always True (never silently drop unclassified)
+    """
+    cat = ep["briefing_category"]
+    if cat == "awareness":
+        return False
+    if cat == "pattern":
+        last = ep["last_briefed_at"]
+        if last is None:
+            return True
+        try:
+            last_dt = datetime.fromisoformat(last)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return True
+        return (now_utc - last_dt).days >= _PATTERN_COOLDOWN_DAYS
+    if cat in ("action_needed", "critical"):
+        return True
+    return True
+
 
 def _make_concern(ep, today: date, today_str: str) -> OpenConcern:
     first_seen_str = ep["observed_at"][:10]
@@ -152,7 +181,8 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
     if tracer is None:
         tracer = _ht.NULL_TRACER
 
-    today = datetime.now(timezone.utc).date()
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.date()
     today_str = today.isoformat()
     observations = []
 
@@ -212,11 +242,18 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
         else:
             observations.append(Observation(text=f"{count} training comments came in over the last day."))
 
+    # Filter open episodes to only those that should appear in today's briefing.
+    # awareness episodes are tracked in memory but never surfaced in briefings.
+    # pattern episodes respect a 3-day cooldown via last_briefed_at.
+    # Hearth City and hearth_reader receive the full open_episodes list — only
+    # the context passed to Gemini gets the filtered briefable_episodes.
+    briefable_episodes = [ep for ep in (open_episodes or []) if _should_brief(ep, now_utc)]
+
     # Group episodes by entity_id — None means no linked person
     by_entity = {}  # entity_id (int) -> list of episode rows
     unattached_eps = []
 
-    for ep in (open_episodes or []):
+    for ep in briefable_episodes:
         eid = ep["entity_id"]
         if eid is None:
             unattached_eps.append(ep)
@@ -355,8 +392,16 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
             except Exception:
                 pass
 
+    # Stamp last_briefed_at for pattern episodes that were just included so the
+    # cooldown window starts from this run.
+    if memory_conn:
+        ts = now_utc.isoformat()
+        for ep in briefable_episodes:
+            if ep["briefing_category"] == "pattern":
+                hearth_memory.update_last_briefed_at(memory_conn, ep["id"], ts)
+
     return HearthAwarenessContext(
-        date=datetime.now().strftime("%A, %B %d, %Y"),
+        date=now_utc.strftime("%A, %B %d, %Y"),
         observations=observations,
         person_contexts=person_contexts,
         unattached_concerns=unattached_concerns,

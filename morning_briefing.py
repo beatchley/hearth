@@ -622,6 +622,7 @@ def detect_and_record_issues(memory_conn, data, tracer=None):
                 memory_conn, entity["id"], "probation",
                 f"User {row['name']} ({row['email']}) is on probation.",
                 severity="high",
+                briefing_category="action_needed",
             )
             try:
                 tracer.record(hearth_trace.TraceEntry(
@@ -651,6 +652,7 @@ def detect_and_record_issues(memory_conn, data, tracer=None):
                 memory_conn, entity["id"], "missing_discord",
                 f"User {row['name']} ({row['email']}) has not been added to Discord.",
                 severity="medium",
+                briefing_category="awareness",
             )
             try:
                 tracer.record(hearth_trace.TraceEntry(
@@ -719,6 +721,7 @@ def detect_and_record_issues(memory_conn, data, tracer=None):
                 desc,
                 severity="low",
                 reference_key=ref_key,
+                briefing_category="action_needed",
             )
             try:
                 tracer.record(hearth_trace.TraceEntry(
@@ -764,6 +767,7 @@ def detect_and_record_issues(memory_conn, data, tracer=None):
                 desc,
                 severity="low",
                 reference_key=ref_key,
+                briefing_category="awareness",
             )
             try:
                 tracer.record(hearth_trace.TraceEntry(
@@ -803,6 +807,7 @@ def detect_and_record_issues(memory_conn, data, tracer=None):
                 desc,
                 severity=severity,
                 reference_key=ref_key,
+                briefing_category="awareness",
             )
             try:
                 tracer.record(hearth_trace.TraceEntry(
@@ -876,6 +881,7 @@ def detect_and_record_issues(memory_conn, data, tracer=None):
                 desc,
                 severity=severity,
                 reference_key=ref_key,
+                briefing_category="pattern",
             )
             try:
                 tracer.record(hearth_trace.TraceEntry(

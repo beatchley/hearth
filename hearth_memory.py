@@ -67,12 +67,28 @@ def init_tables(conn):
     for migration in (
         "ALTER TABLE hearth_entities ADD COLUMN display_name TEXT;",
         "ALTER TABLE hearth_entities ADD COLUMN first_observed_at TEXT;",
+        "ALTER TABLE hearth_episodes ADD COLUMN briefing_category TEXT;",
+        "ALTER TABLE hearth_episodes ADD COLUMN last_briefed_at TEXT;",
     ):
         try:
             conn.execute(migration)
             conn.commit()
         except Exception:
             pass  # Column already exists
+    conn.execute("""
+        UPDATE hearth_episodes SET briefing_category =
+            CASE episode_type
+                WHEN 'checkin_not_submitted'           THEN 'awareness'
+                WHEN 'creator_quiet'                   THEN 'pattern'
+                WHEN 'training_comment_needs_response' THEN 'action_needed'
+                WHEN 'probation'                       THEN 'action_needed'
+                WHEN 'missing_discord'                 THEN 'awareness'
+                WHEN 'training_no_engagement'          THEN 'awareness'
+                WHEN 'unlinked_battle'                 THEN 'awareness'
+            END
+        WHERE briefing_category IS NULL;
+    """)
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +170,7 @@ def get_entity_context(memory_conn, entity_id):
 # ---------------------------------------------------------------------------
 
 def create_episode(memory_conn, entity_id, episode_type, description,
-                   severity="medium", reference_key=None):
+                   severity="medium", reference_key=None, briefing_category=None):
     """
     Record a new episode unless an identical open one already exists.
 
@@ -164,6 +180,9 @@ def create_episode(memory_conn, entity_id, episode_type, description,
 
     Returns the episode id (existing or newly created).
     """
+    if briefing_category is None:
+        briefing_category = _BRIEFING_CATEGORIES.get(episode_type)
+
     if reference_key:
         existing = memory_conn.execute(
             "SELECT id FROM hearth_episodes"
@@ -184,9 +203,10 @@ def create_episode(memory_conn, entity_id, episode_type, description,
     now = datetime.now(timezone.utc).isoformat()
     cur = memory_conn.execute(
         "INSERT INTO hearth_episodes"
-        " (entity_id, episode_type, reference_key, description, severity, observed_at)"
-        " VALUES (?, ?, ?, ?, ?, ?);",
-        (entity_id, episode_type, reference_key, description, severity, now),
+        " (entity_id, episode_type, reference_key, description, severity, observed_at,"
+        "  briefing_category)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?);",
+        (entity_id, episode_type, reference_key, description, severity, now, briefing_category),
     )
     memory_conn.commit()
     return cur.lastrowid, "created_episode"
@@ -212,6 +232,17 @@ def get_open_episodes(memory_conn, entity_id=None):
         " WHERE e.resolved = 0"
         " ORDER BY e.observed_at;"
     ).fetchall()
+
+
+def update_last_briefed_at(memory_conn, episode_id, ts=None):
+    """Record that this episode was included in a briefing. Used to enforce pattern cooldown."""
+    if ts is None:
+        ts = datetime.now(timezone.utc).isoformat()
+    memory_conn.execute(
+        "UPDATE hearth_episodes SET last_briefed_at = ? WHERE id = ?;",
+        (ts, episode_id),
+    )
+    memory_conn.commit()
 
 
 def get_recent_episodes(memory_conn, limit=50):
@@ -264,6 +295,16 @@ _EPISODE_TYPE_LABELS = {
     "training_no_engagement":           "training posted with no engagement",
     "training_comment_needs_response":  "training comment may need a response",
     "creator_quiet":                    "creator quiet period",
+}
+
+_BRIEFING_CATEGORIES = {
+    "checkin_not_submitted":            "awareness",
+    "creator_quiet":                    "pattern",
+    "training_comment_needs_response":  "action_needed",
+    "probation":                        "action_needed",
+    "missing_discord":                  "awareness",
+    "training_no_engagement":           "awareness",
+    "unlinked_battle":                  "awareness",
 }
 
 
@@ -320,7 +361,7 @@ def process_entity_observations(memory_conn, entity_id):
     exist. Summary is factual and evidence-backed.
     """
     all_episodes = memory_conn.execute(
-        "SELECT episode_type, severity, resolved, observed_at"
+        "SELECT episode_type, severity, resolved, observed_at, briefing_category"
         " FROM hearth_episodes WHERE entity_id = ? ORDER BY observed_at;",
         (entity_id,),
     ).fetchall()
@@ -334,9 +375,14 @@ def process_entity_observations(memory_conn, entity_id):
     first_observed_at = all_episodes[0]["observed_at"]
     last_observed_at = all_episodes[-1]["observed_at"]
 
-    # Count all-time occurrences per episode type
+    # Awareness episodes track state but don't count toward recurring patterns
+    # or concerns surfaced in briefings — exclude them from these learned-memory fields
+    briefable_eps = [e for e in all_episodes if e["briefing_category"] != "awareness"]
+    open_briefable_eps = [e for e in open_episodes if e["briefing_category"] != "awareness"]
+
+    # Count all-time occurrences per episode type (briefable only)
     type_counts = {}
-    for ep in all_episodes:
+    for ep in briefable_eps:
         type_counts[ep["episode_type"]] = type_counts.get(ep["episode_type"], 0) + 1
 
     # Patterns: only types seen more than once (repeated evidence rule)
@@ -346,15 +392,15 @@ def process_entity_observations(memory_conn, entity_id):
             patterns.append(f"{_episode_label(ep_type)} ({count} times)")
     patterns_noticed = "; ".join(patterns) if patterns else None
 
-    # Concerns: open episodes with actionable severity
+    # Concerns: open briefable episodes with actionable severity
     concern_labels = [
         _episode_label(ep["episode_type"])
-        for ep in open_episodes
+        for ep in open_briefable_eps
         if ep["severity"] in ("high", "medium")
     ]
     concerns = "; ".join(concern_labels) if concern_labels else None
 
-    summary = _build_entity_summary(all_episodes, open_episodes, type_counts, patterns)
+    summary = _build_entity_summary(all_episodes, open_briefable_eps, type_counts, patterns)
 
     memory_conn.execute(
         "UPDATE hearth_entities"
