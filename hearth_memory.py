@@ -299,6 +299,7 @@ _EPISODE_TYPE_LABELS = {
     "creator_quiet":                    "creator quiet period",
     "checkin_feedback_waiting":         "check-in feedback waiting",
     "training_comment_waiting":         "training comment awaiting staff response",
+    "support_request_waiting":          "support request awaiting staff response",
 }
 
 _BRIEFING_CATEGORIES = {
@@ -311,6 +312,7 @@ _BRIEFING_CATEGORIES = {
     "unlinked_battle":                  "awareness",
     "checkin_feedback_waiting":         "action_needed",
     "training_comment_waiting":         "action_needed",
+    "support_request_waiting":          "action_needed",
 }
 
 

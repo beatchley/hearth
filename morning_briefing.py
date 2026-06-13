@@ -38,8 +38,9 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 HEARTH_TRACE = os.getenv("HEARTH_TRACE", "0").strip() == "1"
 
 # Watcher thresholds — adjust here without touching watcher logic
-CHECKIN_FEEDBACK_WAITING_DAYS  = 3   # flag a submitted check-in after this many days with no feedback
-TRAINING_COMMENT_WAITING_DAYS  = 3   # flag a creator training comment after this many days with no staff response
+CHECKIN_FEEDBACK_WAITING_DAYS   = 3   # flag a submitted check-in after this many days with no feedback
+TRAINING_COMMENT_WAITING_DAYS   = 3   # flag a creator training comment after this many days with no staff response
+SUPPORT_REQUEST_WAITING_DAYS    = 3   # flag an open support thread after this many days with no staff response
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +290,57 @@ def query_training_comment_waiting(conn, cutoff: datetime):
     return safe_query(conn, "Training comments awaiting staff response", sql, (cutoff.isoformat(),))
 
 
+def query_support_request_waiting(conn, cutoff: datetime):
+    """Open support threads where the latest message is from a creator (not staff)
+    and has been waiting longer than SUPPORT_REQUEST_WAITING_DAYS.
+
+    Threads created by staff are excluded. Staff roles: ceo, it, manager, coach.
+    Triggers when:
+      - Thread status is 'open'
+      - Creator is not a staff member
+      - Latest message is from the creator (not staff), or no messages exist yet
+      - That latest creator message (or thread created_at if no messages) is older than cutoff
+    """
+    sql = """
+        WITH last_msg AS (
+            SELECT thread_id,
+                   MAX(created_at) AS last_msg_at
+            FROM support_messages
+            GROUP BY thread_id
+        ),
+        last_msg_detail AS (
+            SELECT sm.thread_id, sm.author_id, sm.created_at AS last_msg_at,
+                   u.role AS last_author_role
+            FROM support_messages sm
+            JOIN users u ON u.id = sm.author_id
+            INNER JOIN last_msg lm ON lm.thread_id = sm.thread_id
+                                   AND sm.created_at = lm.last_msg_at
+        )
+        SELECT
+            st.id                                               AS thread_id,
+            st.creator_id,
+            st.subject,
+            st.created_at,
+            COALESCE(NULLIF(u.tiktok_handle, ''), u.name)      AS display_name,
+            COALESCE(lmd.last_msg_at, st.created_at)           AS last_waiting_at,
+            CAST(julianday('now') - julianday(
+                COALESCE(lmd.last_msg_at, st.created_at)
+            ) AS INTEGER)                                       AS days_waiting
+        FROM support_threads st
+        JOIN users u ON u.id = st.creator_id
+        LEFT JOIN last_msg_detail lmd ON lmd.thread_id = st.id
+        WHERE st.status = 'open'
+          AND u.role NOT IN ('ceo', 'it', 'manager', 'coach')
+          AND (
+              lmd.thread_id IS NULL
+              OR lmd.last_author_role NOT IN ('ceo', 'it', 'manager', 'coach')
+          )
+          AND COALESCE(lmd.last_msg_at, st.created_at) <= ?
+        ORDER BY days_waiting DESC;
+    """
+    return safe_query(conn, "Support requests awaiting response", sql, (cutoff.isoformat(),))
+
+
 def query_creator_quiet(conn):
     """
     Approved pathway/shop creators with no meaningful activity for 14+ days.
@@ -433,6 +485,7 @@ def collect_data(conn):
     since_7d = now_utc - timedelta(days=7)
     feedback_cutoff = now_utc - timedelta(days=CHECKIN_FEEDBACK_WAITING_DAYS)
     comment_cutoff  = now_utc - timedelta(days=TRAINING_COMMENT_WAITING_DAYS)
+    support_cutoff  = now_utc - timedelta(days=SUPPORT_REQUEST_WAITING_DAYS)
 
     results = {}
     queries = [
@@ -446,6 +499,7 @@ def collect_data(conn):
         lambda: query_checkins_not_submitted(conn),
         lambda: query_checkin_feedback_waiting(conn, feedback_cutoff),
         lambda: query_training_comment_waiting(conn, comment_cutoff),
+        lambda: query_support_request_waiting(conn, support_cutoff),
         lambda: query_creator_quiet(conn),
     ]
     for q in queries:
@@ -535,6 +589,15 @@ def resolve_stale_issues(memory_conn, data, tracer=None):
     else:
         current_comment_waiting_keys = None  # query failed — skip this type
 
+    # Build the set of support thread reference_keys still awaiting staff response
+    support_waiting_rows = data.get("Support requests awaiting response", [])
+    if isinstance(support_waiting_rows, list):
+        current_support_waiting_keys = {
+            f"support_request_waiting_{row['thread_id']}" for row in support_waiting_rows
+        }
+    else:
+        current_support_waiting_keys = None  # query failed — skip this type
+
     for ep in hearth_memory.get_open_episodes(memory_conn):
         ep_type = ep["episode_type"]
         user_id = ep["user_id"]
@@ -576,6 +639,11 @@ def resolve_stale_issues(memory_conn, data, tracer=None):
             should_resolve = ref_key is not None and ref_key not in current_comment_waiting_keys
             if should_resolve:
                 resolve_reason = "staff response received or comment no longer exists"
+
+        elif ep_type == "support_request_waiting" and current_support_waiting_keys is not None:
+            should_resolve = ref_key is not None and ref_key not in current_support_waiting_keys
+            if should_resolve:
+                resolve_reason = "staff response received, ticket closed, or ticket no longer exists"
 
         if should_resolve:
             hearth_memory.resolve_episode(memory_conn, ep["id"], now)
@@ -1185,6 +1253,76 @@ def detect_training_comment_waiting(memory_conn, data, tracer=None):
 
 
 # ---------------------------------------------------------------------------
+# Watcher: support_request_waiting
+# ---------------------------------------------------------------------------
+
+def detect_support_request_waiting(memory_conn, data, tracer=None):
+    """
+    Watcher #3: Support Request Waiting.
+
+    Flags open support threads where the latest message is from the creator (not staff)
+    and that message has been waiting longer than SUPPORT_REQUEST_WAITING_DAYS days.
+    Staff-created threads are excluded.
+
+    One episode per thread (reference_key = support_request_waiting_{thread_id}).
+    Resolves automatically when staff responds (status becomes 'answered'), thread is
+    closed, or the thread no longer exists.
+    """
+    if tracer is None:
+        tracer = hearth_trace.NULL_TRACER
+
+    rows = data.get("Support requests awaiting response", [])
+    if not isinstance(rows, list):
+        return
+
+    for row in rows:
+        thread_id    = row["thread_id"]
+        creator_id   = row["creator_id"]
+        display_name = row["display_name"] or "a creator"
+        subject      = row["subject"] or "a support request"
+        days         = row["days_waiting"] if row["days_waiting"] is not None else 0
+        ref_key      = f"support_request_waiting_{thread_id}"
+
+        desc = (
+            f"Creator @{display_name} submitted a support request '{subject}' "
+            f"{days} days ago and has not received a response."
+        )
+
+        severity = "high" if days >= 7 else "medium"
+
+        entity = hearth_memory.get_or_create_entity(memory_conn, creator_id)
+        _ep_id, action = hearth_memory.create_episode(
+            memory_conn, entity["id"], "support_request_waiting",
+            desc,
+            severity=severity,
+            reference_key=ref_key,
+            briefing_category="action_needed",
+        )
+        try:
+            tracer.record(hearth_trace.TraceEntry(
+                rule_name="support_request_waiting",
+                episode_type="support_request_waiting",
+                action_taken=action,
+                reason=f"support thread open {days} days with no staff response",
+                source_table="support_threads + support_messages + users",
+                source_record_id=thread_id,
+                reference_key=ref_key,
+                source_fields={
+                    "thread_id": thread_id,
+                    "subject": subject,
+                    "days_waiting": days,
+                    "created_at": row["created_at"],
+                    "display_name": display_name,
+                },
+                entity_user_id=creator_id,
+                entity_display_name=entity["display_name"],
+                confidence="high",
+            ))
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Hearth message generation — Gemini is the voice layer, not the identity
 # ---------------------------------------------------------------------------
 
@@ -1275,6 +1413,7 @@ def run_pipeline(db_path: str, gemini_api_key: str) -> str:
         detect_and_record_issues(memory_conn, data, tracer)
         detect_checkin_feedback_waiting(memory_conn, data, tracer)
         detect_training_comment_waiting(memory_conn, data, tracer)
+        detect_support_request_waiting(memory_conn, data, tracer)
         hearth_memory.process_all_entities(memory_conn)
         open_episodes = hearth_memory.get_open_episodes(memory_conn)
         awareness = hearth_context.build_context(data, open_episodes, memory_conn, tracer)
@@ -1339,6 +1478,7 @@ def main():
         detect_and_record_issues(memory_conn, data, tracer)
         detect_checkin_feedback_waiting(memory_conn, data, tracer)
         detect_training_comment_waiting(memory_conn, data, tracer)
+        detect_support_request_waiting(memory_conn, data, tracer)
 
         # Step 8: Update learned observations for all entities
         hearth_memory.process_all_entities(memory_conn)
