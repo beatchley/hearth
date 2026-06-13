@@ -85,6 +85,8 @@ def init_tables(conn):
                 WHEN 'missing_discord'                 THEN 'awareness'
                 WHEN 'training_no_engagement'          THEN 'awareness'
                 WHEN 'unlinked_battle'                 THEN 'awareness'
+                WHEN 'checkin_feedback_waiting'        THEN 'action_needed'
+                WHEN 'training_comment_waiting'        THEN 'action_needed'
             END
         WHERE briefing_category IS NULL;
     """)
@@ -295,6 +297,8 @@ _EPISODE_TYPE_LABELS = {
     "training_no_engagement":           "training posted with no engagement",
     "training_comment_needs_response":  "training comment may need a response",
     "creator_quiet":                    "creator quiet period",
+    "checkin_feedback_waiting":         "check-in feedback waiting",
+    "training_comment_waiting":         "training comment awaiting staff response",
 }
 
 _BRIEFING_CATEGORIES = {
@@ -305,6 +309,8 @@ _BRIEFING_CATEGORIES = {
     "missing_discord":                  "awareness",
     "training_no_engagement":           "awareness",
     "unlinked_battle":                  "awareness",
+    "checkin_feedback_waiting":         "action_needed",
+    "training_comment_waiting":         "action_needed",
 }
 
 

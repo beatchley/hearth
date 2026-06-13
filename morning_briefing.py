@@ -37,6 +37,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 HEARTH_TRACE = os.getenv("HEARTH_TRACE", "0").strip() == "1"
 
+# Watcher thresholds — adjust here without touching watcher logic
+CHECKIN_FEEDBACK_WAITING_DAYS  = 3   # flag a submitted check-in after this many days with no feedback
+TRAINING_COMMENT_WAITING_DAYS  = 3   # flag a creator training comment after this many days with no staff response
+
 
 # ---------------------------------------------------------------------------
 # Database helpers — read-only throughout
@@ -211,6 +215,80 @@ def query_checkins_not_submitted(conn):
     return safe_query(conn, "Check-ins not submitted (7+ days)", sql)
 
 
+def query_checkin_feedback_waiting(conn, cutoff: datetime):
+    """Submitted check-ins where the creator has submitted but no feedback has been provided.
+
+    Triggers after CHECKIN_FEEDBACK_WAITING_DAYS — cutoff is now minus that many days,
+    so submitted_at <= cutoff means the submission has been waiting at least that long.
+    Only includes submissions still in 'Submitted' status (not yet FeedbackComplete).
+    """
+    sql = """
+        SELECT
+            cs.id                                               AS submission_id,
+            cs.checkin_id,
+            cs.user_id,
+            cs.submitted_at,
+            ci.title                                            AS checkin_title,
+            COALESCE(NULLIF(u.tiktok_handle, ''), u.name)      AS display_name,
+            u.assigned_coach_id,
+            COALESCE(NULLIF(cu.tiktok_handle, ''), cu.name)    AS coach_display_name,
+            CAST(julianday('now') - julianday(cs.submitted_at) AS INTEGER) AS days_waiting
+        FROM checkin_submissions cs
+        JOIN checkins ci    ON ci.id   = cs.checkin_id
+        JOIN users u        ON u.id    = cs.user_id
+        LEFT JOIN users cu  ON cu.id   = u.assigned_coach_id
+        WHERE cs.status = 'Submitted'
+          AND cs.submitted_at IS NOT NULL
+          AND cs.submitted_at <= ?
+        ORDER BY cs.submitted_at ASC;
+    """
+    return safe_query(conn, "Check-ins awaiting feedback", sql, (cutoff.isoformat(),))
+
+
+def query_training_comment_waiting(conn, cutoff: datetime):
+    """Creator comments on trainings with no staff response after TRAINING_COMMENT_WAITING_DAYS.
+
+    Staff roles: ceo, it, manager, coach (anyone whose role is not 'member').
+    A staff response is either:
+      - a reply (training_comment_replies) from a staff user on the same comment, OR
+      - a later training_comments row from a staff user on the same training.
+    The cutoff date (now - threshold) filters to comments old enough to flag.
+    """
+    sql = """
+        SELECT
+            tc.id                                               AS comment_id,
+            tc.training_id,
+            tc.user_id,
+            tc.content,
+            tc.created_at,
+            COALESCE(NULLIF(u.tiktok_handle, ''), u.name)      AS display_name,
+            t.title                                             AS training_title,
+            CAST(julianday('now') - julianday(tc.created_at) AS INTEGER) AS days_waiting
+        FROM training_comments tc
+        JOIN users u     ON u.id  = tc.user_id
+        JOIN trainings t ON t.id  = tc.training_id
+        WHERE u.role NOT IN ('ceo', 'it', 'manager', 'coach')
+          AND tc.created_at <= ?
+          AND NOT EXISTS (
+              SELECT 1
+              FROM training_comment_replies tcr
+              JOIN users ru ON ru.id = tcr.user_id
+              WHERE tcr.comment_id = tc.id
+                AND ru.role IN ('ceo', 'it', 'manager', 'coach')
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM training_comments tc2
+              JOIN users ru2 ON ru2.id = tc2.user_id
+              WHERE tc2.training_id = tc.training_id
+                AND tc2.created_at > tc.created_at
+                AND ru2.role IN ('ceo', 'it', 'manager', 'coach')
+          )
+        ORDER BY tc.created_at ASC;
+    """
+    return safe_query(conn, "Training comments awaiting staff response", sql, (cutoff.isoformat(),))
+
+
 def query_creator_quiet(conn):
     """
     Approved pathway/shop creators with no meaningful activity for 14+ days.
@@ -353,6 +431,8 @@ def collect_data(conn):
     since_24h = now_utc - timedelta(hours=24)
     since_48h = now_utc - timedelta(hours=48)
     since_7d = now_utc - timedelta(days=7)
+    feedback_cutoff = now_utc - timedelta(days=CHECKIN_FEEDBACK_WAITING_DAYS)
+    comment_cutoff  = now_utc - timedelta(days=TRAINING_COMMENT_WAITING_DAYS)
 
     results = {}
     queries = [
@@ -364,6 +444,8 @@ def collect_data(conn):
         lambda: query_missing_discord(conn),
         lambda: query_trainings_no_engagement(conn, since_7d, since_24h),
         lambda: query_checkins_not_submitted(conn),
+        lambda: query_checkin_feedback_waiting(conn, feedback_cutoff),
+        lambda: query_training_comment_waiting(conn, comment_cutoff),
         lambda: query_creator_quiet(conn),
     ]
     for q in queries:
@@ -435,6 +517,24 @@ def resolve_stale_issues(memory_conn, data, tracer=None):
     else:
         current_quiet_keys = None  # query failed — skip this type
 
+    # Build the set of submission reference_keys still awaiting feedback
+    feedback_waiting_rows = data.get("Check-ins awaiting feedback", [])
+    if isinstance(feedback_waiting_rows, list):
+        current_feedback_waiting_keys = {
+            f"checkin_feedback_{row['submission_id']}" for row in feedback_waiting_rows
+        }
+    else:
+        current_feedback_waiting_keys = None  # query failed — skip this type
+
+    # Build the set of comment reference_keys still awaiting a staff response
+    comment_waiting_rows = data.get("Training comments awaiting staff response", [])
+    if isinstance(comment_waiting_rows, list):
+        current_comment_waiting_keys = {
+            f"training_comment_waiting_{row['comment_id']}" for row in comment_waiting_rows
+        }
+    else:
+        current_comment_waiting_keys = None  # query failed — skip this type
+
     for ep in hearth_memory.get_open_episodes(memory_conn):
         ep_type = ep["episode_type"]
         user_id = ep["user_id"]
@@ -466,6 +566,16 @@ def resolve_stale_issues(memory_conn, data, tracer=None):
             should_resolve = ref_key is not None and ref_key not in current_quiet_keys
             if should_resolve:
                 resolve_reason = "creator_activity_resumed"
+
+        elif ep_type == "checkin_feedback_waiting" and current_feedback_waiting_keys is not None:
+            should_resolve = ref_key is not None and ref_key not in current_feedback_waiting_keys
+            if should_resolve:
+                resolve_reason = "feedback provided or submission no longer awaiting review"
+
+        elif ep_type == "training_comment_waiting" and current_comment_waiting_keys is not None:
+            should_resolve = ref_key is not None and ref_key not in current_comment_waiting_keys
+            if should_resolve:
+                resolve_reason = "staff response received or comment no longer exists"
 
         if should_resolve:
             hearth_memory.resolve_episode(memory_conn, ep["id"], now)
@@ -919,6 +1029,162 @@ def detect_and_record_issues(memory_conn, data, tracer=None):
 
 
 # ---------------------------------------------------------------------------
+# Watcher: checkin_feedback_waiting
+# ---------------------------------------------------------------------------
+
+def detect_checkin_feedback_waiting(memory_conn, data, tracer=None):
+    """
+    Watcher #1: Check-In Feedback Waiting.
+
+    Flags submitted check-ins where the creator has submitted their responses
+    but no coach feedback has been provided after CHECKIN_FEEDBACK_WAITING_DAYS days.
+
+    One episode per submission (reference_key = checkin_feedback_{submission_id}).
+    Resolves automatically when the submission moves out of 'Submitted' status
+    (i.e. FeedbackComplete or back to Assigned).
+    """
+    if tracer is None:
+        tracer = hearth_trace.NULL_TRACER
+
+    rows = data.get("Check-ins awaiting feedback", [])
+    if not isinstance(rows, list):
+        return
+
+    for row in rows:
+        submission_id  = row["submission_id"]
+        creator_id     = row["user_id"]
+        display_name   = row["display_name"] or "a creator"
+        title          = row["checkin_title"] or "a check-in"
+        days           = row["days_waiting"] if row["days_waiting"] is not None else 0
+        coach_name     = row["coach_display_name"]
+        ref_key        = f"checkin_feedback_{submission_id}"
+
+        if coach_name:
+            desc = (
+                f"@{display_name} submitted \"{title}\" {days} days ago"
+                f" and has not yet received feedback from {coach_name}."
+            )
+        else:
+            desc = (
+                f"@{display_name} submitted \"{title}\" {days} days ago"
+                f" and has not yet received coach feedback."
+            )
+
+        severity = "high" if days >= 7 else "medium"
+
+        entity = hearth_memory.get_or_create_entity(memory_conn, creator_id)
+        _ep_id, action = hearth_memory.create_episode(
+            memory_conn, entity["id"], "checkin_feedback_waiting",
+            desc,
+            severity=severity,
+            reference_key=ref_key,
+            briefing_category="action_needed",
+        )
+        try:
+            tracer.record(hearth_trace.TraceEntry(
+                rule_name="checkin_feedback_waiting",
+                episode_type="checkin_feedback_waiting",
+                action_taken=action,
+                reason=f"submission.status == 'Submitted', {days} days since submitted_at",
+                source_table="checkin_submissions + checkins + users",
+                source_record_id=submission_id,
+                reference_key=ref_key,
+                source_fields={
+                    "submission_id": submission_id,
+                    "checkin_id": row["checkin_id"],
+                    "checkin_title": title,
+                    "days_waiting": days,
+                    "submitted_at": row["submitted_at"],
+                    "display_name": display_name,
+                    "coach_display_name": coach_name,
+                },
+                entity_user_id=creator_id,
+                entity_display_name=entity["display_name"],
+                confidence="high",
+            ))
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Watcher: training_comment_waiting
+# ---------------------------------------------------------------------------
+
+def detect_training_comment_waiting(memory_conn, data, tracer=None):
+    """
+    Watcher #2: Training Comment Waiting.
+
+    Flags creator comments on training items that have gone TRAINING_COMMENT_WAITING_DAYS
+    days without any staff response (via reply or a later comment from staff on the same
+    training). Staff roles: ceo, it, manager, coach.
+
+    One episode per comment (reference_key = training_comment_waiting_{comment_id}).
+    Resolves automatically when a staff response appears or the comment is deleted.
+    """
+    if tracer is None:
+        tracer = hearth_trace.NULL_TRACER
+
+    rows = data.get("Training comments awaiting staff response", [])
+    if not isinstance(rows, list):
+        return
+
+    for row in rows:
+        comment_id   = row["comment_id"]
+        creator_id   = row["user_id"]
+        display_name = row["display_name"] or "a creator"
+        title        = row["training_title"] or "a training"
+        days         = row["days_waiting"] if row["days_waiting"] is not None else 0
+        content      = row["content"] or ""
+        ref_key      = f"training_comment_waiting_{comment_id}"
+
+        preview = content[:100].strip()
+        if len(content) > 100:
+            preview += "..."
+
+        desc = (
+            f"@{display_name} commented on \"{title}\" {days} days ago"
+            f" and has not received a staff response."
+        )
+        if preview:
+            desc += f" Comment: \"{preview}\""
+
+        severity = "high" if days >= 7 else "medium"
+
+        entity = hearth_memory.get_or_create_entity(memory_conn, creator_id)
+        _ep_id, action = hearth_memory.create_episode(
+            memory_conn, entity["id"], "training_comment_waiting",
+            desc,
+            severity=severity,
+            reference_key=ref_key,
+            briefing_category="action_needed",
+        )
+        try:
+            tracer.record(hearth_trace.TraceEntry(
+                rule_name="training_comment_waiting",
+                episode_type="training_comment_waiting",
+                action_taken=action,
+                reason=f"creator comment {days} days old with no staff response",
+                source_table="training_comments + trainings + users",
+                source_record_id=comment_id,
+                reference_key=ref_key,
+                source_fields={
+                    "comment_id": comment_id,
+                    "training_id": row["training_id"],
+                    "training_title": title,
+                    "days_waiting": days,
+                    "created_at": row["created_at"],
+                    "display_name": display_name,
+                    "content_preview": content[:80],
+                },
+                entity_user_id=creator_id,
+                entity_display_name=entity["display_name"],
+                confidence="high",
+            ))
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Hearth message generation — Gemini is the voice layer, not the identity
 # ---------------------------------------------------------------------------
 
@@ -1007,6 +1273,8 @@ def run_pipeline(db_path: str, gemini_api_key: str) -> str:
         resolve_stale_issues(memory_conn, data, tracer)
         resolve_legacy_unlinked_battles(memory_conn, tracer)
         detect_and_record_issues(memory_conn, data, tracer)
+        detect_checkin_feedback_waiting(memory_conn, data, tracer)
+        detect_training_comment_waiting(memory_conn, data, tracer)
         hearth_memory.process_all_entities(memory_conn)
         open_episodes = hearth_memory.get_open_episodes(memory_conn)
         awareness = hearth_context.build_context(data, open_episodes, memory_conn, tracer)
@@ -1069,6 +1337,8 @@ def main():
         # Step 7: Record new issues into Hearth's memory
         print("Updating Hearth memory...")
         detect_and_record_issues(memory_conn, data, tracer)
+        detect_checkin_feedback_waiting(memory_conn, data, tracer)
+        detect_training_comment_waiting(memory_conn, data, tracer)
 
         # Step 8: Update learned observations for all entities
         hearth_memory.process_all_entities(memory_conn)
