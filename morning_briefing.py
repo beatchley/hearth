@@ -11,6 +11,7 @@ Usage:
     python morning_briefing.py
 """
 
+import argparse
 import os
 import sqlite3
 import sys
@@ -23,8 +24,10 @@ from google import genai
 from dotenv import load_dotenv
 
 import hearth_memory
+import hearth_questions
 import hearth_relationships
 import hearth_context
+import hearth_soul
 import hearth_trace
 
 # ---------------------------------------------------------------------------
@@ -1548,22 +1551,41 @@ def generate_hearth_message(awareness_context: hearth_context.HearthAwarenessCon
     return response.text
 
 
-def run_pipeline(db_path: str, gemini_api_key: str) -> str:
+def run_pipeline(db_path=None, gemini_api_key=None, scan_mode="morning",
+                 send_brief=None, force_brief=False):
     """
-    Run the full Hearth briefing pipeline and return the generated message.
+    Run the Hearth pipeline for the given scan mode.
 
-    Safe to call from external code (no sys.exit, no module-level side effects).
-    Raises on failure — the caller is responsible for graceful error handling.
+    scan_mode "morning"  → send_brief defaults to True (generates and returns briefing).
+    scan_mode "midday", "evening", "manual" → send_brief defaults to False (watchers and
+    reflection run; no Gemini call; returns None).
+    Passing send_brief explicitly overrides the scan_mode default.
+    force_brief=True bypasses the daily duplicate guard.
 
-    Pipeline:
-        Pathway Data → Hearth Memory → Hearth Awareness Context → Gemini → Hearth Message
+    Backward-compatible: existing callers passing (db_path, gemini_api_key) positionally
+    continue to work unchanged.
+
+    Returns the generated briefing text, or None if no briefing was produced.
     """
-    gemini_client = genai.Client(api_key=gemini_api_key)
+    if db_path is None:
+        raw = DATABASE_URL or ""
+        db_path = raw[len("sqlite:///"):] if raw.startswith("sqlite:///") else raw
+    if gemini_api_key is None:
+        gemini_api_key = GEMINI_API_KEY
+
+    if send_brief is None:
+        effective_send_brief = (scan_mode == "morning")
+    else:
+        effective_send_brief = bool(send_brief)
+
+    print(f"[HEARTH SCAN] mode={scan_mode} send_brief={effective_send_brief}")
+
     tracer = hearth_trace.Tracer()
-
     memory_conn = hearth_memory.get_memory_connection()
     try:
         hearth_memory.init_tables(memory_conn)
+        hearth_soul.ensure_reflections_table(memory_conn)
+        hearth_questions.ensure_questions_table(memory_conn)
 
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
@@ -1583,12 +1605,55 @@ def run_pipeline(db_path: str, gemini_api_key: str) -> str:
         detect_support_request_waiting(memory_conn, data, tracer)
         detect_new_creator_stuck(memory_conn, data, tracer)
         hearth_memory.process_all_entities(memory_conn)
+
         open_episodes = hearth_memory.get_open_episodes(memory_conn)
+        open_questions = hearth_questions.list_open_questions(memory_conn)
         awareness = hearth_context.build_context(data, open_episodes, memory_conn, tracer)
+
+        reflection_id = hearth_soul.generate_reflection(
+            memory_conn,
+            new_episodes=open_episodes,
+            open_concerns=open_episodes,
+            open_questions=open_questions,
+            source_run=scan_mode,
+            auto_question=True,
+        )
+        print(f"[HEARTH REFLECTION] reflection_id={reflection_id} source_run={scan_mode}")
+
+        if not effective_send_brief:
+            print("[HEARTH BRIEF] skipped: non-morning scan")
+            if HEARTH_TRACE:
+                tracer.print_report()
+            return None
+
+        # Daily duplicate guard — query Pathway DB for a Hearth brief sent today (UTC).
+        if not force_brief:
+            guard_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            guard_conn.row_factory = sqlite3.Row
+            try:
+                today_utc = datetime.now(timezone.utc).date().isoformat()
+                already_sent = guard_conn.execute(
+                    "SELECT 1 FROM admin_chat_messages"
+                    " WHERE is_hearth = 1 AND DATE(created_at) = ?"
+                    " LIMIT 1;",
+                    (today_utc,),
+                ).fetchone()
+                if already_sent:
+                    print("[HEARTH BRIEF] skipped: already sent today")
+                    if HEARTH_TRACE:
+                        tracer.print_report()
+                    return None
+            except Exception:
+                pass  # table not present or query failed — proceed with send
+            finally:
+                guard_conn.close()
+
+        gemini_client = genai.Client(api_key=gemini_api_key)
         message = generate_hearth_message(awareness, gemini_client=gemini_client)
         if HEARTH_TRACE:
             tracer.print_report()
         return message
+
     finally:
         memory_conn.close()
 
@@ -1597,7 +1662,7 @@ def run_pipeline(db_path: str, gemini_api_key: str) -> str:
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def main(scan_mode="morning", send_brief=None, force_brief=False):
     if not GEMINI_API_KEY:
         sys.exit("ERROR: GEMINI_API_KEY is missing. Add it to your .env file.")
     if not DATABASE_URL:
@@ -1608,75 +1673,41 @@ def main():
     else:
         db_path = DATABASE_URL
 
-    print("Hearth Morning Briefing — connecting to Pathway Portal...")
-    tracer = hearth_trace.Tracer()
-
-    memory_conn = hearth_memory.get_memory_connection()
-    try:
-        # Step 1: Initialize Hearth's memory tables
-        hearth_memory.init_tables(memory_conn)
-
-        conn = get_connection()
-        try:
-            # Step 2: Sync Pathway users into Hearth's entity table
-            hearth_memory.sync_users_to_entities(memory_conn, conn)
-
-            # Step 3: Discover and store relationship roads from Pathway
-            hearth_relationships.init_relationship_tables(memory_conn)
-            hearth_relationships.discover_relationships(memory_conn, conn)
-
-            # Step 4: Discover schema (debug output only — not passed to LLM)
-            schema = discover_schema(conn)
-            print_schema(schema)
-
-            # Step 5: Collect operational data from Pathway
-            print("Collecting operational data...")
-            data = collect_data(conn)
-        finally:
-            conn.close()
-
-        # Step 6: Close episodes whose conditions are no longer present in Pathway
-        resolve_stale_issues(memory_conn, data, tracer)
-
-        # Step 6b: Resolve open unlinked_battle episodes — rule disabled (see function docstring)
-        resolve_legacy_unlinked_battles(memory_conn, tracer)
-
-        # Step 7: Record new issues into Hearth's memory
-        print("Updating Hearth memory...")
-        detect_and_record_issues(memory_conn, data, tracer)
-        detect_checkin_feedback_waiting(memory_conn, data, tracer)
-        detect_training_comment_waiting(memory_conn, data, tracer)
-        detect_support_request_waiting(memory_conn, data, tracer)
-        detect_new_creator_stuck(memory_conn, data, tracer)
-
-        # Step 8: Update learned observations for all entities
-        hearth_memory.process_all_entities(memory_conn)
-
-        # Step 9: Load all open episodes from Hearth's memory
-        open_episodes = hearth_memory.get_open_episodes(memory_conn)
-        print(f"  {len(open_episodes)} open episode(s) in memory.")
-
-        # Step 10: Build Hearth's awareness context
-        print("Building Hearth awareness context...")
-        awareness = hearth_context.build_context(data, open_episodes, memory_conn, tracer)
-
-        # Step 11: Generate the Hearth message via Gemini
-        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-        print("Generating Hearth message...\n")
-        message = generate_hearth_message(awareness, gemini_client=gemini_client)
-
-        # Step 12: Print the result
+    print("Hearth — connecting to Pathway Portal...")
+    message = run_pipeline(
+        db_path=db_path,
+        gemini_api_key=GEMINI_API_KEY,
+        scan_mode=scan_mode,
+        send_brief=send_brief,
+        force_brief=force_brief,
+    )
+    if message:
         print("=" * 60)
         print(message)
         print("=" * 60)
 
-        # Step 13: Print full trace report if requested
-        if HEARTH_TRACE:
-            tracer.print_report()
-
-    finally:
-        memory_conn.close()
-
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Hearth pipeline runner")
+    parser.add_argument(
+        "--scan",
+        choices=["morning", "midday", "evening", "manual"],
+        default="morning",
+        dest="scan_mode",
+        help="Scan mode (default: morning)",
+    )
+    parser.add_argument(
+        "--force-brief",
+        action="store_true",
+        default=False,
+        help="Bypass the daily duplicate guard and send briefing regardless",
+    )
+    parser.add_argument(
+        "--send-brief",
+        action="store_true",
+        default=False,
+        help="Force briefing generation regardless of scan mode",
+    )
+    args = parser.parse_args()
+    send_brief_override = True if args.send_brief else None
+    main(scan_mode=args.scan_mode, send_brief=send_brief_override, force_brief=args.force_brief)
