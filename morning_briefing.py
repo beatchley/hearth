@@ -41,6 +41,7 @@ HEARTH_TRACE = os.getenv("HEARTH_TRACE", "0").strip() == "1"
 CHECKIN_FEEDBACK_WAITING_DAYS   = 3   # flag a submitted check-in after this many days with no feedback
 TRAINING_COMMENT_WAITING_DAYS   = 3   # flag a creator training comment after this many days with no staff response
 SUPPORT_REQUEST_WAITING_DAYS    = 3   # flag an open support thread after this many days with no staff response
+NEW_CREATOR_STUCK_DAYS          = 14  # flag a new creator with zero engagement after this many days since joining
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +342,88 @@ def query_support_request_waiting(conn, cutoff: datetime):
     return safe_query(conn, "Support requests awaiting response", sql, (cutoff.isoformat(),))
 
 
+def query_new_creator_stuck(conn):
+    """Approved creators who joined NEW_CREATOR_STUCK_DAYS+ days ago with zero engagement.
+
+    Uses the same creator filter as creator_quiet (approved, is_pathway_creator or
+    is_shop_creator, non-staff role) plus a joined_on threshold. Returns only creators
+    with no engagement signals across all meaningful signal tables. Excludes page_visits
+    (passive) and private_messages (ambiguous sender — often coach-initiated).
+    """
+    sql = """
+        WITH creators AS (
+            SELECT id,
+                   COALESCE(NULLIF(tiktok_handle, ''), name) AS display_name,
+                   joined_on,
+                   assigned_coach_id,
+                   CAST(julianday('now') - julianday(joined_on) AS INTEGER) AS days_since_joining
+            FROM users
+            WHERE status = 'approved'
+              AND (is_pathway_creator = 1 OR is_shop_creator = 1)
+              AND role NOT IN ('ceo', 'it', 'manager', 'coach')
+              AND joined_on IS NOT NULL
+              AND julianday('now') - julianday(joined_on) >= ?
+        ),
+        activity AS (
+            SELECT user_id FROM checkin_submissions
+            WHERE user_id IN (SELECT id FROM creators)
+              AND submitted_at IS NOT NULL
+
+            UNION ALL
+            SELECT creator_user_id FROM battles
+            WHERE creator_user_id IN (SELECT id FROM creators)
+              AND battle_date <= date('now')
+
+            UNION ALL
+            SELECT creator_id FROM battle_requests
+            WHERE creator_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT user_id FROM training_comments
+            WHERE user_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT user_id FROM training_comment_replies
+            WHERE user_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT author_id FROM posts
+            WHERE author_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT author_id FROM comments
+            WHERE author_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT author_id FROM support_messages
+            WHERE author_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT user_id FROM pathway_event_signups
+            WHERE user_id IN (SELECT id FROM creators)
+
+            UNION ALL
+            SELECT user_id FROM role_hub_chat_messages
+            WHERE user_id IN (SELECT id FROM creators)
+        ),
+        engaged_creators AS (
+            SELECT DISTINCT user_id FROM activity
+        )
+        SELECT
+            c.id                                                AS user_id,
+            c.display_name,
+            c.joined_on,
+            c.days_since_joining,
+            c.assigned_coach_id,
+            COALESCE(NULLIF(cu.tiktok_handle, ''), cu.name)    AS coach_display_name
+        FROM creators c
+        LEFT JOIN users cu ON cu.id = c.assigned_coach_id
+        WHERE c.id NOT IN (SELECT user_id FROM engaged_creators)
+        ORDER BY c.days_since_joining DESC;
+    """
+    return safe_query(conn, "New creators stuck (14+ days)", sql, (NEW_CREATOR_STUCK_DAYS,))
+
+
 def query_creator_quiet(conn):
     """
     Approved pathway/shop creators with no meaningful activity for 14+ days.
@@ -500,6 +583,7 @@ def collect_data(conn):
         lambda: query_checkin_feedback_waiting(conn, feedback_cutoff),
         lambda: query_training_comment_waiting(conn, comment_cutoff),
         lambda: query_support_request_waiting(conn, support_cutoff),
+        lambda: query_new_creator_stuck(conn),
         lambda: query_creator_quiet(conn),
     ]
     for q in queries:
@@ -598,6 +682,13 @@ def resolve_stale_issues(memory_conn, data, tracer=None):
     else:
         current_support_waiting_keys = None  # query failed — skip this type
 
+    # Build the set of reference_keys for creators still stuck (joined 14+ days, zero engagement)
+    stuck_rows = data.get("New creators stuck (14+ days)", [])
+    if isinstance(stuck_rows, list):
+        current_stuck_keys = {f"new_creator_stuck_{row['user_id']}" for row in stuck_rows}
+    else:
+        current_stuck_keys = None  # query failed — skip this type
+
     for ep in hearth_memory.get_open_episodes(memory_conn):
         ep_type = ep["episode_type"]
         user_id = ep["user_id"]
@@ -644,6 +735,11 @@ def resolve_stale_issues(memory_conn, data, tracer=None):
             should_resolve = ref_key is not None and ref_key not in current_support_waiting_keys
             if should_resolve:
                 resolve_reason = "staff response received, ticket closed, or ticket no longer exists"
+
+        elif ep_type == "new_creator_stuck" and current_stuck_keys is not None:
+            should_resolve = ref_key is not None and ref_key not in current_stuck_keys
+            if should_resolve:
+                resolve_reason = "creator has established engagement or account is no longer active"
 
         if should_resolve:
             hearth_memory.resolve_episode(memory_conn, ep["id"], now)
@@ -1323,6 +1419,77 @@ def detect_support_request_waiting(memory_conn, data, tracer=None):
 
 
 # ---------------------------------------------------------------------------
+# Watcher: new_creator_stuck
+# ---------------------------------------------------------------------------
+
+def detect_new_creator_stuck(memory_conn, data, tracer=None):
+    """
+    Watcher #4: New Creator Stuck.
+
+    Flags approved creators who joined NEW_CREATOR_STUCK_DAYS+ days ago but have not
+    yet established any meaningful engagement with Pathway resources. Surfaces onboarding
+    gaps so the assigned coach can follow up.
+
+    One episode per creator (reference_key = new_creator_stuck_{user_id}).
+    Resolves automatically when any engagement signal is detected, or when the creator
+    account is deactivated or removed (no longer in the approved creator set).
+    """
+    if tracer is None:
+        tracer = hearth_trace.NULL_TRACER
+
+    rows = data.get("New creators stuck (14+ days)", [])
+    if not isinstance(rows, list):
+        return
+
+    for row in rows:
+        user_id      = row["user_id"]
+        display_name = row["display_name"] or "a creator"
+        days         = row["days_since_joining"] if row["days_since_joining"] is not None else 0
+        coach_name   = row["coach_display_name"]
+        ref_key      = f"new_creator_stuck_{user_id}"
+
+        desc = (
+            f"Creator @{display_name} joined Pathway {days} days ago but has not yet "
+            f"established meaningful engagement with Pathway resources."
+        )
+        if coach_name:
+            desc += f" Assigned coach: {coach_name}."
+
+        severity = "high" if days >= 30 else "medium"
+
+        entity = hearth_memory.get_or_create_entity(memory_conn, user_id)
+        _ep_id, action = hearth_memory.create_episode(
+            memory_conn, entity["id"], "new_creator_stuck",
+            desc,
+            severity=severity,
+            reference_key=ref_key,
+            briefing_category="pattern",
+        )
+        try:
+            tracer.record(hearth_trace.TraceEntry(
+                rule_name="new_creator_stuck",
+                episode_type="new_creator_stuck",
+                action_taken=action,
+                reason=f"joined {days} days ago, zero engagement signals detected",
+                source_table="users + engagement signals",
+                source_record_id=user_id,
+                reference_key=ref_key,
+                source_fields={
+                    "user_id": user_id,
+                    "display_name": display_name,
+                    "joined_on": row["joined_on"],
+                    "days_since_joining": days,
+                    "coach_display_name": coach_name,
+                },
+                entity_user_id=user_id,
+                entity_display_name=entity["display_name"],
+                confidence="high",
+            ))
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Hearth message generation — Gemini is the voice layer, not the identity
 # ---------------------------------------------------------------------------
 
@@ -1414,6 +1581,7 @@ def run_pipeline(db_path: str, gemini_api_key: str) -> str:
         detect_checkin_feedback_waiting(memory_conn, data, tracer)
         detect_training_comment_waiting(memory_conn, data, tracer)
         detect_support_request_waiting(memory_conn, data, tracer)
+        detect_new_creator_stuck(memory_conn, data, tracer)
         hearth_memory.process_all_entities(memory_conn)
         open_episodes = hearth_memory.get_open_episodes(memory_conn)
         awareness = hearth_context.build_context(data, open_episodes, memory_conn, tracer)
@@ -1479,6 +1647,7 @@ def main():
         detect_checkin_feedback_waiting(memory_conn, data, tracer)
         detect_training_comment_waiting(memory_conn, data, tracer)
         detect_support_request_waiting(memory_conn, data, tracer)
+        detect_new_creator_stuck(memory_conn, data, tracer)
 
         # Step 8: Update learned observations for all entities
         hearth_memory.process_all_entities(memory_conn)

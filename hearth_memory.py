@@ -87,6 +87,7 @@ def init_tables(conn):
                 WHEN 'unlinked_battle'                 THEN 'awareness'
                 WHEN 'checkin_feedback_waiting'        THEN 'action_needed'
                 WHEN 'training_comment_waiting'        THEN 'action_needed'
+                WHEN 'new_creator_stuck'               THEN 'pattern'
             END
         WHERE briefing_category IS NULL;
     """)
@@ -300,6 +301,7 @@ _EPISODE_TYPE_LABELS = {
     "checkin_feedback_waiting":         "check-in feedback waiting",
     "training_comment_waiting":         "training comment awaiting staff response",
     "support_request_waiting":          "support request awaiting staff response",
+    "new_creator_stuck":                "new creator not yet engaged with Pathway",
 }
 
 _BRIEFING_CATEGORIES = {
@@ -313,6 +315,7 @@ _BRIEFING_CATEGORIES = {
     "checkin_feedback_waiting":         "action_needed",
     "training_comment_waiting":         "action_needed",
     "support_request_waiting":          "action_needed",
+    "new_creator_stuck":                "pattern",
 }
 
 
