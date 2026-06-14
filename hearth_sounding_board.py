@@ -153,6 +153,8 @@ def _handle_answer(conn, question):
                     confidence=0.7,
                 )
                 hearth_questions.mark_question_answered(conn, question["question_id"])
+                print(f"[SOUNDING BOARD] Original proposal: {proposed[:80]}")
+                print(f"[SOUNDING BOARD] Saved as edited:   {edited[:80]}")
                 print("Edited principle saved. Question marked answered.")
                 return
             print(f"\nProposed principle:\n{proposed}\n")
