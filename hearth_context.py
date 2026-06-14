@@ -83,6 +83,7 @@ class HearthAwarenessContext:
     person_contexts: list = field(default_factory=list)       # List[PersonContext]
     unattached_concerns: list = field(default_factory=list)   # List[OpenConcern] — no linked person
     recent_resolutions: list = field(default_factory=list)    # List[RecentResolution]
+    relevant_principles: list = field(default_factory=list)   # List[dict] from hearth_principles
 
     @property
     def is_quiet(self):
@@ -92,6 +93,66 @@ class HearthAwarenessContext:
             and not self.unattached_concerns
             and not self.recent_resolutions
         )
+
+
+# ---------------------------------------------------------------------------
+# Principles
+# ---------------------------------------------------------------------------
+
+_EPISODE_TAG_MAP = {
+    "creator_quiet":            "creator_activity",
+    "checkin_not_submitted":    "creator_activity",
+    "new_creator_stuck":        "creator_activity",
+    "checkin_feedback_waiting": "coaching",
+    "training_comment_waiting": "engagement",
+    "support_request_waiting":  "support",
+    "probation":                "coaching",
+    "missing_discord":          "onboarding",
+    "training_no_engagement":   "engagement",
+}
+
+
+def collect_relevant_principles(memory_conn, active_episode_types, tracer=None):
+    """Return principle dicts relevant to the current episode types, deduplicated.
+
+    Queries hearth_principles by the domain tags that correspond to each active
+    episode type. Marks each selected principle as used. Prints trace lines to
+    stdout unconditionally — principles are developer-visible audit context.
+    """
+    import hearth_principles as _hp
+
+    tags = set()
+    for ep_type in active_episode_types:
+        tag = _EPISODE_TAG_MAP.get(ep_type)
+        if tag:
+            tags.add(tag)
+
+    if not tags:
+        print("[HEARTH PRINCIPLES] No matching tags for current episode types — skipping.")
+        return []
+
+    seen_ids = set()
+    principles = []
+    for tag in sorted(tags):
+        for row in _hp.get_principles_by_tag(memory_conn, tag):
+            pid = row["principle_id"]
+            if pid not in seen_ids:
+                seen_ids.add(pid)
+                principles.append(row)
+
+    for p in principles:
+        _hp.mark_principle_used(memory_conn, p["principle_id"])
+
+    tags_str = ", ".join(sorted(tags))
+    print(
+        f"[HEARTH PRINCIPLES] Tags matched: {tags_str}"
+        f" | Selected: {len(principles)} principle(s)"
+    )
+    for i, p in enumerate(principles, 1):
+        snippet = p["content"][:80] + ("..." if len(p["content"]) > 80 else "")
+        print(f"[HEARTH PRINCIPLES] #{i} (conf {p['confidence']:.2f}): {snippet}")
+
+    return principles
 
 
 # ---------------------------------------------------------------------------
@@ -400,12 +461,27 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
             if ep["briefing_category"] == "pattern":
                 hearth_memory.update_last_briefed_at(memory_conn, ep["id"], ts)
 
+    # Collect principles whose domain tags correspond to active episode types.
+    relevant_principles = []
+    if memory_conn:
+        active_episode_types = [ep["episode_type"] for ep in briefable_episodes]
+        principle_rows = collect_relevant_principles(memory_conn, active_episode_types, tracer)
+        relevant_principles = [
+            {
+                "principle_id": p["principle_id"],
+                "content": p["content"],
+                "confidence": p["confidence"],
+            }
+            for p in principle_rows
+        ]
+
     return HearthAwarenessContext(
         date=now_utc.strftime("%A, %B %d, %Y"),
         observations=observations,
         person_contexts=person_contexts,
         unattached_concerns=unattached_concerns,
         recent_resolutions=recent_resolutions,
+        relevant_principles=relevant_principles,
     )
 
 
@@ -490,6 +566,15 @@ def render_for_llm(context: HearthAwarenessContext) -> str:
                 f"  - [{concern.severity.upper()}] {concern.description}"
                 f" ({_age_note(concern)})"
             )
+        lines.append("")
+
+    qualifying_principles = [
+        p for p in context.relevant_principles if p["confidence"] >= 0.5
+    ]
+    if qualifying_principles:
+        lines.append("What I know about this organization:")
+        for p in qualifying_principles:
+            lines.append(f"  - {p['content']} (confidence: {p['confidence']:.1f})")
         lines.append("")
 
     return "\n".join(lines)
