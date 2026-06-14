@@ -1610,10 +1610,17 @@ def run_pipeline(db_path=None, gemini_api_key=None, scan_mode="morning",
         open_questions = hearth_questions.list_open_questions(memory_conn)
         awareness = hearth_context.build_context(data, open_episodes, memory_conn, tracer)
 
+        _concern_categories = {"action_needed", "critical", "pattern"}
+        open_concerns = [
+            ep for ep in open_episodes
+            if ep["briefing_category"] is None
+            or ep["briefing_category"] in _concern_categories
+        ]
+
         reflection_id = hearth_soul.generate_reflection(
             memory_conn,
             new_episodes=open_episodes,
-            open_concerns=open_episodes,
+            open_concerns=open_concerns,
             open_questions=open_questions,
             source_run=scan_mode,
             auto_question=True,
