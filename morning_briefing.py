@@ -1593,6 +1593,7 @@ def run_pipeline(db_path=None, gemini_api_key=None, scan_mode="morning",
             hearth_memory.sync_users_to_entities(memory_conn, conn)
             hearth_relationships.init_relationship_tables(memory_conn)
             hearth_relationships.discover_relationships(memory_conn, conn)
+            hearth_relationships.discover_recruiter_relationships(memory_conn, conn)
             data = collect_data(conn)
         finally:
             conn.close()

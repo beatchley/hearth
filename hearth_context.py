@@ -64,6 +64,7 @@ class PersonContext:
     hearth_summary: Optional[str] = None       # From entity.summary
     patterns_noticed: Optional[str] = None     # From entity.patterns_noticed (recurring patterns)
     coach_name: Optional[str] = None           # Display name of assigned coach if known
+    recruiter_name: Optional[str] = None      # Display name of recruiter if known
 
     @property
     def has_multiple_issues(self):
@@ -331,6 +332,7 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
         hearth_summary = None
         patterns_noticed = None
         coach_name = None
+        recruiter_name = None
         if memory_conn:
             ctx = hearth_memory.get_entity_context(memory_conn, entity_id)
             if ctx:
@@ -345,6 +347,12 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
             if coaches:
                 coach_name = coaches[0]["display_name"] or "a team member"
 
+            recruiters = hearth_relationships.get_related_entities(
+                memory_conn, entity_id, "recruited_by"
+            )
+            if recruiters:
+                recruiter_name = recruiters[0]["display_name"] or None
+
         person_contexts.append(PersonContext(
             user_id=episodes[0]["user_id"],
             display_name=display_name,
@@ -353,6 +361,7 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
             hearth_summary=hearth_summary,
             patterns_noticed=patterns_noticed,
             coach_name=coach_name,
+            recruiter_name=recruiter_name,
         ))
 
         # Trace each open episode being included for this person
@@ -548,6 +557,8 @@ def render_for_llm(context: HearthAwarenessContext) -> str:
 
             if person.coach_name:
                 lines.append(f"    [Assigned coach: {person.coach_name}]")
+            if person.recruiter_name:
+                lines.append(f"    [Recruited by: {person.recruiter_name}]")
             if person.patterns_noticed:
                 lines.append(f"    [Recurring pattern: {person.patterns_noticed}]")
             if person.hearth_summary:

@@ -149,6 +149,50 @@ def discover_relationships(memory_conn, pathway_conn):
     memory_conn.commit()
 
 
+def discover_recruiter_relationships(memory_conn, pathway_conn):
+    """
+    Read Pathway recruiter data and write recruited_by / recruiter_of roads.
+
+    Rule: recruited_by / recruiter_of
+        Source: users.recruited_by_user_id
+        Confidence: 1.0 (explicit Pathway assignment)
+        Only approved creators with a non-null recruited_by_user_id are processed.
+        If the recruiter has no Hearth entity, the relationship is skipped silently.
+    """
+    try:
+        rows = pathway_conn.execute(
+            "SELECT id, recruited_by_user_id"
+            " FROM users"
+            " WHERE recruited_by_user_id IS NOT NULL AND status = 'approved';"
+        ).fetchall()
+    except sqlite3.Error:
+        return
+
+    if not rows:
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    entity_map = {
+        row["user_id"]: row["id"]
+        for row in memory_conn.execute(
+            "SELECT id, user_id FROM hearth_entities WHERE user_id IS NOT NULL;"
+        ).fetchall()
+    }
+
+    for row in rows:
+        creator_eid = entity_map.get(row["id"])
+        recruiter_eid = entity_map.get(row["recruited_by_user_id"])
+        if not creator_eid or not recruiter_eid:
+            continue
+        upsert_relationship(memory_conn, creator_eid, recruiter_eid,
+                            "recruited_by", "pathway_recruited_by", 1.0, now)
+        upsert_relationship(memory_conn, recruiter_eid, creator_eid,
+                            "recruiter_of", "pathway_recruited_by", 1.0, now)
+
+    memory_conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # Query helpers
 # ---------------------------------------------------------------------------
