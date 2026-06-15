@@ -106,7 +106,9 @@ def sync_users_to_entities(memory_conn, pathway_conn):
     Hearth's own learned memory, not a copy of Pathway's source of truth.
     """
     try:
-        users = pathway_conn.execute("SELECT id, name, tiktok_handle FROM users;").fetchall()
+        users = pathway_conn.execute(
+            "SELECT id, name, tiktok_handle FROM users WHERE status = 'approved';"
+        ).fetchall()
     except sqlite3.Error:
         return
     now = datetime.now(timezone.utc).isoformat()
