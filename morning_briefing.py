@@ -226,6 +226,10 @@ def query_checkin_feedback_waiting(conn, cutoff: datetime):
     Triggers after CHECKIN_FEEDBACK_WAITING_DAYS — cutoff is now minus that many days,
     so submitted_at <= cutoff means the submission has been waiting at least that long.
     Only includes submissions still in 'Submitted' status (not yet FeedbackComplete).
+
+    Includes program-specific coach names via creator_coach_assignments when available.
+    Falls back to assigned_coach_id when program assignments are not set.
+    template_type allows us to pick the right program coach when determinable.
     """
     sql = """
         SELECT
@@ -234,14 +238,23 @@ def query_checkin_feedback_waiting(conn, cutoff: datetime):
             cs.user_id,
             cs.submitted_at,
             ci.title                                            AS checkin_title,
+            ci.template_type,
             COALESCE(NULLIF(u.tiktok_handle, ''), u.name)      AS display_name,
             u.assigned_coach_id,
             COALESCE(NULLIF(cu.tiktok_handle, ''), cu.name)    AS coach_display_name,
+            COALESCE(NULLIF(cn_c.tiktok_handle, ''), cn_c.name)   AS cn_coach_display_name,
+            COALESCE(NULLIF(sh_c.tiktok_handle, ''), sh_c.name)   AS shop_coach_display_name,
             CAST(julianday('now') - julianday(cs.submitted_at) AS INTEGER) AS days_waiting
         FROM checkin_submissions cs
         JOIN checkins ci    ON ci.id   = cs.checkin_id
         JOIN users u        ON u.id    = cs.user_id
         LEFT JOIN users cu  ON cu.id   = u.assigned_coach_id
+        LEFT JOIN creator_coach_assignments cn_asgn
+               ON cn_asgn.creator_user_id = u.id AND cn_asgn.program = 'cn' AND cn_asgn.active = 1
+        LEFT JOIN users cn_c ON cn_c.id = cn_asgn.coach_user_id
+        LEFT JOIN creator_coach_assignments sh_asgn
+               ON sh_asgn.creator_user_id = u.id AND sh_asgn.program = 'shop' AND sh_asgn.active = 1
+        LEFT JOIN users sh_c ON sh_c.id = sh_asgn.coach_user_id
         WHERE cs.status = 'Submitted'
           AND cs.submitted_at IS NOT NULL
           AND cs.submitted_at <= ?
@@ -418,9 +431,17 @@ def query_new_creator_stuck(conn):
             c.joined_on,
             c.days_since_joining,
             c.assigned_coach_id,
-            COALESCE(NULLIF(cu.tiktok_handle, ''), cu.name)    AS coach_display_name
+            COALESCE(NULLIF(cu.tiktok_handle, ''), cu.name)    AS coach_display_name,
+            COALESCE(NULLIF(cn_c.tiktok_handle, ''), cn_c.name)   AS cn_coach_display_name,
+            COALESCE(NULLIF(sh_c.tiktok_handle, ''), sh_c.name)   AS shop_coach_display_name
         FROM creators c
         LEFT JOIN users cu ON cu.id = c.assigned_coach_id
+        LEFT JOIN creator_coach_assignments cn_asgn
+               ON cn_asgn.creator_user_id = c.id AND cn_asgn.program = 'cn' AND cn_asgn.active = 1
+        LEFT JOIN users cn_c ON cn_c.id = cn_asgn.coach_user_id
+        LEFT JOIN creator_coach_assignments sh_asgn
+               ON sh_asgn.creator_user_id = c.id AND sh_asgn.program = 'shop' AND sh_asgn.active = 1
+        LEFT JOIN users sh_c ON sh_c.id = sh_asgn.coach_user_id
         WHERE c.id NOT IN (SELECT user_id FROM engaged_creators)
         ORDER BY c.days_since_joining DESC;
     """
@@ -1223,8 +1244,24 @@ def detect_checkin_feedback_waiting(memory_conn, data, tracer=None):
         display_name   = row["display_name"] or "a creator"
         title          = row["checkin_title"] or "a check-in"
         days           = row["days_waiting"] if row["days_waiting"] is not None else 0
-        coach_name     = row["coach_display_name"]
         ref_key        = f"checkin_feedback_{submission_id}"
+
+        # Determine which coach to name based on check-in template_type when available.
+        # new_cn → CN coach; new_shop → Shop coach; monthly/other → legacy assigned_coach_id.
+        template_type = row["template_type"] if "template_type" in row.keys() else None
+        cn_name   = row["cn_coach_display_name"] if "cn_coach_display_name" in row.keys() else None
+        shop_name = row["shop_coach_display_name"] if "shop_coach_display_name" in row.keys() else None
+        legacy    = row["coach_display_name"]
+
+        if template_type == "new_cn" and cn_name:
+            coach_name = cn_name
+        elif template_type == "new_shop" and shop_name:
+            coach_name = shop_name
+        elif template_type in ("new_cn", "new_shop"):
+            coach_name = legacy  # program type known but no program assignment yet
+        else:
+            # monthly or unrecognized — use whichever is available (program-specific preferred)
+            coach_name = cn_name or shop_name or legacy
 
         if coach_name:
             desc = (
@@ -1448,15 +1485,22 @@ def detect_new_creator_stuck(memory_conn, data, tracer=None):
         user_id      = row["user_id"]
         display_name = row["display_name"] or "a creator"
         days         = row["days_since_joining"] if row["days_since_joining"] is not None else 0
-        coach_name   = row["coach_display_name"]
         ref_key      = f"new_creator_stuck_{user_id}"
+
+        cn_name   = row["cn_coach_display_name"] if "cn_coach_display_name" in row.keys() else None
+        shop_name = row["shop_coach_display_name"] if "shop_coach_display_name" in row.keys() else None
+        legacy    = row["coach_display_name"]
 
         desc = (
             f"Creator @{display_name} joined Pathway {days} days ago but has not yet "
             f"established meaningful engagement with Pathway resources."
         )
-        if coach_name:
-            desc += f" Assigned coach: {coach_name}."
+        if cn_name and shop_name and cn_name != shop_name:
+            desc += f" CN Coach: {cn_name}. Shop Coach: {shop_name}."
+        elif cn_name or shop_name:
+            desc += f" Assigned coach: {cn_name or shop_name}."
+        elif legacy:
+            desc += f" Assigned coach: {legacy}."
 
         severity = "high" if days >= 30 else "medium"
 
@@ -1482,7 +1526,9 @@ def detect_new_creator_stuck(memory_conn, data, tracer=None):
                     "display_name": display_name,
                     "joined_on": row["joined_on"],
                     "days_since_joining": days,
-                    "coach_display_name": coach_name,
+                    "cn_coach_display_name": cn_name,
+                    "shop_coach_display_name": shop_name,
+                    "legacy_coach_display_name": legacy,
                 },
                 entity_user_id=user_id,
                 entity_display_name=entity["display_name"],
@@ -1594,6 +1640,7 @@ def run_pipeline(db_path=None, gemini_api_key=None, scan_mode="morning",
             hearth_relationships.init_relationship_tables(memory_conn)
             hearth_relationships.discover_relationships(memory_conn, conn)
             hearth_relationships.discover_recruiter_relationships(memory_conn, conn)
+            hearth_relationships.discover_program_coach_relationships(memory_conn, conn)
             data = collect_data(conn)
         finally:
             conn.close()

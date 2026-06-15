@@ -63,7 +63,9 @@ class PersonContext:
     total_episode_count: int     # All episodes including resolved — depth of history
     hearth_summary: Optional[str] = None       # From entity.summary
     patterns_noticed: Optional[str] = None     # From entity.patterns_noticed (recurring patterns)
-    coach_name: Optional[str] = None           # Display name of assigned coach if known
+    coach_name: Optional[str] = None           # Display name of legacy assigned coach if known
+    cn_coach_name: Optional[str] = None       # Display name of CN-program coach if known
+    shop_coach_name: Optional[str] = None     # Display name of Shop-program coach if known
     recruiter_name: Optional[str] = None      # Display name of recruiter if known
 
     @property
@@ -332,6 +334,8 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
         hearth_summary = None
         patterns_noticed = None
         coach_name = None
+        cn_coach_name = None
+        shop_coach_name = None
         recruiter_name = None
         if memory_conn:
             ctx = hearth_memory.get_entity_context(memory_conn, entity_id)
@@ -347,6 +351,18 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
             if coaches:
                 coach_name = coaches[0]["display_name"] or "a team member"
 
+            cn_coaches = hearth_relationships.get_related_entities(
+                memory_conn, entity_id, "coached_by_cn"
+            )
+            if cn_coaches:
+                cn_coach_name = cn_coaches[0]["display_name"] or None
+
+            shop_coaches = hearth_relationships.get_related_entities(
+                memory_conn, entity_id, "coached_by_shop"
+            )
+            if shop_coaches:
+                shop_coach_name = shop_coaches[0]["display_name"] or None
+
             recruiters = hearth_relationships.get_related_entities(
                 memory_conn, entity_id, "recruited_by"
             )
@@ -361,6 +377,8 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
             hearth_summary=hearth_summary,
             patterns_noticed=patterns_noticed,
             coach_name=coach_name,
+            cn_coach_name=cn_coach_name,
+            shop_coach_name=shop_coach_name,
             recruiter_name=recruiter_name,
         ))
 
@@ -398,13 +416,14 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
 
     # Shared-coach group signal: if 2+ people with the same coach have open concerns,
     # surface that as an observation so the briefing can mention the pattern.
+    # Prefer program-specific coach names; fall back to legacy coach_name.
     coach_groups = {}
     for pc in person_contexts:
-        if pc.coach_name:
-            coach_groups.setdefault(pc.coach_name, []).append(pc.display_name)
-    for coach_name, members in coach_groups.items():
-        if len(members) >= 2:
-            names = ", ".join(members)
+        for cname in filter(None, [pc.cn_coach_name, pc.shop_coach_name, pc.coach_name]):
+            coach_groups.setdefault(cname, set()).add(pc.display_name)
+    for coach_name, member_set in coach_groups.items():
+        if len(member_set) >= 2:
+            names = ", ".join(sorted(member_set))
             observations.append(Observation(
                 text=(
                     f"Multiple members connected to {coach_name} have open concerns: {names}."
@@ -555,7 +574,11 @@ def render_for_llm(context: HearthAwarenessContext) -> str:
                     f" ({_age_note(concern)})"
                 )
 
-            if person.coach_name:
+            if person.cn_coach_name:
+                lines.append(f"    [CN Coach: {person.cn_coach_name}]")
+            if person.shop_coach_name:
+                lines.append(f"    [Shop Coach: {person.shop_coach_name}]")
+            if not person.cn_coach_name and not person.shop_coach_name and person.coach_name:
                 lines.append(f"    [Assigned coach: {person.coach_name}]")
             if person.recruiter_name:
                 lines.append(f"    [Recruited by: {person.recruiter_name}]")

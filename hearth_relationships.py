@@ -149,6 +149,54 @@ def discover_relationships(memory_conn, pathway_conn):
     memory_conn.commit()
 
 
+def discover_program_coach_relationships(memory_conn, pathway_conn):
+    """
+    Read creator_coach_assignments and write program-specific coach roads.
+
+    Roads created:
+      cn_coach_of / coached_by_cn    — from active cn assignments (confidence 1.0)
+      shop_coach_of / coached_by_shop — from active shop assignments (confidence 1.0)
+
+    Safe to call on every pipeline run — all writes are idempotent.
+    If the table does not exist yet, returns gracefully.
+    """
+    try:
+        rows = pathway_conn.execute(
+            "SELECT creator_user_id, coach_user_id, program"
+            " FROM creator_coach_assignments"
+            " WHERE active = 1;"
+        ).fetchall()
+    except sqlite3.Error:
+        return
+
+    if not rows:
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    entity_map = {
+        row["user_id"]: row["id"]
+        for row in memory_conn.execute(
+            "SELECT id, user_id FROM hearth_entities WHERE user_id IS NOT NULL;"
+        ).fetchall()
+    }
+
+    for row in rows:
+        creator_eid = entity_map.get(row["creator_user_id"])
+        coach_eid = entity_map.get(row["coach_user_id"])
+        if not creator_eid or not coach_eid:
+            continue
+        program = row["program"]  # 'cn' or 'shop'
+        coach_of_type = f"{program}_coach_of"
+        coached_by_type = f"coached_by_{program}"
+        upsert_relationship(memory_conn, coach_eid, creator_eid,
+                            coach_of_type, "pathway_program_coach", 1.0, now)
+        upsert_relationship(memory_conn, creator_eid, coach_eid,
+                            coached_by_type, "pathway_program_coach", 1.0, now)
+
+    memory_conn.commit()
+
+
 def discover_recruiter_relationships(memory_conn, pathway_conn):
     """
     Read Pathway recruiter data and write recruited_by / recruiter_of roads.
