@@ -172,7 +172,7 @@ def query_missing_discord(conn):
         SELECT u.id, u.name, u.email
         FROM users u
         JOIN onboarding_records o ON o.user_id = u.id
-        WHERE o.added_discord IS NULL OR o.added_discord = 0
+        WHERE o.added_discord = 'needed' OR o.added_discord IS NULL
         ORDER BY o.created_at DESC
         LIMIT 20;
     """
@@ -957,7 +957,7 @@ def detect_and_record_issues(memory_conn, data, tracer=None):
                     rule_name="missing_discord",
                     episode_type="missing_discord",
                     action_taken=action,
-                    reason="onboarding_records.added_discord is NULL or 0",
+                    reason="onboarding_records.added_discord is 'needed' or NULL",
                     source_table="users + onboarding_records",
                     source_record_id=row["id"],
                     source_fields={
