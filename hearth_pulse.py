@@ -165,6 +165,110 @@ def _classify_message_sent(lookup_conn, event):
     return "signal", 0.4, f"Message from creator after {gap} days of silence."
 
 
+def _classify_training_viewed(lookup_conn, event):
+    prior = lookup_conn.execute(
+        "SELECT occurred_at FROM hearth_events"
+        " WHERE actor_user_id = ? AND event_type = 'training_viewed'"
+        " AND occurred_at < ? ORDER BY occurred_at DESC LIMIT 1;",
+        (event["actor_user_id"], event["occurred_at"]),
+    ).fetchone()
+
+    if not prior:
+        return "signal", 0.40, "First recorded training view for this creator."
+
+    gap = _days_between(prior["occurred_at"], event["occurred_at"])
+    if gap >= 30:
+        return "signal", 0.35, f"Creator returned to training after {gap} days."
+
+    return "trace", 0.10, "Routine training view."
+
+
+def _classify_onboarding_step_completed(lookup_conn, event):
+    target_id = event["target_user_id"]
+
+    prior = lookup_conn.execute(
+        "SELECT 1 FROM hearth_events"
+        " WHERE target_user_id = ? AND event_type = 'onboarding_step_completed'"
+        " AND occurred_at < ? LIMIT 1;",
+        (target_id, event["occurred_at"]),
+    ).fetchone()
+
+    if prior is None:
+        return "signal", 0.50, "First onboarding step completed for this creator."
+
+    try:
+        record = lookup_conn.execute(
+            "SELECT contract_sent, contract_accepted, added_tt_chat,"
+            " added_discord, welcome_form_sent, welcome_form_returned"
+            " FROM onboarding_records WHERE id = ?;",
+            (event["reference_id"],),
+        ).fetchone()
+        if record is not None and all(record[k] == "completed" for k in record.keys()):
+            return "observation", 0.80, "Onboarding completed for this creator."
+    except sqlite3.Error:
+        pass  # onboarding_records lookup unclear — skip it, keep base classification
+
+    return "signal", 0.45, "Onboarding step completed."
+
+
+def _classify_battle_requested(lookup_conn, event):
+    prior = lookup_conn.execute(
+        "SELECT 1 FROM hearth_events"
+        " WHERE actor_user_id = ? AND event_type = 'battle_requested'"
+        " AND occurred_at < ? LIMIT 1;",
+        (event["actor_user_id"], event["occurred_at"]),
+    ).fetchone()
+
+    if prior is None:
+        return "signal", 0.50, "First battle request submitted by this creator."
+
+    return "trace", 0.20, "Battle request submitted."
+
+
+def _classify_event_signup_created(lookup_conn, event):
+    prior = lookup_conn.execute(
+        "SELECT 1 FROM hearth_events"
+        " WHERE actor_user_id = ? AND event_type = 'event_signup_created'"
+        " AND occurred_at < ? LIMIT 1;",
+        (event["actor_user_id"], event["occurred_at"]),
+    ).fetchone()
+
+    if prior is None:
+        return "signal", 0.45, "First event signup recorded for this creator."
+
+    return "trace", 0.15, "Event signup recorded."
+
+
+def _classify_community_message_created(lookup_conn, event):
+    actor_id = event["actor_user_id"]
+
+    prior = lookup_conn.execute(
+        "SELECT occurred_at FROM hearth_events"
+        " WHERE actor_user_id = ? AND event_type = 'community_message_created'"
+        " AND occurred_at < ? ORDER BY occurred_at DESC LIMIT 1;",
+        (actor_id, event["occurred_at"]),
+    ).fetchone()
+
+    board = None
+    reference_type = event["reference_type"] or ""
+    if reference_type.startswith("post:"):
+        board = reference_type.split(":", 1)[1]
+    board_suffix = f" ({board} board)" if board else ""
+
+    if prior is None:
+        return "signal", 0.45, "First community post from this creator."
+
+    gap = _days_between(prior["occurred_at"], event["occurred_at"])
+    if gap >= 30:
+        return (
+            "signal",
+            0.40,
+            f"Creator posted to community after {gap} days of silence.",
+        )
+
+    return "trace", 0.10, f"Community post recorded{board_suffix}."
+
+
 def classify_event(lookup_conn, memory_conn, event):
     """Return (experience_level, importance_score, importance_reason) for one event."""
     event_type = event["event_type"]
@@ -174,6 +278,16 @@ def classify_event(lookup_conn, memory_conn, event):
         return _classify_checkin_submitted(lookup_conn, memory_conn, event)
     if event_type == "message_sent":
         return _classify_message_sent(lookup_conn, event)
+    if event_type == "training_viewed":
+        return _classify_training_viewed(lookup_conn, event)
+    if event_type == "onboarding_step_completed":
+        return _classify_onboarding_step_completed(lookup_conn, event)
+    if event_type == "battle_requested":
+        return _classify_battle_requested(lookup_conn, event)
+    if event_type == "event_signup_created":
+        return _classify_event_signup_created(lookup_conn, event)
+    if event_type == "community_message_created":
+        return _classify_community_message_created(lookup_conn, event)
     return "trace", 0.1, f"No classification rule for event_type '{event_type}'."
 
 
