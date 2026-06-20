@@ -8,13 +8,30 @@ describe what Hearth has noticed, in Hearth's own terms.
 The language model receives this context — not raw database rows, table names,
 column definitions, or query output.
 
+Since Session 4, context begins with Hearth's current worldview understanding
+(read via hearth_worldview.py) and supplements it with the existing supporting
+evidence below — raw events, episodes, and memory remain in place unchanged.
+
 Pipeline:
     Pathway Data  →  Hearth Memory  →  HearthAwarenessContext  →  LLM  →  Hearth Message
+                      Worldview (Soul's interpretation)        ↗
 """
 
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, date, timezone
 from typing import Optional
+
+# Feature flag for reading worldview into context. Defaults on; set the
+# HEARTH_WORLDVIEW_CONTEXT_ENABLED env var to "0" (e.g. via Render) to make
+# context assembly behave exactly as it did before Session 4.
+HEARTH_WORLDVIEW_CONTEXT_ENABLED = (
+    os.environ.get("HEARTH_WORLDVIEW_CONTEXT_ENABLED", "1") == "1"
+)
+
+# Per-category cap when reading worldview into context — within the 10-20
+# range recommended for briefing-sized output.
+_WORLDVIEW_CONTEXT_LIMIT = 15
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +96,29 @@ class PersonContext:
 
 
 @dataclass
+class WorldviewSummary:
+    """Hearth's current worldview understanding, read fresh at each context assembly.
+
+    Populated from hearth_worldview.py's limited snapshot (Session 3). Empty by
+    default — render_for_llm treats all-empty lists as nothing to add, so a
+    briefing with no worldview data behaves exactly as it did before Session 4.
+    Each list holds sqlite3.Row entries from the corresponding worldview table.
+    """
+    active_beliefs: list = field(default_factory=list)
+    active_relationships: list = field(default_factory=list)
+    open_uncertainties: list = field(default_factory=list)
+    watched_changes: list = field(default_factory=list)
+    recent_lessons: list = field(default_factory=list)
+
+    @property
+    def is_empty(self):
+        return not (
+            self.active_beliefs or self.active_relationships or self.open_uncertainties
+            or self.watched_changes or self.recent_lessons
+        )
+
+
+@dataclass
 class HearthAwarenessContext:
     """Hearth's complete awareness for a briefing moment."""
     date: str
@@ -87,6 +127,7 @@ class HearthAwarenessContext:
     unattached_concerns: list = field(default_factory=list)   # List[OpenConcern] — no linked person
     recent_resolutions: list = field(default_factory=list)    # List[RecentResolution]
     relevant_principles: list = field(default_factory=list)   # List[dict] from hearth_principles
+    worldview: WorldviewSummary = field(default_factory=WorldviewSummary)  # Session 4
 
     @property
     def is_quiet(self):
@@ -156,6 +197,54 @@ def collect_relevant_principles(memory_conn, active_episode_types, tracer=None):
         print(f"[HEARTH PRINCIPLES] #{i} (conf {p['confidence']:.2f}): {snippet}")
 
     return principles
+
+
+# ---------------------------------------------------------------------------
+# Worldview
+# ---------------------------------------------------------------------------
+
+def collect_worldview_summary(memory_conn) -> WorldviewSummary:
+    """Read a limited worldview snapshot for context assembly (Session 4).
+
+    Returns an empty WorldviewSummary — never raises — if disabled via
+    HEARTH_WORLDVIEW_CONTEXT_ENABLED, if memory_conn is None, or if worldview
+    retrieval fails for any reason. A worldview problem must never break
+    briefing; legacy context generation always continues.
+    """
+    if not HEARTH_WORLDVIEW_CONTEXT_ENABLED or memory_conn is None:
+        return WorldviewSummary()
+
+    try:
+        import hearth_worldview as _wv
+
+        snapshot = _wv.get_worldview_snapshot(
+            memory_conn,
+            belief_limit=_WORLDVIEW_CONTEXT_LIMIT,
+            relationship_limit=_WORLDVIEW_CONTEXT_LIMIT,
+            uncertainty_limit=_WORLDVIEW_CONTEXT_LIMIT,
+            change_limit=_WORLDVIEW_CONTEXT_LIMIT,
+            lesson_limit=_WORLDVIEW_CONTEXT_LIMIT,
+        )
+        summary = WorldviewSummary(
+            active_beliefs=list(snapshot["active_beliefs"]),
+            active_relationships=list(snapshot["active_relationships"]),
+            open_uncertainties=list(snapshot["open_uncertainties"]),
+            watched_changes=list(snapshot["watched_changes"]),
+            recent_lessons=list(snapshot["recent_lessons"]),
+        )
+        if not summary.is_empty:
+            print(
+                "[HEARTH WORLDVIEW] context read:"
+                f" beliefs={len(summary.active_beliefs)}"
+                f" relationships={len(summary.active_relationships)}"
+                f" uncertainties={len(summary.open_uncertainties)}"
+                f" changes={len(summary.watched_changes)}"
+                f" lessons={len(summary.recent_lessons)}"
+            )
+        return summary
+    except Exception as exc:
+        print(f"[HEARTH WORLDVIEW] context read skipped — falling back to legacy context: {exc}")
+        return WorldviewSummary()
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +592,11 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
             for p in principle_rows
         ]
 
+    # Worldview (Session 4): Hearth's current understanding, read first and
+    # supplemented by everything collected above. Never raises — falls back
+    # to an empty summary on any failure so briefing always still generates.
+    worldview = collect_worldview_summary(memory_conn)
+
     return HearthAwarenessContext(
         date=now_utc.strftime("%A, %B %d, %Y"),
         observations=observations,
@@ -510,6 +604,7 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
         unattached_concerns=unattached_concerns,
         recent_resolutions=recent_resolutions,
         relevant_principles=relevant_principles,
+        worldview=worldview,
     )
 
 
@@ -528,6 +623,40 @@ def _age_note(concern: OpenConcern) -> str:
     return f"for {age} days — worth escalating"
 
 
+def _render_worldview_section(worldview: WorldviewSummary) -> list:
+    """Render the worldview section as a list of lines, or [] if empty.
+
+    Kept separate so render_for_llm can place it ahead of legacy sections
+    (Session 4 priority order) without disturbing any existing rendering.
+    """
+    if worldview.is_empty:
+        return []
+
+    lines = ["Hearth's current understanding:"]
+    if worldview.active_beliefs:
+        lines.append("  Beliefs:")
+        for b in worldview.active_beliefs:
+            lines.append(f"    - {b['belief_text']} (confidence: {b['confidence']:.1f})")
+    if worldview.active_relationships:
+        lines.append("  Relationship understandings:")
+        for r in worldview.active_relationships:
+            lines.append(f"    - {r['relationship_summary']} (confidence: {r['confidence']:.1f})")
+    if worldview.open_uncertainties:
+        lines.append("  Open uncertainties:")
+        for u in worldview.open_uncertainties:
+            lines.append(f"    - {u['uncertainty_text']}")
+    if worldview.watched_changes:
+        lines.append("  Watched changes:")
+        for c in worldview.watched_changes:
+            lines.append(f"    - {c['change_text']}")
+    if worldview.recent_lessons:
+        lines.append("  Recent lessons (provisional, not yet human-approved):")
+        for lesson in worldview.recent_lessons:
+            lines.append(f"    - {lesson['lesson_text']}")
+    lines.append("")
+    return lines
+
+
 def render_for_llm(context: HearthAwarenessContext) -> str:
     """
     Render a HearthAwarenessContext into the text block the language model receives.
@@ -535,8 +664,18 @@ def render_for_llm(context: HearthAwarenessContext) -> str:
     Uses Hearth's language. No table names, column names, SQL dicts, row counts,
     or schema information appears here. Issues are grouped by person so Hearth
     can speak about the whole person rather than a list of independent incidents.
+
+    Since Session 4: if context.worldview has any content, it is rendered first
+    (Hearth's current understanding takes priority over supporting evidence). If
+    worldview is empty, output is byte-for-byte identical to before Session 4.
     """
     lines = [f"Date: {context.date}", ""]
+
+    if context.is_quiet and context.worldview.is_empty:
+        lines.append("Nothing of particular concern observed today.")
+        return "\n".join(lines)
+
+    lines.extend(_render_worldview_section(context.worldview))
 
     if context.is_quiet:
         lines.append("Nothing of particular concern observed today.")

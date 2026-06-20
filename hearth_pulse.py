@@ -9,6 +9,13 @@ and concern level.
 Connects directly to the Pathway DB (DATABASE_URL) for both the read-write
 update connection and the read-only lookup connection. Only opens
 hearth_memory.db when a checkin_submitted event needs an episode lookup.
+
+Since Session 6, Pulse also reads a small worldview snapshot (see
+collect_pulse_worldview_context) once per run, before classification begins.
+This is read-only and purely informational for now — classify_event() does
+not receive or consult it, so classification output is unchanged. The
+intent is future logic that understands what "normal" looks like; this
+session only makes that data available to Pulse.
 """
 
 import os
@@ -24,6 +31,20 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 _STAFF_ROLES = ("manager", "coach", "ceo", "it", "navigator")
+
+# Feature flag for reading worldview into Pulse — Session 6. Defaults on; set
+# the HEARTH_WORLDVIEW_PULSE_ENABLED env var to "0" to make Pulse behave
+# exactly as it did before Session 6 (no worldview read at all).
+HEARTH_WORLDVIEW_PULSE_ENABLED = (
+    os.environ.get("HEARTH_WORLDVIEW_PULSE_ENABLED", "1") == "1"
+)
+
+# Small per-category caps for the worldview snapshot Pulse carries per run.
+_PULSE_WORLDVIEW_BELIEF_LIMIT = 10
+_PULSE_WORLDVIEW_RELATIONSHIP_LIMIT = 10
+_PULSE_WORLDVIEW_UNCERTAINTY_LIMIT = 10
+_PULSE_WORLDVIEW_CHANGE_LIMIT = 10
+_PULSE_WORLDVIEW_LESSON_LIMIT = 5
 
 
 # ---------------------------------------------------------------------------
@@ -292,10 +313,68 @@ def classify_event(lookup_conn, memory_conn, event):
 
 
 # ---------------------------------------------------------------------------
+# Worldview context (Session 6 — read-only, not yet used for classification)
+# ---------------------------------------------------------------------------
+
+def collect_pulse_worldview_context(conn=None):
+    """Read a small worldview snapshot for Pulse to carry alongside a run.
+
+    Read-only and informational only: classify_event() never receives or
+    consults this context, so it has no effect on classification this
+    session. Returns {} without raising if disabled via
+    HEARTH_WORLDVIEW_PULSE_ENABLED, if hearth_worldview is unavailable, if
+    the worldview tables are missing or empty, or if any other error occurs
+    while reading — Pulse must always be able to continue classifying events
+    normally regardless of worldview's state. Never writes to worldview.
+
+    Pass an existing hearth_memory.db connection via `conn` to reuse it;
+    otherwise a short-lived connection is opened and closed internally.
+    """
+    if not HEARTH_WORLDVIEW_PULSE_ENABLED:
+        return {}
+
+    owns_conn = conn is None
+    try:
+        import hearth_worldview as _wv
+
+        if owns_conn:
+            conn = _wv.get_worldview_connection()
+
+        snapshot = _wv.get_worldview_snapshot(
+            conn,
+            belief_limit=_PULSE_WORLDVIEW_BELIEF_LIMIT,
+            relationship_limit=_PULSE_WORLDVIEW_RELATIONSHIP_LIMIT,
+            uncertainty_limit=_PULSE_WORLDVIEW_UNCERTAINTY_LIMIT,
+            change_limit=_PULSE_WORLDVIEW_CHANGE_LIMIT,
+            lesson_limit=_PULSE_WORLDVIEW_LESSON_LIMIT,
+        )
+        total = sum(len(rows) for rows in snapshot.values())
+        if total:
+            print(
+                "[hearth_pulse] worldview context read (informational only):"
+                f" beliefs={len(snapshot['active_beliefs'])}"
+                f" relationships={len(snapshot['active_relationships'])}"
+                f" uncertainties={len(snapshot['open_uncertainties'])}"
+                f" changes={len(snapshot['watched_changes'])}"
+                f" lessons={len(snapshot['recent_lessons'])}"
+            )
+        return snapshot
+    except Exception as exc:
+        print(f"[hearth_pulse] worldview context unavailable this run, continuing without it: {exc}")
+        return {}
+    finally:
+        if owns_conn and conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Processor
 # ---------------------------------------------------------------------------
 
-def _process_unprocessed_hearth_events_detailed(limit=100):
+def _process_unprocessed_hearth_events_detailed(limit=100, include_worldview_context=False):
     """
     Classify up to `limit` unprocessed hearth_events rows and write the
     classification back to the Pathway DB. Returns a list of
@@ -305,11 +384,20 @@ def _process_unprocessed_hearth_events_detailed(limit=100):
     Opens its own read-write connection to the Pathway DB for updates and a
     separate read-only connection for classification lookups. Only opens
     hearth_memory.db when a checkin_submitted event needs an episode lookup.
+
+    include_worldview_context: if True, returns (results, worldview_context)
+    instead of just results. Defaults to False so existing callers keep the
+    original return shape. worldview_context (see collect_pulse_worldview_context)
+    is read once per run, before any event is classified, but classify_event()
+    never receives or uses it — Session 6 only makes it available, it does
+    not change classification output either way.
     """
     db_path = _resolve_db_path(DATABASE_URL)
     write_conn = get_pathway_connection(db_path)
     lookup_conn = get_pathway_readonly_connection(db_path)
     memory_conn = None
+
+    worldview_context = collect_pulse_worldview_context()
 
     results = []
     try:
@@ -343,6 +431,8 @@ def _process_unprocessed_hearth_events_detailed(limit=100):
             results.append((row["id"], row["event_type"], level, score, reason))
 
         write_conn.commit()
+        if include_worldview_context:
+            return results, worldview_context
         return results
     finally:
         lookup_conn.close()
@@ -364,7 +454,18 @@ if __name__ == "__main__":
         raise SystemExit("ERROR: DATABASE_URL is missing. Add it to your .env file.")
 
     print("Hearth Pulse — connecting to Pathway Portal...")
-    results = _process_unprocessed_hearth_events_detailed()
+    results, worldview_context = _process_unprocessed_hearth_events_detailed(
+        include_worldview_context=True
+    )
     print(f"Processed {len(results)} events")
     for event_id, event_type, level, score, reason in results:
         print(f"  id={event_id} type={event_type} level={level} score={score} reason={reason}")
+    if worldview_context:
+        print(
+            "Worldview context attached this run (read-only, not used for classification):"
+            f" beliefs={len(worldview_context.get('active_beliefs', []))}"
+            f" relationships={len(worldview_context.get('active_relationships', []))}"
+            f" uncertainties={len(worldview_context.get('open_uncertainties', []))}"
+            f" changes={len(worldview_context.get('watched_changes', []))}"
+            f" lessons={len(worldview_context.get('recent_lessons', []))}"
+        )

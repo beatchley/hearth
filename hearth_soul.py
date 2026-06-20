@@ -1,15 +1,31 @@
 """
-Hearth Soul — reflective state recorder for the Hearth AI teammate.
+Hearth Soul — reflective state recorder and worldview reflection engine for
+the Hearth AI teammate.
 
-Records operational observations after each pipeline run. Entries are factual
-and short — a black-box log, not a journal.
+Records operational observations after each pipeline run (a black-box log,
+not a journal) and, since Session 3, is the only writer to Hearth's
+worldview: it reads the current worldview and the same episode data already
+flowing into reflection, weighs it conservatively against existing principles,
+and writes belief/uncertainty/change/lesson updates through hearth_worldview.py.
+
+Architecture rule: Pulse filters. Soul interprets. Worldview updates.
+Artifacts surface. Soul may suggest lessons; only a human promotes a lesson
+into hearth_principles.
 """
 
+import os
 import sqlite3
 from datetime import datetime, timezone
 
+import hearth_principles
 import hearth_questions
+import hearth_worldview
 from hearth_memory import MEMORY_DB_PATH
+
+# Feature flag for Soul's worldview reflection pass. Defaults on; set the
+# HEARTH_WORLDVIEW_ENABLED env var to "0" (e.g. via Render) to disable
+# worldview writes without a deploy.
+HEARTH_WORLDVIEW_ENABLED = os.environ.get("HEARTH_WORLDVIEW_ENABLED", "1") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -161,12 +177,257 @@ def _list_len(val):
 
 
 # ---------------------------------------------------------------------------
+# Worldview reflection
+#
+# Soul is the only writer to worldview. These functions read the same
+# episode data already passed into generate_reflection() (no new event
+# pipeline), compare it against current worldview state, weigh changes using
+# existing principles where available, and write conservative updates through
+# hearth_worldview.py. Lessons are always written as provisional — only a
+# human promotes a lesson into hearth_principles.
+# ---------------------------------------------------------------------------
+
+# Thresholds mirror the surprise-detection thresholds already used above in
+# generate_reflection's what_surprised_me logic.
+_REPEAT_CONCERN_THRESHOLD = 2   # same entity appears this many times in one run
+_TYPE_SPIKE_THRESHOLD = 3       # same episode_type appears this many times in one run
+
+_NEW_BELIEF_CONFIDENCE = 0.5
+_NEW_UNCERTAINTY_CONFIDENCE = 0.5
+_NEW_CHANGE_CONFIDENCE = 0.5
+_GROUNDED_DELTA = 0.05          # confidence shift when a supporting principle exists
+_UNGROUNDED_DELTA = 0.03        # smaller, more conservative shift otherwise
+
+
+def _group_episode_counts(episodes):
+    """Return (entity_counts, type_counts) dicts from a list of episode dicts/Rows."""
+    entity_counts = {}
+    type_counts = {}
+    for ep in episodes or []:
+        entity = _episode_entity(ep)
+        if entity is not None:
+            entity_counts[entity] = entity_counts.get(entity, 0) + 1
+        ep_type = _episode_type(ep)
+        if ep_type is not None:
+            type_counts[ep_type] = type_counts.get(ep_type, 0) + 1
+    return entity_counts, type_counts
+
+
+def _confidence_delta(conn, topic_tag):
+    """Use existing principles to weigh how much a confidence change should move.
+
+    Returns the standard delta if an active principle tags this topic,
+    otherwise a smaller, more conservative delta.
+    """
+    if hearth_principles.get_principles_by_tag(conn, topic_tag):
+        return _GROUNDED_DELTA
+    return _UNGROUNDED_DELTA
+
+
+def _upsert_entity_repeat_uncertainty(conn, entity, count, source_run):
+    """Open or refresh a single open uncertainty about repeated same-run concerns.
+
+    Duplicate protection: at most one open uncertainty per (entity), refreshed
+    in place rather than re-created each run.
+    """
+    subject_id = str(entity)
+    text = (
+        f"Entity {entity} had {count} new concern episode(s) in a single run —"
+        " unclear if this is a meaningful pattern or coincidence."
+    )
+    existing = hearth_worldview.get_open_uncertainties(
+        conn, subject_type="entity", subject_id=subject_id, limit=1,
+    )
+    if existing:
+        hearth_worldview.update_uncertainty(conn, existing[0]["id"], uncertainty_text=text)
+        return existing[0]["id"], False
+
+    uid = hearth_worldview.open_uncertainty(
+        conn, subject_type="entity", subject_id=subject_id,
+        uncertainty_text=text,
+        why_it_matters=(
+            "Repeated same-run concerns may indicate an emerging issue, but a"
+            " single run is not enough evidence on its own."
+        ),
+        possible_question=f"Is entity {entity}'s recent concern volume expected or unusual?",
+        confidence=_NEW_UNCERTAINTY_CONFIDENCE,
+        source_episode_id=source_run,
+    )
+    return uid, True
+
+
+def _reinforce_recurrence_lesson(conn, episode_type, source_run):
+    """Add or confirm a provisional lesson when an episode-type spike recurs across runs.
+
+    Only called when the watched change for episode_type already existed
+    (i.e. this is at least the second run it has been seen), so a single
+    spike never becomes a lesson by itself. Stays provisional — Soul may
+    suggest lessons; only a human may promote one into hearth_principles.
+    """
+    lesson_text = (
+        f"Episode type '{episode_type}' recurring at elevated volume across multiple"
+        " scans may indicate a systemic pattern worth reviewing."
+    )
+    existing = [
+        row for row in hearth_worldview.get_recent_lessons(conn, limit=None)
+        if row["lesson_text"] == lesson_text
+    ]
+    if existing:
+        hearth_worldview.confirm_recent_lesson(conn, existing[0]["id"])
+        return existing[0]["id"], False
+
+    lid = hearth_worldview.add_recent_lesson(
+        conn, lesson_text=lesson_text,
+        topic_tags=f"episode_type,{episode_type},pattern",
+        confidence=_NEW_BELIEF_CONFIDENCE,
+        source_episode_id=source_run,
+    )
+    return lid, True
+
+
+def _upsert_episode_type_change(conn, episode_type, count, source_run):
+    """Record or refresh a watched change for an episode_type volume spike.
+
+    Duplicate protection: at most one watching change per episode_type,
+    refreshed (last_seen_at) in place rather than re-created each run. A
+    recurrence (the change already existed) also reinforces a provisional
+    recent lesson — see _reinforce_recurrence_lesson.
+    """
+    existing = hearth_worldview.get_watched_changes(
+        conn, subject_type="episode_type", subject_id=episode_type, limit=1,
+    )
+    if existing:
+        row = existing[0]
+        hearth_worldview.update_change(
+            conn, row["id"],
+            current_state=f"{count} occurrence(s) in latest run",
+            direction="recurring",
+            last_seen=True,
+        )
+        lesson_result = _reinforce_recurrence_lesson(conn, episode_type, source_run)
+        return row["id"], False, lesson_result
+
+    cid = hearth_worldview.record_change(
+        conn, subject_type="episode_type", subject_id=episode_type,
+        change_text=f"Episode type '{episode_type}' is appearing at elevated volume.",
+        previous_state="not previously elevated",
+        current_state=f"{count} occurrence(s) in latest run",
+        direction="increasing",
+        confidence=_NEW_CHANGE_CONFIDENCE,
+        source_episode_id=source_run,
+    )
+    return cid, True, None
+
+
+def _upsert_responsiveness_belief(conn, entity, source_run, confirm):
+    """Add, confirm, or softly challenge a belief about one entity's responsiveness.
+
+    confirm=True is evidence the entity resolved a concern (supports or
+    creates the belief). confirm=False is evidence of a new concern despite
+    an existing belief (challenges it) — a single negative event never
+    creates a belief on its own, since optional participation is not failure.
+    Duplicate protection: at most one active responsiveness belief per entity.
+    """
+    subject_id = str(entity)
+    existing = hearth_worldview.get_active_beliefs(
+        conn, subject_type="entity", subject_id=subject_id,
+        belief_type="responsiveness", limit=1,
+    )
+    if existing:
+        belief = existing[0]
+        delta = _confidence_delta(conn, "creator_activity")
+        new_confidence = belief["confidence"] + delta if confirm else belief["confidence"] - delta
+        hearth_worldview.update_belief(
+            conn, belief["id"], confidence=new_confidence,
+            last_confirmed=confirm, last_challenged=not confirm,
+        )
+        return belief["id"], False
+
+    if not confirm:
+        return None, False  # don't manufacture a belief out of a single negative event
+
+    bid = hearth_worldview.add_belief(
+        conn, subject_type="entity", subject_id=subject_id, belief_type="responsiveness",
+        belief_text=f"Entity {entity} has shown episodes resolving, suggesting responsiveness to outreach.",
+        confidence=_NEW_BELIEF_CONFIDENCE,
+        source_episode_id=source_run,
+    )
+    return bid, True
+
+
+def reflect_on_worldview(conn, new_episodes=None, resolved_episodes=None, source_run=None,
+                         snapshot_limit=25):
+    """
+    Soul's worldview reflection pass — the only code path that writes to
+    hearth_worldview_* tables, and only ever through hearth_worldview.py.
+
+    Reads a limited worldview snapshot (step 1), then reuses the same
+    new_episodes/resolved_episodes already flowing into generate_reflection
+    (step 2) to conservatively add or refresh beliefs, uncertainties, watched
+    changes, and provisional recent lessons (steps 3-5). Duplicate protection
+    keeps each (subject, type) to at most one active/open row per category,
+    refreshed in place rather than re-inserted on repeat runs.
+
+    Returns a dict: {"worldview_before": <snapshot>, "beliefs": [...],
+    "uncertainties": [...], "changes": [...], "lessons": [...]}, where each
+    list holds (row_id, created) tuples for whatever Soul wrote this run.
+    """
+    hearth_worldview.ensure_worldview_tables(conn)
+
+    worldview_before = hearth_worldview.get_worldview_snapshot(
+        conn,
+        belief_limit=snapshot_limit,
+        relationship_limit=snapshot_limit,
+        uncertainty_limit=snapshot_limit,
+        change_limit=snapshot_limit,
+        lesson_limit=snapshot_limit,
+    )
+
+    written = {"worldview_before": worldview_before, "beliefs": [], "uncertainties": [],
+               "changes": [], "lessons": []}
+
+    entity_counts, type_counts = _group_episode_counts(new_episodes)
+    resolved_entity_counts, _ = _group_episode_counts(resolved_episodes)
+
+    for entity, count in entity_counts.items():
+        if count >= _REPEAT_CONCERN_THRESHOLD:
+            result = _upsert_entity_repeat_uncertainty(conn, entity, count, source_run)
+            written["uncertainties"].append(result)
+
+    for episode_type, count in type_counts.items():
+        if count >= _TYPE_SPIKE_THRESHOLD:
+            cid, created, lesson_result = _upsert_episode_type_change(
+                conn, episode_type, count, source_run
+            )
+            written["changes"].append((cid, created))
+            if lesson_result is not None:
+                written["lessons"].append(lesson_result)
+
+    for entity in resolved_entity_counts:
+        result = _upsert_responsiveness_belief(conn, entity, source_run, confirm=True)
+        if result[0] is not None:
+            written["beliefs"].append(result)
+
+    # An entity with an existing responsiveness belief that still shows a new
+    # concern this run softly challenges that belief. One event alone is
+    # never enough to create a belief (handled inside the helper).
+    for entity in entity_counts:
+        if entity in resolved_entity_counts:
+            continue
+        result = _upsert_responsiveness_belief(conn, entity, source_run, confirm=False)
+        if result[0] is not None:
+            written["beliefs"].append(result)
+
+    return written
+
+
+# ---------------------------------------------------------------------------
 # Reflection generator
 # ---------------------------------------------------------------------------
 
 def generate_reflection(conn, new_episodes=None, resolved_episodes=None,
                         open_concerns=None, open_questions=None, source_run=None,
-                        auto_question=True):
+                        auto_question=True, update_worldview=True):
     """
     Derive a reflection from pipeline run data and persist it.
 
@@ -177,6 +438,14 @@ def generate_reflection(conn, new_episodes=None, resolved_episodes=None,
     auto_question: if True (default) and what_i_should_ask is non-empty, a
     question is created via hearth_questions so it surfaces for human review.
     Pass False to store the reflection without touching hearth_questions.
+
+    update_worldview: if True (default) and HEARTH_WORLDVIEW_ENABLED is also
+    True, also runs reflect_on_worldview() on the same new_episodes/
+    resolved_episodes so Soul's worldview reflection happens automatically on
+    every call. A failure in that pass is logged and swallowed so it can
+    never break reflection generation; pass False to disable it for this call
+    only (e.g. for isolated testing), or set HEARTH_WORLDVIEW_ENABLED=0 to
+    disable it everywhere without a deploy.
     """
     # --- what_changed ---
     parts = []
@@ -253,6 +522,15 @@ def generate_reflection(conn, new_episodes=None, resolved_episodes=None,
             triggered_by="hearth_soul",
         )
 
+    if update_worldview and HEARTH_WORLDVIEW_ENABLED:
+        try:
+            reflect_on_worldview(
+                conn, new_episodes=new_episodes, resolved_episodes=resolved_episodes,
+                source_run=source_run,
+            )
+        except Exception as exc:
+            print(f"[HEARTH SOUL] worldview reflection skipped this run: {exc}")
+
     return reflection_id
 
 
@@ -305,6 +583,148 @@ if __name__ == "__main__":
     print("\nStep 4: summarize_recent_reflections()")
     summary = summarize_recent_reflections(conn, limit=10)
     print(summary if summary else "  (no summary)")
+
+    print("\nStep 5: confirm Soul's automatic worldview write from Step 2")
+    creator_quiet_change = hearth_worldview.get_watched_changes(
+        conn, subject_type="episode_type", subject_id="creator_quiet", limit=1,
+    )
+    userE_belief = hearth_worldview.get_active_beliefs(
+        conn, subject_type="entity", subject_id="userE", belief_type="responsiveness", limit=1,
+    )
+    assert creator_quiet_change, "Expected a watched change for episode_type='creator_quiet'"
+    assert userE_belief, "Expected a responsiveness belief for entity='userE'"
+    change_id_first = creator_quiet_change[0]["id"]
+    belief_id_first = userE_belief[0]["id"]
+    belief_confidence_first = userE_belief[0]["confidence"]
+    print(f"  watched_change id={change_id_first} current_state={creator_quiet_change[0]['current_state']!r}")
+    print(f"  belief id={belief_id_first} confidence={belief_confidence_first}")
+
+    print("\nStep 6: generate_reflection() again with identical input — duplicate protection")
+    rid2 = generate_reflection(
+        conn,
+        new_episodes=new_eps,
+        resolved_episodes=resolved_eps,
+        open_concerns=open_concerns,
+        open_questions=open_questions_sample,
+        source_run="smoke_test",
+    )
+    print(f"  reflection_id={rid2} (a new reflection log row is expected — each call logs one)")
+
+    all_creator_quiet_changes = hearth_worldview.get_watched_changes(
+        conn, subject_type="episode_type", subject_id="creator_quiet",
+    )
+    all_userE_beliefs = hearth_worldview.get_active_beliefs(
+        conn, subject_type="entity", subject_id="userE", belief_type="responsiveness",
+    )
+    assert len(all_creator_quiet_changes) == 1, "Duplicate watched change rows created!"
+    assert len(all_userE_beliefs) == 1, "Duplicate belief rows created!"
+    assert all_creator_quiet_changes[0]["id"] == change_id_first, "change id should be stable across runs"
+    assert all_userE_beliefs[0]["id"] == belief_id_first, "belief id should be stable across runs"
+    assert all_userE_beliefs[0]["confidence"] > belief_confidence_first, "confirmed belief should gain confidence"
+    print(f"  watched_change id unchanged: {all_creator_quiet_changes[0]['id'] == change_id_first}")
+    print(f"  belief id unchanged: {all_userE_beliefs[0]['id'] == belief_id_first},"
+          f" confidence {belief_confidence_first} -> {all_userE_beliefs[0]['confidence']}")
+
+    recurrence_lessons = [
+        row for row in hearth_worldview.get_recent_lessons(conn)
+        if row["lesson_text"].startswith("Episode type 'creator_quiet' recurring")
+    ]
+    assert recurrence_lessons, "Expected a provisional recurrence lesson to appear on the second run"
+    print(f"  recurrence lesson created: id={recurrence_lessons[0]['id']}"
+          f" status={recurrence_lessons[0]['status']} confidence={recurrence_lessons[0]['confidence']}")
+
+    print("\nStep 7: reflect_on_worldview() directly — entity repeat-concern uncertainty + dedup")
+    repeat_eps = [
+        {"episode_type": "missing_discord", "entity": "session_3_smoketest_creator_F"},
+        {"episode_type": "probation", "entity": "session_3_smoketest_creator_F"},
+    ]
+    result_a = reflect_on_worldview(conn, new_episodes=repeat_eps, source_run="session_3_smoke_test")
+    result_b = reflect_on_worldview(conn, new_episodes=repeat_eps, source_run="session_3_smoke_test")
+    repeat_uncertainties = hearth_worldview.get_open_uncertainties(
+        conn, subject_type="entity", subject_id="session_3_smoketest_creator_F",
+    )
+    assert len(repeat_uncertainties) == 1, "Duplicate uncertainty rows created!"
+    assert result_a["uncertainties"] and result_a["uncertainties"][0][1] is True, \
+        "Expected the first call to create a new uncertainty"
+    assert result_b["uncertainties"] and result_b["uncertainties"][0][1] is False, \
+        "Expected the second call to update, not create, the uncertainty"
+    print(f"  uncertainty id={repeat_uncertainties[0]['id']}")
+    print(f"  text: {repeat_uncertainties[0]['uncertainty_text']}")
+    print(f"  first call created={result_a['uncertainties'][0][1]},"
+          f" second call created={result_b['uncertainties'][0][1]}")
+
+    print("\nAll Session 3 smoke test assertions passed.")
+
+    print("\nStep 8: get_worldview_snapshot() and full review dump")
+    snapshot = hearth_worldview.get_worldview_snapshot(conn)
+    for key in ("identity", "active_beliefs", "active_relationships", "open_uncertainties",
+                "watched_changes", "recent_lessons"):
+        print(f"  {key}: {len(snapshot[key])} row(s)")
+
+    print("\n=== Full worldview table contents (for human review before Session 4) ===")
+
+    print("\n--- hearth_worldview_beliefs ---")
+    belief_rows = conn.execute("SELECT * FROM hearth_worldview_beliefs ORDER BY id;").fetchall()
+    for row in belief_rows:
+        print(f"  id={row['id']} subject={row['subject_type']}:{row['subject_id']}"
+              f" type={row['belief_type']} status={row['status']} confidence={row['confidence']}"
+              f" source_episode_id={row['source_episode_id']}")
+        print(f"    belief_text: {row['belief_text']}")
+    if not belief_rows:
+        print("  (no rows)")
+
+    print("\n--- hearth_worldview_uncertainties ---")
+    uncertainty_rows = conn.execute("SELECT * FROM hearth_worldview_uncertainties ORDER BY id;").fetchall()
+    for row in uncertainty_rows:
+        print(f"  id={row['id']} subject={row['subject_type']}:{row['subject_id']}"
+              f" status={row['status']} confidence={row['confidence']}"
+              f" source_episode_id={row['source_episode_id']}")
+        print(f"    uncertainty_text: {row['uncertainty_text']}")
+    if not uncertainty_rows:
+        print("  (no rows)")
+
+    print("\n--- hearth_worldview_changes ---")
+    change_rows = conn.execute("SELECT * FROM hearth_worldview_changes ORDER BY id;").fetchall()
+    for row in change_rows:
+        print(f"  id={row['id']} subject={row['subject_type']}:{row['subject_id']}"
+              f" status={row['status']} direction={row['direction']} confidence={row['confidence']}"
+              f" source_episode_id={row['source_episode_id']}")
+        print(f"    change_text: {row['change_text']}")
+        print(f"    previous_state={row['previous_state']!r} current_state={row['current_state']!r}")
+    if not change_rows:
+        print("  (no rows)")
+
+    print("\n--- hearth_worldview_recent_lessons ---")
+    lesson_rows = conn.execute("SELECT * FROM hearth_worldview_recent_lessons ORDER BY id;").fetchall()
+    for row in lesson_rows:
+        print(f"  id={row['id']} status={row['status']} confidence={row['confidence']}"
+              f" times_confirmed={row['times_confirmed']} times_challenged={row['times_challenged']}"
+              f" candidate_for_principle={row['candidate_for_principle']}"
+              f" source_episode_id={row['source_episode_id']}")
+        print(f"    lesson_text: {row['lesson_text']}")
+    if not lesson_rows:
+        print("  (no rows)")
+
+    print("\n--- hearth_worldview_relationships ---")
+    relationship_rows = conn.execute("SELECT * FROM hearth_worldview_relationships ORDER BY id;").fetchall()
+    for row in relationship_rows:
+        print(f"  id={row['id']} status={row['status']} confidence={row['confidence']}")
+        print(f"    relationship_summary: {row['relationship_summary']}")
+    if not relationship_rows:
+        print("  (no rows — this session does not write relationships)")
+
+    print("\n--- hearth_worldview_identity ---")
+    identity_rows = conn.execute("SELECT * FROM hearth_worldview_identity ORDER BY id;").fetchall()
+    for row in identity_rows:
+        print(f"  id={row['id']} key={row['identity_key']} value={row['identity_value']!r} status={row['status']}")
+    if not identity_rows:
+        print("  (no rows — this session does not write identity)")
+
+    print(
+        "\nNOTE: worldview rows above were written by Soul during this smoke test and"
+        " intentionally left in hearth_memory.db for review before Session 4, rather"
+        " than being deleted like Session 2's cleanup."
+    )
 
     conn.close()
     print("\nSmoke test complete.")
