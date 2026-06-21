@@ -203,6 +203,51 @@ def collect_relevant_principles(memory_conn, active_episode_types, tracer=None):
 # Worldview
 # ---------------------------------------------------------------------------
 
+def _resolve_worldview_subject_name(memory_conn, pathway_conn, subject_type, subject_id):
+    """Best-effort resolution of one worldview subject to a human display name.
+
+    subject_id is Hearth's own hearth_entities.id when subject_type == "entity"
+    (not a Pathway users.id directly — see hearth_memory.get_or_create_entity),
+    so resolution is a two-step hop: hearth_entities.id -> user_id -> identity.
+    Returns None for any other subject_type, a missing/unresolvable id, or any
+    lookup failure — callers must treat None as "render the raw row as before."
+    """
+    if subject_type != "entity" or not subject_id:
+        return None
+    try:
+        entity_id = int(subject_id)
+        entity_row = memory_conn.execute(
+            "SELECT user_id FROM hearth_entities WHERE id = ?;", (entity_id,)
+        ).fetchone()
+        if not entity_row or entity_row["user_id"] is None:
+            return None
+        import hearth_identity
+        return hearth_identity.get_user_display_name(entity_row["user_id"], conn=pathway_conn)
+    except Exception:
+        return None
+
+
+def _with_subject_name(memory_conn, pathway_conn, row):
+    """Return row (as a dict) with a resolved "_subject_name" key added."""
+    row = dict(row)
+    row["_subject_name"] = _resolve_worldview_subject_name(
+        memory_conn, pathway_conn, row.get("subject_type"), row.get("subject_id")
+    )
+    return row
+
+
+def _with_relationship_names(memory_conn, pathway_conn, row):
+    """Return row (as a dict) with resolved "_entity_a_name"/"_entity_b_name" keys added."""
+    row = dict(row)
+    row["_entity_a_name"] = _resolve_worldview_subject_name(
+        memory_conn, pathway_conn, row.get("entity_a_type"), row.get("entity_a_id")
+    )
+    row["_entity_b_name"] = _resolve_worldview_subject_name(
+        memory_conn, pathway_conn, row.get("entity_b_type"), row.get("entity_b_id")
+    )
+    return row
+
+
 def collect_worldview_summary(memory_conn) -> WorldviewSummary:
     """Read a limited worldview snapshot for context assembly (Session 4).
 
@@ -210,6 +255,13 @@ def collect_worldview_summary(memory_conn) -> WorldviewSummary:
     HEARTH_WORLDVIEW_CONTEXT_ENABLED, if memory_conn is None, or if worldview
     retrieval fails for any reason. A worldview problem must never break
     briefing; legacy context generation always continues.
+
+    Since the identity-resolution pass below, each row in active_beliefs,
+    active_relationships, open_uncertainties, and watched_changes is a dict
+    (not a sqlite3.Row) carrying an extra "_subject_name" (or
+    "_entity_a_name"/"_entity_b_name") key for human-facing rendering. The
+    underlying worldview tables and IDs are untouched — this is render-time
+    enrichment only. recent_lessons has no subject id and is left as-is.
     """
     if not HEARTH_WORLDVIEW_CONTEXT_ENABLED or memory_conn is None:
         return WorldviewSummary()
@@ -225,13 +277,32 @@ def collect_worldview_summary(memory_conn) -> WorldviewSummary:
             change_limit=_WORLDVIEW_CONTEXT_LIMIT,
             lesson_limit=_WORLDVIEW_CONTEXT_LIMIT,
         )
-        summary = WorldviewSummary(
-            active_beliefs=list(snapshot["active_beliefs"]),
-            active_relationships=list(snapshot["active_relationships"]),
-            open_uncertainties=list(snapshot["open_uncertainties"]),
-            watched_changes=list(snapshot["watched_changes"]),
-            recent_lessons=list(snapshot["recent_lessons"]),
-        )
+
+        import hearth_identity
+        pathway_conn = hearth_identity.get_pathway_connection()
+        try:
+            summary = WorldviewSummary(
+                active_beliefs=[
+                    _with_subject_name(memory_conn, pathway_conn, r)
+                    for r in snapshot["active_beliefs"]
+                ],
+                active_relationships=[
+                    _with_relationship_names(memory_conn, pathway_conn, r)
+                    for r in snapshot["active_relationships"]
+                ],
+                open_uncertainties=[
+                    _with_subject_name(memory_conn, pathway_conn, r)
+                    for r in snapshot["open_uncertainties"]
+                ],
+                watched_changes=[
+                    _with_subject_name(memory_conn, pathway_conn, r)
+                    for r in snapshot["watched_changes"]
+                ],
+                recent_lessons=list(snapshot["recent_lessons"]),
+            )
+        finally:
+            if pathway_conn:
+                pathway_conn.close()
         if not summary.is_empty:
             print(
                 "[HEARTH WORLDVIEW] context read:"
@@ -623,11 +694,41 @@ def _age_note(concern: OpenConcern) -> str:
     return f"for {age} days — worth escalating"
 
 
+def _subject_label(row) -> Optional[str]:
+    """Return the resolved display name for a single-subject worldview row, if any."""
+    try:
+        return row.get("_subject_name")
+    except AttributeError:
+        return None
+
+
+def _relationship_label(row) -> Optional[str]:
+    """Return a combined display label for a relationship row, if either side resolved."""
+    try:
+        a = row.get("_entity_a_name")
+        b = row.get("_entity_b_name")
+    except AttributeError:
+        return None
+    if a and b:
+        return f"{a} & {b}"
+    return a or b
+
+
+def _labeled(label, text) -> str:
+    """Prefix text with "label: " when a display name resolved, else text unchanged."""
+    return f"{label}: {text}" if label else text
+
+
 def _render_worldview_section(worldview: WorldviewSummary) -> list:
     """Render the worldview section as a list of lines, or [] if empty.
 
     Kept separate so render_for_llm can place it ahead of legacy sections
     (Session 4 priority order) without disturbing any existing rendering.
+    Where a row's subject resolved to a real person (see _subject_label /
+    _relationship_label), the line is prefixed with their display name —
+    e.g. "Denise Lewis: entity userE has shown responsiveness" — instead of
+    showing only the stored worldview text. Unresolved subjects render
+    exactly as before.
     """
     if worldview.is_empty:
         return []
@@ -636,19 +737,23 @@ def _render_worldview_section(worldview: WorldviewSummary) -> list:
     if worldview.active_beliefs:
         lines.append("  Beliefs:")
         for b in worldview.active_beliefs:
-            lines.append(f"    - {b['belief_text']} (confidence: {b['confidence']:.1f})")
+            text = _labeled(_subject_label(b), b['belief_text'])
+            lines.append(f"    - {text} (confidence: {b['confidence']:.1f})")
     if worldview.active_relationships:
         lines.append("  Relationship understandings:")
         for r in worldview.active_relationships:
-            lines.append(f"    - {r['relationship_summary']} (confidence: {r['confidence']:.1f})")
+            text = _labeled(_relationship_label(r), r['relationship_summary'])
+            lines.append(f"    - {text} (confidence: {r['confidence']:.1f})")
     if worldview.open_uncertainties:
         lines.append("  Open uncertainties:")
         for u in worldview.open_uncertainties:
-            lines.append(f"    - {u['uncertainty_text']}")
+            text = _labeled(_subject_label(u), u['uncertainty_text'])
+            lines.append(f"    - {text}")
     if worldview.watched_changes:
         lines.append("  Watched changes:")
         for c in worldview.watched_changes:
-            lines.append(f"    - {c['change_text']}")
+            text = _labeled(_subject_label(c), c['change_text'])
+            lines.append(f"    - {text}")
     if worldview.recent_lessons:
         lines.append("  Recent lessons (provisional, not yet human-approved):")
         for lesson in worldview.recent_lessons:
