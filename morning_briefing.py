@@ -1647,6 +1647,9 @@ def run_pipeline(db_path=None, gemini_api_key=None, scan_mode="morning",
 
         resolve_stale_issues(memory_conn, data, tracer)
         resolve_legacy_unlinked_battles(memory_conn, tracer)
+        # Captured right after the resolve calls above so it reflects only
+        # episodes this run closed, not older resolutions from a prior scan.
+        resolved_episodes = hearth_memory.get_recent_resolutions(memory_conn, hours=1)
         detect_and_record_issues(memory_conn, data, tracer)
         detect_checkin_feedback_waiting(memory_conn, data, tracer)
         detect_training_comment_waiting(memory_conn, data, tracer)
@@ -1668,6 +1671,7 @@ def run_pipeline(db_path=None, gemini_api_key=None, scan_mode="morning",
         reflection_id = hearth_soul.generate_reflection(
             memory_conn,
             new_episodes=open_episodes,
+            resolved_episodes=resolved_episodes,
             open_concerns=open_concerns,
             open_questions=open_questions,
             source_run=scan_mode,

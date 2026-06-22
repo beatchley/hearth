@@ -15,6 +15,7 @@ into hearth_principles.
 
 import os
 import sqlite3
+import traceback
 from datetime import datetime, timezone
 
 import hearth_principles
@@ -164,6 +165,15 @@ def _episode_type(ep):
     return None
 
 
+def _episode_severity(ep):
+    """Extract a severity string from an episode dict or Row, or None if absent."""
+    try:
+        val = ep["severity"]
+        return str(val) if val is not None else None
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
 def _list_len(val):
     """Return len if val is a list, treat as integer count otherwise."""
     if val is None:
@@ -197,6 +207,28 @@ _NEW_UNCERTAINTY_CONFIDENCE = 0.5
 _NEW_CHANGE_CONFIDENCE = 0.5
 _GROUNDED_DELTA = 0.05          # confidence shift when a supporting principle exists
 _UNGROUNDED_DELTA = 0.03        # smaller, more conservative shift otherwise
+
+# Episode types significant enough that a single occurrence still earns a
+# cautious worldview entry, separate from the repeat/spike thresholds above
+# (those exist for stronger, higher-volume signals and are unchanged). One
+# meaningful episode may open a cautious uncertainty; it is never enough on
+# its own to create a belief.
+_SINGLE_SIGNIFICANCE_TYPES = frozenset({
+    "support_request_waiting",
+    "checkin_feedback_waiting",
+    "training_comment_waiting",
+    "new_creator_stuck",
+    "onboarding_engagement",
+    "missing_discord",
+})
+
+# creator_quiet only earns single-episode significance once the watcher in
+# morning_briefing.py has already flagged it past its lowest severity band
+# (severity is "low" for the first 14-20 quiet days, "medium"/"high" beyond),
+# so a creator who just crossed the 14-day line doesn't immediately trigger.
+_CREATOR_QUIET_SIGNIFICANT_SEVERITIES = frozenset({"medium", "high"})
+
+_SINGLE_SIGNIFICANCE_CONFIDENCE = 0.5
 
 
 def _group_episode_counts(episodes):
@@ -319,6 +351,94 @@ def _upsert_episode_type_change(conn, episode_type, count, source_run):
     return cid, True, None
 
 
+def _is_individually_significant(ep, episode_type):
+    """Whether a single occurrence of this episode is worth a cautious worldview entry.
+
+    Most types in _SINGLE_SIGNIFICANCE_TYPES qualify unconditionally; creator_quiet
+    qualifies only once its severity has moved past the lowest band (see
+    _CREATOR_QUIET_SIGNIFICANT_SEVERITIES).
+    """
+    if episode_type in _SINGLE_SIGNIFICANCE_TYPES:
+        return True
+    if episode_type == "creator_quiet":
+        return _episode_severity(ep) in _CREATOR_QUIET_SIGNIFICANT_SEVERITIES
+    return False
+
+
+def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run):
+    """Open or refresh a cautious uncertainty for one individually meaningful episode.
+
+    This is deliberately separate from _upsert_entity_repeat_uncertainty (keyed on
+    entity alone) and _upsert_episode_type_change (keyed on episode_type alone) — it
+    uses subject_type="entity_episode" so the three never collide or overwrite each
+    other. Duplicate protection: at most one open uncertainty per (episode_type,
+    entity), refreshed in place. Confidence stays in the cautious 0.45-0.55 band —
+    a single concern is worth watching, not a belief.
+    """
+    subject_id = f"{episode_type}:{entity}"
+    label = episode_type.replace("_", " ")
+    text = (
+        f"It is unclear whether the {label} episode for entity {entity} reflects"
+        " a meaningful pattern or an isolated event — worth watching."
+    )
+    existing = hearth_worldview.get_open_uncertainties(
+        conn, subject_type="entity_episode", subject_id=subject_id, limit=1,
+    )
+    if existing:
+        hearth_worldview.update_uncertainty(conn, existing[0]["id"], uncertainty_text=text)
+        return existing[0]["id"], False
+
+    uid = hearth_worldview.open_uncertainty(
+        conn, subject_type="entity_episode", subject_id=subject_id,
+        uncertainty_text=text,
+        why_it_matters=(
+            f"A single {label} episode may or may not indicate something worth"
+            " acting on — Hearth is unsure without more data."
+        ),
+        possible_question=f"Is the {label} episode for entity {entity} part of a larger pattern?",
+        confidence=_SINGLE_SIGNIFICANCE_CONFIDENCE,
+        source_episode_id=source_run,
+    )
+    return uid, True
+
+
+def _upsert_creator_quiet_watch(conn, entity, source_run):
+    """Open or refresh a cautious watched change for a creator_quiet episode that has
+    already crossed into the medium/high severity band (see
+    _CREATOR_QUIET_SIGNIFICANT_SEVERITIES) — quiet duration is motion, not a fixed
+    state, so this uses record_change rather than open_uncertainty.
+
+    Duplicate protection: at most one watching change per entity (subject_type=
+    "creator_quiet_entity"), refreshed in place rather than re-created each run.
+    """
+    subject_id = str(entity)
+    existing = hearth_worldview.get_watched_changes(
+        conn, subject_type="creator_quiet_entity", subject_id=subject_id, limit=1,
+    )
+    if existing:
+        hearth_worldview.update_change(
+            conn, existing[0]["id"],
+            current_state="still quiet as of latest run",
+            direction="unclear",
+            last_seen=True,
+        )
+        return existing[0]["id"], False
+
+    cid = hearth_worldview.record_change(
+        conn, subject_type="creator_quiet_entity", subject_id=subject_id,
+        change_text=(
+            f"Entity {entity} has gone quiet for an extended period. This may indicate"
+            " disengagement, or it may be a temporary lull — it is unclear yet."
+        ),
+        previous_state="not previously flagged at this severity",
+        current_state="quiet as of latest run",
+        direction="unclear",
+        confidence=_SINGLE_SIGNIFICANCE_CONFIDENCE,
+        source_episode_id=source_run,
+    )
+    return cid, True
+
+
 def _upsert_responsiveness_belief(conn, entity, source_run, confirm):
     """Add, confirm, or softly challenge a belief about one entity's responsiveness.
 
@@ -402,6 +522,24 @@ def reflect_on_worldview(conn, new_episodes=None, resolved_episodes=None, source
             written["changes"].append((cid, created))
             if lesson_result is not None:
                 written["lessons"].append(lesson_result)
+
+    # Individual significance: some episode types are worth a cautious entry
+    # even as a single occurrence, independent of the repeat/spike thresholds
+    # above. Never creates a belief — see _upsert_single_episode_uncertainty
+    # and _upsert_creator_quiet_watch.
+    for ep in new_episodes or []:
+        entity = _episode_entity(ep)
+        ep_type = _episode_type(ep)
+        if entity is None or ep_type is None:
+            continue
+        if not _is_individually_significant(ep, ep_type):
+            continue
+        if ep_type == "creator_quiet":
+            written["changes"].append(_upsert_creator_quiet_watch(conn, entity, source_run))
+        else:
+            written["uncertainties"].append(
+                _upsert_single_episode_uncertainty(conn, ep_type, entity, source_run)
+            )
 
     for entity in resolved_entity_counts:
         result = _upsert_responsiveness_belief(conn, entity, source_run, confirm=True)
@@ -529,7 +667,11 @@ def generate_reflection(conn, new_episodes=None, resolved_episodes=None,
                 source_run=source_run,
             )
         except Exception as exc:
-            print(f"[HEARTH SOUL] worldview reflection skipped this run: {exc}")
+            print(
+                f"[HEARTH WORLDVIEW ERROR] source_run={source_run!r} "
+                f"{type(exc).__name__}: {exc}"
+            )
+            traceback.print_exc()
 
     return reflection_id
 
