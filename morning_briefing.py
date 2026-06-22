@@ -23,6 +23,7 @@ CT = ZoneInfo("America/Chicago")
 from google import genai
 from dotenv import load_dotenv
 
+import hearth_identity
 import hearth_memory
 import hearth_questions
 import hearth_relationships
@@ -266,13 +267,21 @@ def query_checkin_feedback_waiting(conn, cutoff: datetime):
 def query_training_comment_waiting(conn, cutoff: datetime):
     """Creator comments on trainings with no staff response after TRAINING_COMMENT_WAITING_DAYS.
 
-    Staff roles: ceo, it, manager, coach (anyone whose role is not 'member').
+    Creator identity here is creator flags (is_pathway_creator or
+    is_shop_creator), independent of staff role — a creator-flagged user's
+    comment is creator-originated even if they also hold a staff role. Staff
+    response detection uses the centralized hearth_identity.STAFF_ROLES set,
+    independent of creator flags — a staff reply counts even if that staff
+    member is also a creator. A hybrid user can be both.
+
     A staff response is either:
       - a reply (training_comment_replies) from a staff user on the same comment, OR
       - a later training_comments row from a staff user on the same training.
     The cutoff date (now - threshold) filters to comments old enough to flag.
     """
-    sql = """
+    staff_roles = tuple(hearth_identity.STAFF_ROLES)
+    staff_placeholders = ", ".join("?" for _ in staff_roles)
+    sql = f"""
         SELECT
             tc.id                                               AS comment_id,
             tc.training_id,
@@ -285,14 +294,14 @@ def query_training_comment_waiting(conn, cutoff: datetime):
         FROM training_comments tc
         JOIN users u     ON u.id  = tc.user_id
         JOIN trainings t ON t.id  = tc.training_id
-        WHERE u.role NOT IN ('ceo', 'it', 'manager', 'coach')
+        WHERE (u.is_pathway_creator = 1 OR u.is_shop_creator = 1)
           AND tc.created_at <= ?
           AND NOT EXISTS (
               SELECT 1
               FROM training_comment_replies tcr
               JOIN users ru ON ru.id = tcr.user_id
               WHERE tcr.comment_id = tc.id
-                AND ru.role IN ('ceo', 'it', 'manager', 'coach')
+                AND lower(trim(ru.role)) IN ({staff_placeholders})
           )
           AND NOT EXISTS (
               SELECT 1
@@ -300,25 +309,35 @@ def query_training_comment_waiting(conn, cutoff: datetime):
               JOIN users ru2 ON ru2.id = tc2.user_id
               WHERE tc2.training_id = tc.training_id
                 AND tc2.created_at > tc.created_at
-                AND ru2.role IN ('ceo', 'it', 'manager', 'coach')
+                AND lower(trim(ru2.role)) IN ({staff_placeholders})
           )
         ORDER BY tc.created_at ASC;
     """
-    return safe_query(conn, "Training comments awaiting staff response", sql, (cutoff.isoformat(),))
+    params = (cutoff.isoformat(),) + staff_roles + staff_roles
+    return safe_query(conn, "Training comments awaiting staff response", sql, params)
 
 
 def query_support_request_waiting(conn, cutoff: datetime):
-    """Open support threads where the latest message is from a creator (not staff)
-    and has been waiting longer than SUPPORT_REQUEST_WAITING_DAYS.
+    """Open support threads where the latest message is from a creator and has
+    been waiting longer than SUPPORT_REQUEST_WAITING_DAYS.
 
-    Threads created by staff are excluded. Staff roles: ceo, it, manager, coach.
+    Creator identity here is creator flags (is_pathway_creator or
+    is_shop_creator) on the thread requester, independent of staff role — a
+    creator-flagged thread is creator-originated even if the requester also
+    holds a staff role. Staff-response detection uses the centralized
+    hearth_identity.STAFF_ROLES set, independent of creator flags — a staff
+    reply counts even if that staff member is also a creator. A hybrid user
+    can be both.
+
     Triggers when:
       - Thread status is 'open'
-      - Creator is not a staff member
-      - Latest message is from the creator (not staff), or no messages exist yet
-      - That latest creator message (or thread created_at if no messages) is older than cutoff
+      - Thread requester has a creator flag set
+      - Latest message is not from a staff-role user, or no messages exist yet
+      - That latest message (or thread created_at if no messages) is older than cutoff
     """
-    sql = """
+    staff_roles = tuple(hearth_identity.STAFF_ROLES)
+    staff_placeholders = ", ".join("?" for _ in staff_roles)
+    sql = f"""
         WITH last_msg AS (
             SELECT thread_id,
                    MAX(created_at) AS last_msg_at
@@ -347,24 +366,28 @@ def query_support_request_waiting(conn, cutoff: datetime):
         JOIN users u ON u.id = st.creator_id
         LEFT JOIN last_msg_detail lmd ON lmd.thread_id = st.id
         WHERE st.status = 'open'
-          AND u.role NOT IN ('ceo', 'it', 'manager', 'coach')
+          AND (u.is_pathway_creator = 1 OR u.is_shop_creator = 1)
           AND (
               lmd.thread_id IS NULL
-              OR lmd.last_author_role NOT IN ('ceo', 'it', 'manager', 'coach')
+              OR lower(trim(lmd.last_author_role)) NOT IN ({staff_placeholders})
           )
           AND COALESCE(lmd.last_msg_at, st.created_at) <= ?
         ORDER BY days_waiting DESC;
     """
-    return safe_query(conn, "Support requests awaiting response", sql, (cutoff.isoformat(),))
+    params = staff_roles + (cutoff.isoformat(),)
+    return safe_query(conn, "Support requests awaiting response", sql, params)
 
 
 def query_new_creator_stuck(conn):
     """Approved creators who joined NEW_CREATOR_STUCK_DAYS+ days ago with zero engagement.
 
     Uses the same creator filter as creator_quiet (approved, is_pathway_creator or
-    is_shop_creator, non-staff role) plus a joined_on threshold. Returns only creators
-    with no engagement signals across all meaningful signal tables. Excludes page_visits
-    (passive) and private_messages (ambiguous sender — often coach-initiated).
+    is_shop_creator) plus a joined_on threshold. Creator and staff identity are
+    independent — a creator-flagged user is included even if they also hold a
+    staff role (see hearth_identity.is_creator_user / is_staff_user). Returns
+    only creators with no engagement signals across all meaningful signal
+    tables. Excludes page_visits (passive) and private_messages (ambiguous
+    sender — often coach-initiated).
     """
     sql = """
         WITH creators AS (
@@ -376,7 +399,6 @@ def query_new_creator_stuck(conn):
             FROM users
             WHERE status = 'approved'
               AND (is_pathway_creator = 1 OR is_shop_creator = 1)
-              AND role NOT IN ('ceo', 'it', 'manager', 'coach')
               AND joined_on IS NOT NULL
               AND julianday('now') - julianday(joined_on) >= ?
         ),
@@ -452,8 +474,10 @@ def query_creator_quiet(conn):
     """
     Approved pathway/shop creators with no meaningful activity for 14+ days.
 
-    Excludes manager, ceo, it, and coach roles — they are not tracked as
-    creators even if is_pathway_creator or is_shop_creator happens to be set.
+    Creator identity (is_pathway_creator / is_shop_creator) and staff identity
+    (role) are independent and overlapping — a user with creator flags is
+    eligible here even if they also hold a staff role. See
+    hearth_identity.is_creator_user / is_staff_user.
 
     A single UNION ALL collects every activity signal; one MAX() per user
     finds their most recent timestamp without Python-side loops.
@@ -468,7 +492,6 @@ def query_creator_quiet(conn):
             FROM users
             WHERE status = 'approved'
               AND (is_pathway_creator = 1 OR is_shop_creator = 1)
-              AND role NOT IN ('ceo', 'it', 'manager', 'coach')
         ),
         activity AS (
             SELECT user_id,         visited_at                    AS activity_at,

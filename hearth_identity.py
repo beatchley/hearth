@@ -100,6 +100,86 @@ def get_user_display_name(user_id, conn=None):
 
 
 # ---------------------------------------------------------------------------
+# Identity predicates — creator and staff are independent, overlapping
+# identities. Pathway's actual model is:
+#   users.role                          -> staff/access responsibility
+#   users.is_pathway_creator/is_shop_creator -> creator identity
+# A user can satisfy both. Centralized here so every watcher across Hearth
+# (creator_quiet, new_creator_stuck, support_request_waiting,
+# training_comment_waiting, etc.) agrees on what counts as staff.
+# ---------------------------------------------------------------------------
+
+# Union of every staff-like role found across Hearth/Pathway role checks
+# (morning_briefing.py watcher exclusions, the comment-needs-response staff
+# filter, and hearth_pulse.py's _STAFF_ROLES).
+STAFF_ROLES = frozenset({
+    "ceo",
+    "manager",
+    "coach",
+    "navigator",
+    "it",
+    "admin",
+})
+
+
+def _get_field(row_or_dict, field, default=None):
+    """Defensively read field from a sqlite3.Row, dict, or ORM-like object.
+
+    sqlite3.Row raises IndexError (not KeyError) for an unknown column, and
+    has no .get(), so it needs its own branch.
+    """
+    if row_or_dict is None:
+        return default
+    if isinstance(row_or_dict, sqlite3.Row):
+        try:
+            return row_or_dict[field]
+        except IndexError:
+            return default
+    if isinstance(row_or_dict, dict):
+        return row_or_dict.get(field, default)
+    return getattr(row_or_dict, field, default)
+
+
+def normalize_role(role):
+    """Lowercase/trim a role string for comparison. None/non-string -> ""."""
+    if role is None:
+        return ""
+    return str(role).strip().lower()
+
+
+def is_creator_user(row_or_dict):
+    """True if either creator flag is set — independent of role/staff status.
+
+    A staff member with is_pathway_creator or is_shop_creator set is still
+    a creator; being staff does not remove creator identity.
+    """
+    is_pathway_creator = _get_field(row_or_dict, "is_pathway_creator")
+    is_shop_creator = _get_field(row_or_dict, "is_shop_creator")
+    return bool(is_pathway_creator) or bool(is_shop_creator)
+
+
+def is_staff_user(row_or_dict):
+    """True if the user's normalized role is in the central STAFF_ROLES set.
+
+    Independent of creator flags — a staff creator is both.
+    """
+    role = _get_field(row_or_dict, "role")
+    return normalize_role(role) in STAFF_ROLES
+
+
+def identity_flags(row_or_dict):
+    """Return {"is_creator": bool, "is_staff": bool} for row_or_dict.
+
+    The two flags are independent and can both be True for a hybrid
+    staff/creator user.
+    """
+    return {
+        "is_creator": is_creator_user(row_or_dict),
+        "is_staff": is_staff_user(row_or_dict),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Smoke test
 # ---------------------------------------------------------------------------
 
