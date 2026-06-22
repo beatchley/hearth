@@ -41,6 +41,14 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 HEARTH_TRACE = os.getenv("HEARTH_TRACE", "0").strip() == "1"
 
+# Feature flag for the worldview-interpretation guidance in the brief prompt
+# (Step 4). Defaults on; set HEARTH_WORLDVIEW_PROMPT_ENABLED=0 to make the
+# prompt behave exactly as it did before Step 4. This only changes prompt
+# wording — it does not change what data is passed into the prompt.
+HEARTH_WORLDVIEW_PROMPT_ENABLED = (
+    os.environ.get("HEARTH_WORLDVIEW_PROMPT_ENABLED", "1") == "1"
+)
+
 # Watcher thresholds — adjust here without touching watcher logic
 CHECKIN_FEEDBACK_WAITING_DAYS   = 3   # flag a submitted check-in after this many days with no feedback
 TRAINING_COMMENT_WAITING_DAYS   = 3   # flag a creator training comment after this many days with no staff response
@@ -1565,6 +1573,35 @@ def detect_new_creator_stuck(memory_conn, data, tracer=None):
 # Hearth message generation — Gemini is the voice layer, not the identity
 # ---------------------------------------------------------------------------
 
+# Step 4: explains how to weigh worldview (Hearth's current understanding)
+# against raw events (today's supporting evidence) within the awareness
+# block. Gated by HEARTH_WORLDVIEW_PROMPT_ENABLED — see generate_hearth_message.
+_WORLDVIEW_GUIDANCE_SECTION = """\
+--- HOW TO WEIGH YOUR AWARENESS ---
+Your awareness opens with Hearth's current understanding: beliefs, open \
+uncertainties, watched changes, and recent lessons formed from everything \
+you've observed before today. Treat that as your starting point, not as \
+another event to report.
+Beliefs are what you currently hold to be true — lean on them as context.
+Open uncertainties are active questions of yours. Give them attention when \
+today's events touch on them.
+Watched changes are things you've noticed may be shifting. They deserve \
+attention even when nothing new happened today to trigger them.
+Recent lessons are provisional, not human-approved principles. Use them \
+cautiously to help read the situation, not as settled fact.
+Everything below that — what you're noticing, who you're watching, what's \
+resolved — is today's evidence. It can support, sharpen, or complicate \
+your understanding, but a single day's events shouldn't overturn what \
+you've held for longer. If today's evidence seems to contradict something \
+you believe, say so plainly and hold both possibilities rather than picking \
+a side with false confidence.
+Speak in your own plain language — don't borrow Hearth's internal labels \
+("beliefs", "uncertainties", "watched changes", "recent lessons") as words \
+in the briefing itself.
+
+"""
+
+
 HEARTH_SYSTEM_PROMPT = """\
 You are Hearth.
 
@@ -1599,7 +1636,7 @@ When a practical next step is obvious, weave it into the sentence — don't anno
 an action item.
 If it has been a quiet morning, say so in one sentence and stop there.
 
---- WHAT TO AVOID ---
+{worldview_guidance}--- WHAT TO AVOID ---
 Do not mention Gemini, AI models, databases, queries, tables, row counts, statistics, \
 or any internal implementation detail.
 Do not use emojis, section headers, or bold formatting.
@@ -1615,7 +1652,10 @@ def generate_hearth_message(awareness_context: hearth_context.HearthAwarenessCon
                             gemini_client) -> str:
     """Send Hearth's awareness context to Gemini and return the Hearth message."""
     awareness_text = hearth_context.render_for_llm(awareness_context)
-    prompt = HEARTH_SYSTEM_PROMPT.format(awareness=awareness_text)
+    worldview_guidance = _WORLDVIEW_GUIDANCE_SECTION if HEARTH_WORLDVIEW_PROMPT_ENABLED else ""
+    prompt = HEARTH_SYSTEM_PROMPT.format(
+        awareness=awareness_text, worldview_guidance=worldview_guidance
+    )
     response = gemini_client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
     return response.text
 
