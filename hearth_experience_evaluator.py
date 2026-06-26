@@ -1,14 +1,18 @@
 """
-Hearth Experience Evaluator — V1, observation mode only.
+Hearth Experience Evaluator — V1.
 
 Bridges Pulse signals and Hearth episodes. Pulse notices activity and
 classifies hearth_events as trace/signal/observation. This module asks the
 next question: "Does this signal meaningfully change understanding relative
-to worldview?" If yes, it may eventually be promoted into a Hearth episode.
+to worldview?" If yes, it is promoted into a Hearth episode.
 
-V1 never creates episodes and never writes to worldview. It only reads
-Pulse-classified events and Hearth's worldview, classifies each event into
-a candidate type, and reports what it would have done.
+Default behavior is observation only: it reads Pulse-classified events and
+Hearth's worldview, classifies each event into a candidate type, and reports
+what it would do — never writing anything. Setting
+HEARTH_EXPERIENCE_EVALUATOR_PROMOTE=1 enables the write path, which turns
+momentum/resolution/concern candidates into Hearth episodes (idempotently,
+via hearth_memory.create_episode). It never writes to worldview and never
+updates hearth_events.
 
 Architecture:
     Pulse (hearth_events) -> Experience Evaluator -> episode candidate
@@ -40,7 +44,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 _LOG_PREFIX = "[HEARTH EXPERIENCE]"
 
 # Feature flags — see module docstring. Promotion stays off by default;
-# enabling it in V1 only prints/returns that promotion is not implemented.
+# enabling it turns momentum/resolution/concern candidates into Hearth episodes.
 HEARTH_EXPERIENCE_EVALUATOR_ENABLED = (
     os.environ.get("HEARTH_EXPERIENCE_EVALUATOR_ENABLED", "1") == "1"
 )
@@ -96,6 +100,25 @@ _ENTITY_EPISODE_SUBJECT_TYPE = "entity_episode"
 _CREATOR_QUIET_SUBJECT_TYPE = "creator_quiet_entity"
 
 _WORLDVIEW_SCAN_LIMIT = 500  # safety cap when scanning entity_episode rows
+
+# Promotion (V1 write path). Only these candidate types may become episodes —
+# they map 1:1 onto the episode_type column. No new episode schema is introduced;
+# promoted rows go through hearth_memory.create_episode like every other watcher.
+_PROMOTABLE_CANDIDATE_TYPES = ("resolution", "momentum", "concern")
+
+# severity / briefing_category per promoted episode_type. These types are new to
+# hearth_memory's maps, so we pass them explicitly rather than relying on the
+# defaults (which would leave briefing_category NULL).
+_PROMOTION_SEVERITY = {
+    "resolution": "low",
+    "momentum": "low",
+    "concern": "medium",
+}
+_PROMOTION_BRIEFING_CATEGORY = {
+    "resolution": "awareness",
+    "momentum": "awareness",
+    "concern": "action_needed",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +294,61 @@ def _evaluate_event(event, memory_conn):
 
 
 # ---------------------------------------------------------------------------
+# Promotion (V1 write path)
+# ---------------------------------------------------------------------------
+
+def _promotion_reference_key(event):
+    """Stable provenance key tying a promoted episode back to its Pulse event.
+
+    Dedup is enforced by create_episode on (episode_type, reference_key), so
+    keying on the source hearth_events row id makes re-running the evaluator
+    against the same event idempotent — no duplicate episodes.
+    """
+    return f"pulse_event_{event['id']}"
+
+
+def _promotion_description(event, result, display_name):
+    """Human-readable episode body that preserves where the episode came from:
+    originating entity, event type, promotion category, event timestamp, and
+    the source event id (the schema has no dedicated provenance column, so this
+    plus reference_key is how traceability is kept)."""
+    who = f"@{display_name}" if display_name else f"user_id={event['actor_user_id'] or event['target_user_id']}"
+    return (
+        f"Promoted from Pulse signal: {who} — {event['event_type']}"
+        f" at {event['occurred_at']} (category={result['candidate_type']}). "
+        f"{result['reason']} [source: hearth_events#{event['id']}]"
+    )
+
+
+def _promote_candidate(result, event, memory_conn):
+    """Write one promotion candidate into a Hearth episode.
+
+    Reuses hearth_memory.create_episode (the same helper every watcher uses), so
+    no second episode schema is introduced. Returns the (episode_id, action)
+    tuple from create_episode, where action is "created_episode" or
+    "reused_open_episode". Raises on DB failure — the caller isolates that so a
+    single failure never aborts the scan.
+    """
+    candidate_type = result["candidate_type"]
+    entity_id = int(result["entity_id"])
+
+    entity_row = memory_conn.execute(
+        "SELECT display_name FROM hearth_entities WHERE id = ?;", (entity_id,)
+    ).fetchone()
+    display_name = entity_row["display_name"] if entity_row else None
+
+    return hearth_memory.create_episode(
+        memory_conn,
+        entity_id,
+        candidate_type,
+        _promotion_description(event, result, display_name),
+        severity=_PROMOTION_SEVERITY.get(candidate_type, "medium"),
+        reference_key=_promotion_reference_key(event),
+        briefing_category=_PROMOTION_BRIEFING_CATEGORY.get(candidate_type),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Processor
 # ---------------------------------------------------------------------------
 
@@ -287,8 +365,11 @@ def _get_recent_signal_events(pathway_conn, limit):
 def evaluate_recent_signals(limit=_DEFAULT_LIMIT):
     """Evaluate up to `limit` recent Pulse-classified signal/observation events.
 
-    Observation mode only: never creates a hearth_episode, never writes to
-    worldview, never updates hearth_events. Returns:
+    Never writes to worldview or updates hearth_events. When
+    HEARTH_EXPERIENCE_EVALUATOR_PROMOTE is off (default) this is observation
+    only and never creates a hearth_episode. When on, momentum/resolution/concern
+    candidates are written via hearth_memory.create_episode (idempotently).
+    Returns:
 
         {
             "evaluated": int,
@@ -297,19 +378,24 @@ def evaluate_recent_signals(limit=_DEFAULT_LIMIT):
                 ...
             ],
             "no_action": int,
+            "promoted": int,      # episodes created this run (0 unless PROMOTE on)
+            "duplicates": int,    # candidates already promoted, skipped
+            "failed": int,        # promotion attempts that errored
         }
 
     candidates only includes momentum/resolution/concern results — no_action
     results are counted but not included in detail, to keep logs/output
     readable.
     """
+    _empty = {"evaluated": 0, "candidates": [], "no_action": 0,
+              "promoted": 0, "duplicates": 0, "failed": 0}
     if not HEARTH_EXPERIENCE_EVALUATOR_ENABLED:
         print(f"{_LOG_PREFIX} disabled via HEARTH_EXPERIENCE_EVALUATOR_ENABLED — skipping run.")
-        return {"evaluated": 0, "candidates": [], "no_action": 0}
+        return dict(_empty)
 
     if not DATABASE_URL:
         print(f"{_LOG_PREFIX} DATABASE_URL is not set — cannot read hearth_events. Skipping run.")
-        return {"evaluated": 0, "candidates": [], "no_action": 0}
+        return dict(_empty)
 
     db_path = _resolve_db_path(DATABASE_URL)
     pathway_conn = get_pathway_readonly_connection(db_path)
@@ -336,22 +422,59 @@ def evaluate_recent_signals(limit=_DEFAULT_LIMIT):
                     f" {result['candidate_type']} — {result['reason']}"
                 )
 
-        if HEARTH_EXPERIENCE_EVALUATOR_PROMOTE and candidates:
-            print(
-                f"{_LOG_PREFIX} HEARTH_EXPERIENCE_EVALUATOR_PROMOTE is enabled, but"
-                f" promotion is not implemented in V1 — no episodes created for"
-                f" {len(candidates)} candidate(s)."
-            )
+        promoted_count = 0
+        duplicate_count = 0
+        failed_count = 0
+
+        if HEARTH_EXPERIENCE_EVALUATOR_PROMOTE:
+            # event_id -> the source row, so promotion can build provenance.
+            events_by_id = {event["id"]: event for event in events}
+            for result in candidates:
+                event = events_by_id.get(result["event_id"])
+                try:
+                    _episode_id, action = _promote_candidate(result, event, memory_conn)
+                except Exception as exc:  # never let one failure abort the scan
+                    failed_count += 1
+                    print(
+                        f"{_LOG_PREFIX} promotion FAILED — event_id={result['event_id']}"
+                        f" type={result['event_type']} episode_type={result['candidate_type']}:"
+                        f" {exc}"
+                    )
+                    continue
+
+                if action == "created_episode":
+                    promoted_count += 1
+                    print(
+                        f"{_LOG_PREFIX} Promoted Pulse event event_type={result['event_type']}"
+                        f" entity_id={result['entity_id']} episode_type={result['candidate_type']}"
+                        f" (episode_id={_episode_id})"
+                    )
+                else:
+                    duplicate_count += 1
+                    print(
+                        f"{_LOG_PREFIX} duplicate skipped — event_id={result['event_id']}"
+                        f" type={result['event_type']} episode_type={result['candidate_type']}"
+                        f" already promoted (episode_id={_episode_id})."
+                    )
 
         print(
             f"{_LOG_PREFIX} evaluated {len(events)} event(s):"
             f" {len(candidates)} candidate(s), {no_action_count} no_action."
+            + (
+                f" Promotion ON — {promoted_count} promoted, {duplicate_count} duplicate(s),"
+                f" {failed_count} failed."
+                if HEARTH_EXPERIENCE_EVALUATOR_PROMOTE
+                else " Promotion OFF (observation only)."
+            )
         )
 
         return {
             "evaluated": len(events),
             "candidates": candidates,
             "no_action": no_action_count,
+            "promoted": promoted_count,
+            "duplicates": duplicate_count,
+            "failed": failed_count,
         }
     finally:
         pathway_conn.close()
