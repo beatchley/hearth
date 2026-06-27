@@ -696,10 +696,13 @@ def resolve_stale_issues(memory_conn, data, tracer=None):
     else:
         current_no_engagement_keys = None  # query failed — skip this type
 
-    # Build the set of submission reference_keys still overdue (Sent + Assigned + 7+ days)
+    # Build the set of reference_keys for check-ins still overdue (Sent + Assigned + 7+ days).
+    # Key format matches the watcher: checkin_{checkin_id}_user_{user_id}.
     overdue_rows = data.get("Check-ins not submitted (7+ days)", [])
     if isinstance(overdue_rows, list):
-        current_overdue_keys = {f"checkin_submission_{row['submission_id']}" for row in overdue_rows}
+        current_overdue_keys = {
+            f"checkin_{row['checkin_id']}_user_{row['user_id']}" for row in overdue_rows
+        }
     else:
         current_overdue_keys = None  # query failed — skip this type
 
@@ -1123,7 +1126,11 @@ def detect_and_record_issues(memory_conn, data, tracer=None):
     rows = data.get("Check-ins not submitted (7+ days)", [])
     if isinstance(rows, list):
         for row in rows:
-            ref_key = f"checkin_submission_{row['submission_id']}"
+            # Key on (checkin_id, user_id) — stable per check-in cycle per creator.
+            # submission_id (cs.id) is NOT used because Pathway may create multiple
+            # submission rows for the same check-in (e.g. on resend), which would
+            # otherwise produce one episode per submission instead of one per cycle.
+            ref_key = f"checkin_{row['checkin_id']}_user_{row['user_id']}"
             entity = hearth_memory.get_or_create_entity(memory_conn, row["user_id"])
             days = row["days_overdue"]
             severity = "medium" if days >= 14 else "low"
@@ -1138,6 +1145,8 @@ def detect_and_record_issues(memory_conn, data, tracer=None):
                 reference_key=ref_key,
                 briefing_category="awareness",
             )
+            if action == "reused_open_episode":
+                hearth_memory.refresh_episode(memory_conn, _ep_id, desc, severity)
             try:
                 tracer.record(hearth_trace.TraceEntry(
                     rule_name="checkin_not_submitted",

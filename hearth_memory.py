@@ -250,6 +250,28 @@ def update_last_briefed_at(memory_conn, episode_id, ts=None):
     memory_conn.commit()
 
 
+def refresh_episode(memory_conn, episode_id, description, severity=None):
+    """Refresh the description (and optionally severity) of an existing open episode.
+
+    Called when a watcher reuses an existing episode but the condition has
+    evolved — e.g. days_overdue has increased since the episode was first opened.
+    Does not change observed_at, entity, or type.
+    """
+    if severity is not None:
+        memory_conn.execute(
+            "UPDATE hearth_episodes SET description = ?, severity = ?"
+            " WHERE id = ? AND resolved = 0;",
+            (description, severity, episode_id),
+        )
+    else:
+        memory_conn.execute(
+            "UPDATE hearth_episodes SET description = ?"
+            " WHERE id = ? AND resolved = 0;",
+            (description, episode_id),
+        )
+    memory_conn.commit()
+
+
 def get_recent_episodes(memory_conn, limit=50):
     """Return the most recent episodes regardless of resolved status."""
     return memory_conn.execute(
