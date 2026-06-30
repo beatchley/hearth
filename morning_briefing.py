@@ -394,8 +394,8 @@ def query_new_creator_stuck(conn):
     independent — a creator-flagged user is included even if they also hold a
     staff role (see hearth_identity.is_creator_user / is_staff_user). Returns
     only creators with no engagement signals across all meaningful signal
-    tables. Excludes page_visits (passive) and private_messages (ambiguous
-    sender — often coach-initiated).
+    tables. Excludes page_visits (passive). Private creator-to-creator messages
+    are also excluded — Hearth does not observe private conversations.
     """
     sql = """
         WITH creators AS (
@@ -557,11 +557,9 @@ def query_creator_quiet(conn):
             FROM comments
             WHERE author_id IN (SELECT id FROM creators)
 
-            UNION ALL
-            SELECT sender_id,       created_at,
-                   'private_message'
-            FROM private_messages
-            WHERE sender_id IN (SELECT id FROM creators)
+            -- Hearth intentionally excludes private creator-to-creator conversations.
+            -- Organizational intelligence should observe organizational activity, not
+            -- private communication. This is a permanent architectural boundary.
 
             UNION ALL
             SELECT author_id,       created_at,
@@ -1182,7 +1180,6 @@ def detect_and_record_issues(memory_conn, data, tracer=None):
         "training_comment_reply":   "training comment reply",
         "post":                     "post",
         "comment":                  "comment",
-        "private_message":          "message",
         "support_message":          "support message",
         "event_signup":             "event signup",
         "chat_message":             "chat message",

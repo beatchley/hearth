@@ -59,10 +59,12 @@ _DEFAULT_LIMIT = 50
 _EVALUABLE_EXPERIENCE_LEVELS = ("signal", "observation")
 
 # Event types that represent a creator doing something positive/re-engaging.
+# Hearth intentionally excludes private creator-to-creator conversations.
+# Organizational intelligence should observe organizational activity, not
+# private communication. This is a permanent architectural boundary.
 _POSITIVE_ACTIVITY_EVENT_TYPES = frozenset({
     "training_viewed",
     "user_signed_in",
-    "message_sent",
     "community_message_created",
     "battle_requested",
     "event_signup_created",
@@ -89,7 +91,6 @@ _WAITING_KEYWORDS = (
 # these more specific keywords. Anything else stays a momentum/concern call.
 _RESOLUTION_KEYWORDS_BY_EVENT_TYPE = {
     "checkin_submitted": ("checkin", "feedback"),
-    "message_sent": ("support", "training comment", "message"),
 }
 
 # subject_types under hearth_worldview that are scoped to a single entity.

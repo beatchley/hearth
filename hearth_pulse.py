@@ -142,50 +142,6 @@ def _classify_checkin_submitted(lookup_conn, memory_conn, event):
     return level, score, reason
 
 
-def _classify_message_sent(lookup_conn, event):
-    actor_id = event["actor_user_id"]
-
-    no_prior = lookup_conn.execute(
-        "SELECT 1 FROM hearth_events"
-        " WHERE actor_user_id = ? AND event_type = 'message_sent'"
-        " AND occurred_at < ? LIMIT 1;",
-        (actor_id, event["occurred_at"]),
-    ).fetchone() is None
-
-    if no_prior:
-        return "signal", 0.4, "First recorded message from this user."
-
-    try:
-        role_row = lookup_conn.execute(
-            "SELECT role FROM users WHERE id = ?;", (actor_id,)
-        ).fetchone()
-        role = role_row["role"] if role_row else None
-    except sqlite3.Error:
-        role = None
-
-    if role is None:
-        return "trace", 0.1, "Message recorded; role lookup unavailable."
-
-    if role in _STAFF_ROLES and event["target_user_id"] is not None:
-        return "signal", 0.45, "Message sent from staff member to creator."
-
-    if role in _STAFF_ROLES:
-        # Staff message with no target — fall through to the creator-style gap check below.
-        pass
-
-    prior = lookup_conn.execute(
-        "SELECT occurred_at FROM hearth_events"
-        " WHERE actor_user_id = ? AND event_type = 'message_sent'"
-        " AND occurred_at < ? ORDER BY occurred_at DESC LIMIT 1;",
-        (actor_id, event["occurred_at"]),
-    ).fetchone()
-    gap = _days_between(prior["occurred_at"], event["occurred_at"]) if prior else None
-
-    if gap is not None and gap < 14:
-        return "trace", 0.15, "Routine message from creator."
-    return "signal", 0.4, f"Message from creator after {gap} days of silence."
-
-
 def _classify_training_viewed(lookup_conn, event):
     prior = lookup_conn.execute(
         "SELECT occurred_at FROM hearth_events"
@@ -297,8 +253,6 @@ def classify_event(lookup_conn, memory_conn, event):
         return _classify_user_signed_in(lookup_conn, event)
     if event_type == "checkin_submitted":
         return _classify_checkin_submitted(lookup_conn, memory_conn, event)
-    if event_type == "message_sent":
-        return _classify_message_sent(lookup_conn, event)
     if event_type == "training_viewed":
         return _classify_training_viewed(lookup_conn, event)
     if event_type == "onboarding_step_completed":
@@ -309,6 +263,11 @@ def classify_event(lookup_conn, memory_conn, event):
         return _classify_event_signup_created(lookup_conn, event)
     if event_type == "community_message_created":
         return _classify_community_message_created(lookup_conn, event)
+    # Hearth intentionally excludes private creator-to-creator conversations.
+    # Organizational intelligence should observe organizational activity, not
+    # private communication. This is a permanent architectural boundary.
+    if event_type == "message_sent":
+        return "trace", 0.0, "Private messages are excluded from Hearth's awareness."
     return "trace", 0.1, f"No classification rule for event_type '{event_type}'."
 
 
