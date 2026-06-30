@@ -257,25 +257,21 @@ def _confidence_delta(conn, topic_tag):
 
 
 def _upsert_entity_repeat_uncertainty(conn, entity, count, source_run):
-    """Open or refresh a single open uncertainty about repeated same-run concerns.
+    """Open or refresh a living uncertainty about repeated same-run concerns.
 
-    Duplicate protection: at most one open uncertainty per (entity), refreshed
-    in place rather than re-created each run.
+    Uses upsert_uncertainty() so existing rows survive a status change to
+    question_surfaced — re-observing the same concern refreshes the row
+    rather than creating a duplicate.
     """
     subject_id = str(entity)
     text = (
         f"Entity {entity} had {count} new concern episode(s) in a single run —"
         " unclear if this is a meaningful pattern or coincidence."
     )
-    existing = hearth_worldview.get_open_uncertainties(
-        conn, subject_type="entity", subject_id=subject_id, limit=1,
-    )
-    if existing:
-        hearth_worldview.update_uncertainty(conn, existing[0]["id"], uncertainty_text=text)
-        return existing[0]["id"], False
-
-    uid = hearth_worldview.open_uncertainty(
-        conn, subject_type="entity", subject_id=subject_id,
+    return hearth_worldview.upsert_uncertainty(
+        conn,
+        subject_type="entity",
+        subject_id=subject_id,
         uncertainty_text=text,
         why_it_matters=(
             "Repeated same-run concerns may indicate an emerging issue, but a"
@@ -285,7 +281,6 @@ def _upsert_entity_repeat_uncertainty(conn, entity, count, source_run):
         confidence=_NEW_UNCERTAINTY_CONFIDENCE,
         source_episode_id=source_run,
     )
-    return uid, True
 
 
 def _reinforce_recurrence_lesson(conn, episode_type, source_run):
@@ -366,14 +361,17 @@ def _is_individually_significant(ep, episode_type):
 
 
 def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run):
-    """Open or refresh a cautious uncertainty for one individually meaningful episode.
+    """Open or refresh a cautious living uncertainty for one individually meaningful episode.
 
     This is deliberately separate from _upsert_entity_repeat_uncertainty (keyed on
     entity alone) and _upsert_episode_type_change (keyed on episode_type alone) — it
     uses subject_type="entity_episode" so the three never collide or overwrite each
-    other. Duplicate protection: at most one open uncertainty per (episode_type,
-    entity), refreshed in place. Confidence stays in the cautious 0.45-0.55 band —
-    a single concern is worth watching, not a belief.
+    other.
+
+    Uses upsert_uncertainty() so a row that was promoted to question_surfaced
+    (i.e. the question was asked of Stacy) is still found and refreshed rather
+    than duplicated on the next scan. Confidence stays in the cautious 0.45-0.55
+    band — a single concern is worth watching, not a belief.
     """
     subject_id = f"{episode_type}:{entity}"
     label = episode_type.replace("_", " ")
@@ -381,15 +379,10 @@ def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run):
         f"It is unclear whether the {label} episode for entity {entity} reflects"
         " a meaningful pattern or an isolated event — worth watching."
     )
-    existing = hearth_worldview.get_open_uncertainties(
-        conn, subject_type="entity_episode", subject_id=subject_id, limit=1,
-    )
-    if existing:
-        hearth_worldview.update_uncertainty(conn, existing[0]["id"], uncertainty_text=text)
-        return existing[0]["id"], False
-
-    uid = hearth_worldview.open_uncertainty(
-        conn, subject_type="entity_episode", subject_id=subject_id,
+    return hearth_worldview.upsert_uncertainty(
+        conn,
+        subject_type="entity_episode",
+        subject_id=subject_id,
         uncertainty_text=text,
         why_it_matters=(
             f"A single {label} episode may or may not indicate something worth"
@@ -399,7 +392,6 @@ def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run):
         confidence=_SINGLE_SIGNIFICANCE_CONFIDENCE,
         source_episode_id=source_run,
     )
-    return uid, True
 
 
 def _upsert_creator_quiet_watch(conn, entity, source_run):
@@ -487,6 +479,10 @@ def reflect_on_worldview(conn, new_episodes=None, resolved_episodes=None, source
     changes, and provisional recent lessons (steps 3-5). Duplicate protection
     keeps each (subject, type) to at most one active/open row per category,
     refreshed in place rather than re-inserted on repeat runs.
+
+    NOTE — new_episodes naming: despite the parameter name, callers pass all
+    currently *open* episodes (not only newly-created ones). The name is a
+    historical artifact; treat it as "open_episodes_for_reflection".
 
     Returns a dict: {"worldview_before": <snapshot>, "beliefs": [...],
     "uncertainties": [...], "changes": [...], "lessons": [...]}, where each

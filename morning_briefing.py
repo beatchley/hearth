@@ -1740,6 +1740,9 @@ def run_pipeline(db_path=None, gemini_api_key=None, scan_mode="morning",
             or ep["briefing_category"] in _concern_categories
         ]
 
+        # new_episodes receives all currently open episodes, not only newly-created ones.
+        # The parameter is named new_episodes for historical reasons; treat it as
+        # open_episodes_for_reflection inside hearth_soul.
         reflection_id = hearth_soul.generate_reflection(
             memory_conn,
             new_episodes=open_episodes,

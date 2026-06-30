@@ -116,6 +116,7 @@ def ensure_worldview_tables(conn=None):
                 status            TEXT    DEFAULT 'open',
                 created_at        TEXT    DEFAULT CURRENT_TIMESTAMP,
                 updated_at        TEXT    DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at      TEXT,
                 resolved_at       TEXT,
                 source_episode_id TEXT,
                 source_signal_id  TEXT
@@ -420,9 +421,10 @@ def open_uncertainty(conn, subject_type=None, subject_id=None, uncertainty_text=
 
 
 def get_open_uncertainties(conn, subject_type=None, subject_id=None, priority=None, limit=None):
-    """Return open uncertainties, optionally filtered, ordered by updated_at DESC.
+    """Return open uncertainties (status='open'), optionally filtered, ordered by updated_at DESC.
 
     Pass limit to cap the number of rows returned (most recently updated first).
+    Use get_living_uncertainties() to include question_surfaced rows as well.
     """
     clauses, params = _build_filters({
         "subject_type": subject_type,
@@ -439,9 +441,84 @@ def get_open_uncertainties(conn, subject_type=None, subject_id=None, priority=No
     return conn.execute(sql + ";", params).fetchall()
 
 
+def get_living_uncertainties(conn, subject_type=None, subject_id=None, priority=None, limit=None):
+    """Return uncertainties with living statuses (open, question_surfaced), optionally filtered.
+
+    'Living' means the uncertainty is still active — either not yet surfaced
+    (open) or surfaced but awaiting resolution (question_surfaced). Terminal
+    statuses (resolved, archived, dismissed) are excluded.
+
+    Pass limit to cap the number of rows returned (most recently updated first).
+    """
+    clauses, params = _build_filters({
+        "subject_type": subject_type,
+        "subject_id": subject_id,
+        "priority": priority,
+    })
+    sql = (
+        "SELECT * FROM hearth_worldview_uncertainties"
+        " WHERE status IN ('open', 'question_surfaced')"
+    )
+    if clauses:
+        sql += " AND " + " AND ".join(clauses)
+    sql += " ORDER BY updated_at DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = params + [limit]
+    return conn.execute(sql + ";", params).fetchall()
+
+
+def upsert_uncertainty(conn, subject_type=None, subject_id=None, uncertainty_text=None,
+                       why_it_matters=None, possible_question=None, confidence=0.5,
+                       priority="normal", source_episode_id=None, source_signal_id=None):
+    """Find or create a living uncertainty for (subject_type, subject_id).
+
+    Searches for an existing row with status IN ('open', 'question_surfaced').
+    - If found: updates uncertainty_text, updated_at, and last_seen_at in place;
+      preserves status (including question_surfaced). Returns (id, False).
+    - If not found: inserts a new row with status='open'. Returns (id, True).
+
+    This makes uncertainties behave as living objects — repeated detection of
+    the same condition refreshes the existing row rather than creating duplicates.
+    Terminal statuses (resolved, archived, dismissed) are never reused.
+    """
+    if not uncertainty_text:
+        raise ValueError("uncertainty_text is required")
+    now = _now()
+    existing = get_living_uncertainties(
+        conn, subject_type=subject_type, subject_id=subject_id, limit=1,
+    )
+    if existing:
+        row = existing[0]
+        _update_row(conn, "hearth_worldview_uncertainties", row["id"], {
+            "uncertainty_text": uncertainty_text,
+            "updated_at": now,
+            "last_seen_at": now,
+        })
+        return row["id"], False
+
+    cur = conn.execute(
+        "INSERT INTO hearth_worldview_uncertainties"
+        " (subject_type, subject_id, uncertainty_text, why_it_matters, possible_question,"
+        "  confidence, priority, status, created_at, updated_at, last_seen_at,"
+        "  source_episode_id, source_signal_id)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?);",
+        (subject_type, subject_id, uncertainty_text, why_it_matters, possible_question,
+         _clamp_confidence(confidence), priority, now, now, now,
+         source_episode_id, source_signal_id),
+    )
+    conn.commit()
+    return cur.lastrowid, True
+
+
 def update_uncertainty(conn, uncertainty_id, uncertainty_text=None, why_it_matters=None,
-                        possible_question=None, confidence=None, priority=None, status=None):
-    """Update an uncertainty in place. updated_at is always refreshed."""
+                        possible_question=None, confidence=None, priority=None, status=None,
+                        last_seen=False):
+    """Update an uncertainty in place. updated_at is always refreshed.
+
+    Pass last_seen=True to also stamp last_seen_at (use when re-observing the
+    same condition without changing status).
+    """
     fields = {}
     if uncertainty_text is not None:
         fields["uncertainty_text"] = uncertainty_text
@@ -455,7 +532,10 @@ def update_uncertainty(conn, uncertainty_id, uncertainty_text=None, why_it_matte
         fields["priority"] = priority
     if status is not None:
         fields["status"] = status
-    fields["updated_at"] = _now()
+    now = _now()
+    fields["updated_at"] = now
+    if last_seen:
+        fields["last_seen_at"] = now
     _update_row(conn, "hearth_worldview_uncertainties", uncertainty_id, fields)
 
 
@@ -646,7 +726,7 @@ def get_worldview_snapshot(conn, belief_limit=25, relationship_limit=25, uncerta
         "identity": get_identity(conn),
         "active_beliefs": get_active_beliefs(conn, limit=belief_limit),
         "active_relationships": get_active_relationship_understandings(conn, limit=relationship_limit),
-        "open_uncertainties": get_open_uncertainties(conn, limit=uncertainty_limit),
+        "open_uncertainties": get_living_uncertainties(conn, limit=uncertainty_limit),
         "watched_changes": get_watched_changes(conn, limit=change_limit),
         "recent_lessons": get_recent_lessons(conn, limit=lesson_limit),
     }
