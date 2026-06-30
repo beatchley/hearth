@@ -16,7 +16,7 @@ into hearth_principles.
 import os
 import sqlite3
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import hearth_principles
 import hearth_questions
@@ -467,6 +467,189 @@ def _upsert_responsiveness_belief(conn, entity, source_run, confirm):
     return bid, True
 
 
+# ---------------------------------------------------------------------------
+# Engagement momentum belief
+#
+# Hearth's second belief type. Emerges from a pattern of diverse
+# organizational activity over time — not from episode resolution, but from
+# Pulse-classified hearth_events in the Pathway DB. Private DM event types
+# (message_sent, private_messages) are never included; this exclusion is
+# permanent per HEARTH_SENSORY_POLICY.md Category B.
+# ---------------------------------------------------------------------------
+
+_MOMENTUM_ELIGIBLE_EVENT_TYPES = frozenset({
+    "training_viewed",
+    "checkin_submitted",
+    "battle_requested",
+    "event_signup_created",
+    "community_message_created",
+    "onboarding_step_completed",
+})
+
+_MOMENTUM_TYPE_LABELS = {
+    "training_viewed": "training",
+    "checkin_submitted": "check-ins",
+    "battle_requested": "battles",
+    "event_signup_created": "events",
+    "community_message_created": "community",
+    "onboarding_step_completed": "onboarding",
+}
+
+_MOMENTUM_WINDOW_DAYS = 14       # rolling activity window
+_MOMENTUM_STALE_DAYS = 21        # no activity after this → begin decay
+_MOMENTUM_DECAY_PER_CYCLE = 0.08 # confidence lost per Soul cycle while stale
+_MOMENTUM_ARCHIVE_THRESHOLD = 0.10  # archive once confidence drops below this
+_MOMENTUM_CONFIDENCE_CAP = 0.85  # never exceed this
+_MOMENTUM_MIN_DISTINCT_TYPES = 4 # threshold to form or sustain a belief
+
+
+def _momentum_confidence(distinct_count):
+    """Map distinct eligible activity type count to belief confidence.
+
+    4→0.18, 6→0.33, 8→0.48, 10+→0.65 growing to 0.85 cap.
+    """
+    if distinct_count < _MOMENTUM_MIN_DISTINCT_TYPES:
+        return 0.0
+    if distinct_count >= 10:
+        return min(_MOMENTUM_CONFIDENCE_CAP, 0.65 + (distinct_count - 10) * 0.05)
+    return min(_MOMENTUM_CONFIDENCE_CAP, 0.18 + (distinct_count - 4) * 0.075)
+
+
+def _collect_momentum_activity(window_days=_MOMENTUM_WINDOW_DAYS):
+    """Read signal-level hearth_events per user for the last window_days days.
+
+    Opens its own read-only connection to the Pathway DB (DATABASE_URL).
+    Returns {str(actor_user_id): {"types": set, "display_name": str}}.
+    Returns {} silently if DATABASE_URL is absent or the query fails —
+    a missing Pathway DB must never break Soul's reflection cycle.
+    """
+    db_url = os.environ.get("DATABASE_URL", "")
+    if not db_url:
+        return {}
+    db_path = db_url[len("sqlite:///"):] if db_url.startswith("sqlite:///") else db_url
+
+    window_start = (
+        datetime.now(timezone.utc) - timedelta(days=window_days)
+    ).isoformat()
+    eligible = sorted(_MOMENTUM_ELIGIBLE_EVENT_TYPES)
+    placeholders = ",".join("?" * len(eligible))
+
+    try:
+        path_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        path_conn.row_factory = sqlite3.Row
+        try:
+            rows = path_conn.execute(
+                f"SELECT he.actor_user_id, he.event_type,"
+                f" COALESCE(NULLIF(u.tiktok_handle, ''), u.name) AS display_name"
+                f" FROM hearth_events he"
+                f" LEFT JOIN users u ON u.id = he.actor_user_id"
+                f" WHERE he.event_type IN ({placeholders})"
+                f"   AND he.experience_level IN ('signal', 'observation')"
+                f"   AND he.occurred_at >= ?"
+                f"   AND he.actor_user_id IS NOT NULL;",
+                tuple(eligible) + (window_start,),
+            ).fetchall()
+        finally:
+            path_conn.close()
+    except Exception as exc:
+        print(
+            f"[hearth_soul] momentum: pathway query unavailable this run"
+            f" ({type(exc).__name__}: {exc})"
+        )
+        return {}
+
+    result = {}
+    for row in rows:
+        uid = str(row["actor_user_id"])
+        if uid not in result:
+            result[uid] = {
+                "types": set(),
+                "display_name": row["display_name"] or f"User {uid}",
+            }
+        result[uid]["types"].add(row["event_type"])
+    return result
+
+
+def _upsert_momentum_belief(conn, entity_id, distinct_count, activity_types,
+                            display_name, source_run):
+    """Add or confirm an engagement_momentum belief for one entity.
+
+    On confirm: updates belief_text and confidence (never lowers), stamps
+    last_confirmed_at. On creation: inserts with calculated confidence.
+    Returns (belief_id, created: bool).
+    """
+    subject_id = str(entity_id)
+    existing = hearth_worldview.get_active_beliefs(
+        conn, subject_type="entity", subject_id=subject_id,
+        belief_type="engagement_momentum", limit=1,
+    )
+
+    confidence = _momentum_confidence(distinct_count)
+    labels = sorted(
+        _MOMENTUM_TYPE_LABELS.get(t, t.replace("_", " ")) for t in activity_types
+    )
+    belief_text = (
+        f"{display_name} has shown engagement momentum across {distinct_count} distinct"
+        f" activity types in the last {_MOMENTUM_WINDOW_DAYS} days"
+        f" ({', '.join(labels)})."
+    )
+
+    if existing:
+        belief = existing[0]
+        new_conf = max(belief["confidence"], confidence)
+        hearth_worldview.update_belief(
+            conn, belief["id"],
+            confidence=new_conf,
+            belief_text=belief_text,
+            last_confirmed=True,
+        )
+        return belief["id"], False
+
+    bid = hearth_worldview.add_belief(
+        conn, subject_type="entity", subject_id=subject_id,
+        belief_type="engagement_momentum",
+        belief_text=belief_text,
+        confidence=confidence,
+        source_episode_id=source_run,
+    )
+    return bid, True
+
+
+def _decay_stale_momentum_beliefs(conn, active_entity_ids):
+    """Decay confidence on engagement_momentum beliefs inactive for _MOMENTUM_STALE_DAYS.
+
+    active_entity_ids: set of entity_id strings confirmed this cycle (skipped).
+    Uses last_confirmed_at if set, else created_at, as the staleness timestamp.
+    Beliefs that fall below _MOMENTUM_ARCHIVE_THRESHOLD are archived rather
+    than deleted — momentum fades gradually, never flips in one cycle.
+    """
+    stale_cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=_MOMENTUM_STALE_DAYS)
+    ).isoformat()
+
+    all_momentum = hearth_worldview.get_active_beliefs(
+        conn, subject_type="entity", belief_type="engagement_momentum",
+    )
+
+    for belief in all_momentum:
+        if belief["subject_id"] in active_entity_ids:
+            continue
+        last_active = belief["last_confirmed_at"] or belief["created_at"] or ""
+        if last_active >= stale_cutoff:
+            continue  # still within the grace window; not yet stale
+
+        new_conf = max(0.0, belief["confidence"] - _MOMENTUM_DECAY_PER_CYCLE)
+        if new_conf < _MOMENTUM_ARCHIVE_THRESHOLD:
+            hearth_worldview.update_belief(
+                conn, belief["id"], confidence=new_conf,
+                status="archived", last_challenged=True,
+            )
+        else:
+            hearth_worldview.update_belief(
+                conn, belief["id"], confidence=new_conf, last_challenged=True,
+            )
+
+
 def reflect_on_worldview(conn, new_episodes=None, resolved_episodes=None, source_run=None,
                          snapshot_limit=25):
     """
@@ -551,6 +734,31 @@ def reflect_on_worldview(conn, new_episodes=None, resolved_episodes=None, source
         result = _upsert_responsiveness_belief(conn, entity, source_run, confirm=False)
         if result[0] is not None:
             written["beliefs"].append(result)
+
+    # Engagement momentum belief — reads Pathway hearth_events directly.
+    # Runs after responsiveness logic; isolated in a try/except so a Pathway
+    # DB outage never breaks the rest of the reflection cycle.
+    try:
+        momentum_activity = _collect_momentum_activity()
+        active_momentum_ids = set()
+        for entity_id, activity_data in momentum_activity.items():
+            distinct_types = activity_data["types"]
+            if len(distinct_types) < _MOMENTUM_MIN_DISTINCT_TYPES:
+                continue
+            result = _upsert_momentum_belief(
+                conn, entity_id, len(distinct_types), distinct_types,
+                activity_data["display_name"], source_run,
+            )
+            active_momentum_ids.add(entity_id)
+            if result[0] is not None:
+                written["beliefs"].append(result)
+        _decay_stale_momentum_beliefs(conn, active_momentum_ids)
+    except Exception as exc:
+        print(
+            f"[HEARTH WORLDVIEW ERROR] momentum source_run={source_run!r} "
+            f"{type(exc).__name__}: {exc}"
+        )
+        traceback.print_exc()
 
     return written
 
