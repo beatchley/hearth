@@ -69,12 +69,21 @@ def init_tables(conn):
         "ALTER TABLE hearth_entities ADD COLUMN first_observed_at TEXT;",
         "ALTER TABLE hearth_episodes ADD COLUMN briefing_category TEXT;",
         "ALTER TABLE hearth_episodes ADD COLUMN last_briefed_at TEXT;",
+        "ALTER TABLE hearth_entities ADD COLUMN entity_type TEXT DEFAULT 'person';",
+        "ALTER TABLE hearth_entities ADD COLUMN source TEXT DEFAULT 'pathway_sync';",
+        "ALTER TABLE hearth_entities ADD COLUMN canonical_key TEXT;",
+        "ALTER TABLE hearth_entities ADD COLUMN aliases TEXT;",
     ):
         try:
             conn.execute(migration)
             conn.commit()
         except Exception:
             pass  # Column already exists
+    conn.execute(
+        "UPDATE hearth_entities SET canonical_key = 'user:' || user_id"
+        " WHERE canonical_key IS NULL AND user_id IS NOT NULL;"
+    )
+    conn.commit()
     conn.execute("""
         UPDATE hearth_episodes SET briefing_category =
             CASE episode_type
@@ -115,10 +124,11 @@ def sync_users_to_entities(memory_conn, pathway_conn):
     for user in users:
         display_name = user["tiktok_handle"] or user["name"] or "a team member"
         memory_conn.execute(
-            "INSERT INTO hearth_entities (user_id, display_name, created_at)"
-            " VALUES (?, ?, ?)"
+            "INSERT INTO hearth_entities"
+            " (user_id, display_name, entity_type, source, canonical_key, created_at)"
+            " VALUES (?, ?, 'person', 'pathway_sync', ?, ?)"
             " ON CONFLICT(user_id) DO UPDATE SET display_name = excluded.display_name;",
-            (user["id"], display_name, now),
+            (user["id"], display_name, f"user:{user['id']}", now),
         )
     memory_conn.commit()
 
@@ -132,8 +142,10 @@ def get_or_create_entity(memory_conn, user_id):
         return row
     now = datetime.now(timezone.utc).isoformat()
     cur = memory_conn.execute(
-        "INSERT INTO hearth_entities (user_id, created_at) VALUES (?, ?);",
-        (user_id, now),
+        "INSERT INTO hearth_entities"
+        " (user_id, entity_type, source, canonical_key, created_at)"
+        " VALUES (?, 'person', 'pathway_sync', ?, ?);",
+        (user_id, f"user:{user_id}", now),
     )
     memory_conn.commit()
     return memory_conn.execute(

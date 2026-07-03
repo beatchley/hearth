@@ -47,6 +47,20 @@ def init_relationship_tables(conn):
         CREATE INDEX IF NOT EXISTS idx_relationships_type
             ON hearth_relationships (entity_id_1, relationship_type, active);
     """)
+    # Migrate existing databases — add columns introduced after initial release
+    for migration in (
+        "ALTER TABLE hearth_relationships ADD COLUMN origin TEXT DEFAULT 'structural';",
+        "ALTER TABLE hearth_relationships ADD COLUMN status TEXT DEFAULT 'active';",
+        "ALTER TABLE hearth_relationships ADD COLUMN activates_at TEXT;",
+        "ALTER TABLE hearth_relationships ADD COLUMN expires_at TEXT;",
+        "ALTER TABLE hearth_relationships ADD COLUMN transitioned_at TEXT;",
+        "ALTER TABLE hearth_relationships ADD COLUMN transition_reason TEXT;",
+    ):
+        try:
+            conn.execute(migration)
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
 
 
 # ---------------------------------------------------------------------------
@@ -58,15 +72,66 @@ def upsert_relationship(conn, entity_id_1, entity_id_2, relationship_type,
     """
     Insert or update a relationship road. Idempotent — running repeatedly
     updates last_observed_at and re-activates the road without duplicates.
+
+    Always represents a road currently supported by deterministic source
+    data, so it is always written as an active, structural road. If a road
+    had previously been transitioned to historical (see
+    _transition_stale_roads) and its source data has reappeared, this
+    reactivates it and clears the historical transition markers.
     """
     conn.execute(
         "INSERT INTO hearth_relationships"
         " (entity_id_1, entity_id_2, relationship_type, source, confidence,"
-        "  first_observed_at, last_observed_at, active)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, 1)"
+        "  first_observed_at, last_observed_at, active, origin, status)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'structural', 'active')"
         " ON CONFLICT(entity_id_1, entity_id_2, relationship_type)"
-        " DO UPDATE SET last_observed_at = excluded.last_observed_at, active = 1;",
+        " DO UPDATE SET last_observed_at = excluded.last_observed_at,"
+        "     active = 1, status = 'active',"
+        "     transitioned_at = NULL, transition_reason = NULL;",
         (entity_id_1, entity_id_2, relationship_type, source, confidence, now, now),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stale-road lifecycle
+# ---------------------------------------------------------------------------
+
+def _transition_stale_roads(conn, source, valid_keys, now, reason):
+    """
+    Transition previously-active structural roads for this source to
+    'historical' when they're no longer supported by current source data.
+
+    valid_keys is the set of (entity_id_1, entity_id_2, relationship_type)
+    tuples the current sync pass just confirmed via upsert_relationship.
+    Any existing active structural road for this source that isn't in that
+    set is stale: its underlying Pathway relationship changed or vanished.
+
+    Roads are never deleted. active is set to 0 alongside status so that
+    every existing reader (which filters on the legacy `active` column)
+    stops surfacing the stale road, matching the intent of the fix.
+    """
+    rows = conn.execute(
+        "SELECT id, entity_id_1, entity_id_2, relationship_type"
+        " FROM hearth_relationships"
+        " WHERE source = ? AND origin = 'structural'"
+        " AND (status = 'active' OR status IS NULL);",
+        (source,),
+    ).fetchall()
+
+    stale_ids = [
+        row["id"] for row in rows
+        if (row["entity_id_1"], row["entity_id_2"], row["relationship_type"]) not in valid_keys
+    ]
+
+    if not stale_ids:
+        return
+
+    conn.executemany(
+        "UPDATE hearth_relationships"
+        " SET status = 'historical', active = 0,"
+        "     transitioned_at = ?, transition_reason = ?"
+        " WHERE id = ?;",
+        [(now, reason, stale_id) for stale_id in stale_ids],
     )
 
 
@@ -98,9 +163,6 @@ def discover_relationships(memory_conn, pathway_conn):
     except sqlite3.Error:
         return
 
-    if not users:
-        return
-
     now = datetime.now(timezone.utc).isoformat()
 
     # user_id → hearth entity_id lookup
@@ -112,6 +174,7 @@ def discover_relationships(memory_conn, pathway_conn):
     }
 
     # Rule 1: Coach assignment roads
+    coach_valid_keys = set()
     for user in users:
         coach_user_id = user["assigned_coach_id"]
         if not coach_user_id:
@@ -124,6 +187,13 @@ def discover_relationships(memory_conn, pathway_conn):
                             "coach_of", "pathway_assigned_coach", 1.0, now)
         upsert_relationship(memory_conn, creator_eid, coach_eid,
                             "coached_by", "pathway_assigned_coach", 1.0, now)
+        coach_valid_keys.add((coach_eid, creator_eid, "coach_of"))
+        coach_valid_keys.add((creator_eid, coach_eid, "coached_by"))
+
+    _transition_stale_roads(
+        memory_conn, "pathway_assigned_coach", coach_valid_keys, now,
+        "assigned_coach_id no longer matches during sync",
+    )
 
     # Rule 2: Shared-coach peer roads
     # Group users by (assigned_coach_id, role) — only meaningful for small groups
@@ -132,6 +202,7 @@ def discover_relationships(memory_conn, pathway_conn):
         if user["assigned_coach_id"] and user["role"]:
             peer_groups[(user["assigned_coach_id"], user["role"])].append(user["id"])
 
+    peer_valid_keys = set()
     for group_members in peer_groups.values():
         if not (2 <= len(group_members) <= 10):
             continue
@@ -145,6 +216,13 @@ def discover_relationships(memory_conn, pathway_conn):
                                     "creator_role_peer", "pathway_shared_coach", 0.7, now)
                 upsert_relationship(memory_conn, eb, ea,
                                     "creator_role_peer", "pathway_shared_coach", 0.7, now)
+                peer_valid_keys.add((ea, eb, "creator_role_peer"))
+                peer_valid_keys.add((eb, ea, "creator_role_peer"))
+
+    _transition_stale_roads(
+        memory_conn, "pathway_shared_coach", peer_valid_keys, now,
+        "shared-coach peer group no longer valid during sync",
+    )
 
     memory_conn.commit()
 
@@ -169,9 +247,6 @@ def discover_program_coach_relationships(memory_conn, pathway_conn):
     except sqlite3.Error:
         return
 
-    if not rows:
-        return
-
     now = datetime.now(timezone.utc).isoformat()
 
     entity_map = {
@@ -181,6 +256,7 @@ def discover_program_coach_relationships(memory_conn, pathway_conn):
         ).fetchall()
     }
 
+    valid_keys = set()
     for row in rows:
         creator_eid = entity_map.get(row["creator_user_id"])
         coach_eid = entity_map.get(row["coach_user_id"])
@@ -193,6 +269,13 @@ def discover_program_coach_relationships(memory_conn, pathway_conn):
                             coach_of_type, "pathway_program_coach", 1.0, now)
         upsert_relationship(memory_conn, creator_eid, coach_eid,
                             coached_by_type, "pathway_program_coach", 1.0, now)
+        valid_keys.add((coach_eid, creator_eid, coach_of_type))
+        valid_keys.add((creator_eid, coach_eid, coached_by_type))
+
+    _transition_stale_roads(
+        memory_conn, "pathway_program_coach", valid_keys, now,
+        "creator_coach_assignments no longer active during sync",
+    )
 
     memory_conn.commit()
 
@@ -216,9 +299,6 @@ def discover_recruiter_relationships(memory_conn, pathway_conn):
     except sqlite3.Error:
         return
 
-    if not rows:
-        return
-
     now = datetime.now(timezone.utc).isoformat()
 
     entity_map = {
@@ -228,6 +308,7 @@ def discover_recruiter_relationships(memory_conn, pathway_conn):
         ).fetchall()
     }
 
+    valid_keys = set()
     for row in rows:
         creator_eid = entity_map.get(row["id"])
         recruiter_eid = entity_map.get(row["recruited_by_user_id"])
@@ -237,6 +318,13 @@ def discover_recruiter_relationships(memory_conn, pathway_conn):
                             "recruited_by", "pathway_recruited_by", 1.0, now)
         upsert_relationship(memory_conn, recruiter_eid, creator_eid,
                             "recruiter_of", "pathway_recruited_by", 1.0, now)
+        valid_keys.add((creator_eid, recruiter_eid, "recruited_by"))
+        valid_keys.add((recruiter_eid, creator_eid, "recruiter_of"))
+
+    _transition_stale_roads(
+        memory_conn, "pathway_recruited_by", valid_keys, now,
+        "recruited_by_user_id no longer matches during sync",
+    )
 
     memory_conn.commit()
 
