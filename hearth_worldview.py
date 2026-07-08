@@ -84,6 +84,7 @@ def ensure_worldview_tables(conn=None):
                 last_challenged_at  TEXT,
                 source_episode_id   TEXT,
                 source_signal_id    TEXT,
+                source_run          TEXT,
                 notes               TEXT
             );
 
@@ -119,7 +120,8 @@ def ensure_worldview_tables(conn=None):
                 last_seen_at      TEXT,
                 resolved_at       TEXT,
                 source_episode_id TEXT,
-                source_signal_id  TEXT
+                source_signal_id  TEXT,
+                source_run        TEXT
             );
 
             CREATE TABLE IF NOT EXISTS hearth_worldview_changes (
@@ -136,7 +138,8 @@ def ensure_worldview_tables(conn=None):
                 updated_at        TEXT    DEFAULT CURRENT_TIMESTAMP,
                 last_seen_at      TEXT,
                 source_episode_id TEXT,
-                source_signal_id  TEXT
+                source_signal_id  TEXT,
+                source_run        TEXT
             );
 
             CREATE TABLE IF NOT EXISTS hearth_worldview_recent_lessons (
@@ -152,7 +155,8 @@ def ensure_worldview_tables(conn=None):
                 times_challenged        INTEGER DEFAULT 0,
                 candidate_for_principle INTEGER DEFAULT 0,
                 source_episode_id       TEXT,
-                source_signal_id        TEXT
+                source_signal_id        TEXT,
+                source_run              TEXT
             );
         """)
         conn.commit()
@@ -167,6 +171,34 @@ def ensure_worldview_tables(conn=None):
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _validate_source_episode_id(source_episode_id):
+    """Guard against writing non-numeric values into source_episode_id.
+
+    source_episode_id must point at a real hearth_episodes.id (an integer,
+    or a string of digits), or be None. Scan-level provenance (e.g. the
+    "morning"/"midday"/"evening" scan label) belongs in source_run, not
+    here — see the June 2026 bug where six hearth_soul.py call sites wrote
+    the scan label into this field, producing 192 rows with unresolvable
+    "episode ids". Raises loudly instead of allowing that to happen again.
+    """
+    if source_episode_id is None:
+        return
+    if isinstance(source_episode_id, bool):
+        raise ValueError(
+            f"source_episode_id must be a real hearth_episodes.id (int) or None,"
+            f" got bool {source_episode_id!r}"
+        )
+    if isinstance(source_episode_id, int):
+        return
+    if isinstance(source_episode_id, str) and source_episode_id.strip().isdigit():
+        return
+    raise ValueError(
+        f"source_episode_id must be a real hearth_episodes.id (int, or a string of"
+        f" digits) or None — got {source_episode_id!r}. Scan-level provenance (e.g."
+        f" a scan label like 'morning') belongs in source_run, not source_episode_id."
+    )
 
 
 def _clamp_confidence(value):
@@ -259,18 +291,25 @@ def get_identity_value(conn, identity_key, default=None):
 
 def add_belief(conn, subject_type=None, subject_id=None, belief_type=None, belief_text=None,
                confidence=0.5, status="active", source_episode_id=None, source_signal_id=None,
-               notes=None):
-    """Insert a new belief and return its id. Raises ValueError if belief_text is empty."""
+               source_run=None, notes=None):
+    """Insert a new belief and return its id. Raises ValueError if belief_text is empty.
+
+    source_episode_id must be a real hearth_episodes.id (or None) — use
+    source_run for scan-level provenance (e.g. "morning"/"midday"/"evening")
+    when the belief is drawn from an aggregate pattern rather than one
+    specific episode. See _validate_source_episode_id.
+    """
     if not belief_text:
         raise ValueError("belief_text is required")
+    _validate_source_episode_id(source_episode_id)
     now = _now()
     cur = conn.execute(
         "INSERT INTO hearth_worldview_beliefs"
         " (subject_type, subject_id, belief_type, belief_text, confidence, status,"
-        "  created_at, updated_at, source_episode_id, source_signal_id, notes)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+        "  created_at, updated_at, source_episode_id, source_signal_id, source_run, notes)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
         (subject_type, subject_id, belief_type, belief_text, _clamp_confidence(confidence),
-         status, now, now, source_episode_id, source_signal_id, notes),
+         status, now, now, source_episode_id, source_signal_id, source_run, notes),
     )
     conn.commit()
     return cur.lastrowid
@@ -340,6 +379,7 @@ def add_relationship_understanding(conn, entity_a_type=None, entity_a_id=None,
     """
     if not relationship_summary:
         raise ValueError("relationship_summary is required")
+    _validate_source_episode_id(source_episode_id)
     now = _now()
     cur = conn.execute(
         "INSERT INTO hearth_worldview_relationships"
@@ -406,6 +446,7 @@ def open_uncertainty(conn, subject_type=None, subject_id=None, uncertainty_text=
     """Insert a new open uncertainty and return its id."""
     if not uncertainty_text:
         raise ValueError("uncertainty_text is required")
+    _validate_source_episode_id(source_episode_id)
     now = _now()
     cur = conn.execute(
         "INSERT INTO hearth_worldview_uncertainties"
@@ -470,42 +511,54 @@ def get_living_uncertainties(conn, subject_type=None, subject_id=None, priority=
 
 def upsert_uncertainty(conn, subject_type=None, subject_id=None, uncertainty_text=None,
                        why_it_matters=None, possible_question=None, confidence=0.5,
-                       priority="normal", source_episode_id=None, source_signal_id=None):
+                       priority="normal", source_episode_id=None, source_signal_id=None,
+                       source_run=None):
     """Find or create a living uncertainty for (subject_type, subject_id).
 
     Searches for an existing row with status IN ('open', 'question_surfaced').
-    - If found: updates uncertainty_text, updated_at, and last_seen_at in place;
-      preserves status (including question_surfaced). Returns (id, False).
+    - If found: updates uncertainty_text, updated_at, last_seen_at, and
+      source_run (which scan most recently re-observed this) in place;
+      preserves status (including question_surfaced) and does not overwrite
+      source_episode_id. Returns (id, False).
     - If not found: inserts a new row with status='open'. Returns (id, True).
 
     This makes uncertainties behave as living objects — repeated detection of
     the same condition refreshes the existing row rather than creating duplicates.
     Terminal statuses (resolved, archived, dismissed) are never reused.
+
+    source_episode_id must be a real hearth_episodes.id (or None) — use
+    source_run for scan-level provenance (e.g. "morning"/"midday"/"evening")
+    when the uncertainty is drawn from an aggregate pattern rather than one
+    specific episode. See _validate_source_episode_id.
     """
     if not uncertainty_text:
         raise ValueError("uncertainty_text is required")
+    _validate_source_episode_id(source_episode_id)
     now = _now()
     existing = get_living_uncertainties(
         conn, subject_type=subject_type, subject_id=subject_id, limit=1,
     )
     if existing:
         row = existing[0]
-        _update_row(conn, "hearth_worldview_uncertainties", row["id"], {
+        refresh_fields = {
             "uncertainty_text": uncertainty_text,
             "updated_at": now,
             "last_seen_at": now,
-        })
+        }
+        if source_run is not None:
+            refresh_fields["source_run"] = source_run
+        _update_row(conn, "hearth_worldview_uncertainties", row["id"], refresh_fields)
         return row["id"], False
 
     cur = conn.execute(
         "INSERT INTO hearth_worldview_uncertainties"
         " (subject_type, subject_id, uncertainty_text, why_it_matters, possible_question,"
         "  confidence, priority, status, created_at, updated_at, last_seen_at,"
-        "  source_episode_id, source_signal_id)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?);",
+        "  source_episode_id, source_signal_id, source_run)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?);",
         (subject_type, subject_id, uncertainty_text, why_it_matters, possible_question,
          _clamp_confidence(confidence), priority, now, now, now,
-         source_episode_id, source_signal_id),
+         source_episode_id, source_signal_id, source_run),
     )
     conn.commit()
     return cur.lastrowid, True
@@ -555,18 +608,28 @@ def resolve_uncertainty(conn, uncertainty_id):
 
 def record_change(conn, subject_type=None, subject_id=None, change_text=None,
                    previous_state=None, current_state=None, direction=None, confidence=0.5,
-                   status="watching", source_episode_id=None, source_signal_id=None):
-    """Insert a new watched change and return its id."""
+                   status="watching", source_episode_id=None, source_signal_id=None,
+                   source_run=None):
+    """Insert a new watched change and return its id.
+
+    source_episode_id must be a real hearth_episodes.id (or None) — use
+    source_run for scan-level provenance (e.g. "morning"/"midday"/"evening")
+    when the change is drawn from an aggregate pattern rather than one
+    specific episode. See _validate_source_episode_id.
+    """
     if not change_text:
         raise ValueError("change_text is required")
+    _validate_source_episode_id(source_episode_id)
     now = _now()
     cur = conn.execute(
         "INSERT INTO hearth_worldview_changes"
         " (subject_type, subject_id, change_text, previous_state, current_state, direction,"
-        "  confidence, status, created_at, updated_at, source_episode_id, source_signal_id)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+        "  confidence, status, created_at, updated_at, source_episode_id, source_signal_id,"
+        "  source_run)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
         (subject_type, subject_id, change_text, previous_state, current_state, direction,
-         _clamp_confidence(confidence), status, now, now, source_episode_id, source_signal_id),
+         _clamp_confidence(confidence), status, now, now, source_episode_id, source_signal_id,
+         source_run),
     )
     conn.commit()
     return cur.lastrowid
@@ -621,18 +684,25 @@ def update_change(conn, change_id, change_text=None, previous_state=None, curren
 
 def add_recent_lesson(conn, lesson_text=None, topic_tags=None, confidence=0.5,
                        status="provisional", candidate_for_principle=0,
-                       source_episode_id=None, source_signal_id=None):
-    """Insert a new recent lesson and return its id."""
+                       source_episode_id=None, source_signal_id=None, source_run=None):
+    """Insert a new recent lesson and return its id.
+
+    source_episode_id must be a real hearth_episodes.id (or None) — use
+    source_run for scan-level provenance (e.g. "morning"/"midday"/"evening")
+    when the lesson is drawn from an aggregate pattern rather than one
+    specific episode. See _validate_source_episode_id.
+    """
     if not lesson_text:
         raise ValueError("lesson_text is required")
+    _validate_source_episode_id(source_episode_id)
     now = _now()
     cur = conn.execute(
         "INSERT INTO hearth_worldview_recent_lessons"
         " (lesson_text, topic_tags, confidence, status, created_at, updated_at,"
-        "  candidate_for_principle, source_episode_id, source_signal_id)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);",
+        "  candidate_for_principle, source_episode_id, source_signal_id, source_run)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
         (lesson_text, topic_tags, _clamp_confidence(confidence), status, now, now,
-         candidate_for_principle, source_episode_id, source_signal_id),
+         candidate_for_principle, source_episode_id, source_signal_id, source_run),
     )
     conn.commit()
     return cur.lastrowid

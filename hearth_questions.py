@@ -127,8 +127,25 @@ def get_question(conn, question_id):
     ).fetchone()
 
 
+def _resolve_linked_uncertainty(conn, question_id):
+    """If this question came from a worldview uncertainty, resolve that uncertainty."""
+    row = conn.execute(
+        "SELECT worldview_uncertainty_id FROM hearth_questions WHERE question_id = ?;",
+        (question_id,),
+    ).fetchone()
+    if row and row["worldview_uncertainty_id"]:
+        try:
+            hearth_worldview.resolve_uncertainty(conn, row["worldview_uncertainty_id"])
+        except Exception:
+            pass
+
+
 def mark_question_answered(conn, question_id):
-    """Set status to 'answered' and record answered_at. Only acts on open questions."""
+    """Set status to 'answered' and record answered_at. Only acts on open questions.
+
+    If the question was sourced from a worldview uncertainty, also resolves
+    that uncertainty so it does not resurface.
+    """
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "UPDATE hearth_questions"
@@ -137,16 +154,22 @@ def mark_question_answered(conn, question_id):
         (now, question_id),
     )
     conn.commit()
+    _resolve_linked_uncertainty(conn, question_id)
 
 
 def dismiss_question(conn, question_id):
-    """Set status to 'dismissed'. Only acts on open questions."""
+    """Set status to 'dismissed'. Only acts on open questions.
+
+    If the question was sourced from a worldview uncertainty, also resolves
+    that uncertainty so it does not resurface.
+    """
     conn.execute(
         "UPDATE hearth_questions SET status = 'dismissed'"
         " WHERE question_id = ? AND status = 'open';",
         (question_id,),
     )
     conn.commit()
+    _resolve_linked_uncertainty(conn, question_id)
 
 
 def list_questions_by_tag(conn, tag, status="open"):
@@ -362,7 +385,22 @@ if __name__ == "__main__":
         print("\nStep 10: surface_worldview_questions() — first run")
         qids = surface_worldview_questions(conn)
         print(f"  {len(qids)} question_id(s) touched: {qids}")
-        assert len(qids) == 2, f"Expected 2 questions surfaced, got {len(qids)}"
+        # Both test uncertainties must be surfaced; pre-existing open uncertainties
+        # from other smoke tests may also appear — check by uncertainty_id, not count.
+        assert unc_with_q in [
+            conn.execute(
+                "SELECT worldview_uncertainty_id FROM hearth_questions WHERE question_id = ?;",
+                (qid,),
+            ).fetchone()[0]
+            for qid in qids
+        ], "Expected unc_with_q to be surfaced"
+        assert unc_without_q in [
+            conn.execute(
+                "SELECT worldview_uncertainty_id FROM hearth_questions WHERE question_id = ?;",
+                (qid,),
+            ).fetchone()[0]
+            for qid in qids
+        ], "Expected unc_without_q to be surfaced"
 
         q_with = _find_open_question_for_uncertainty(conn, unc_with_q)
         q_without = _find_open_question_for_uncertainty(conn, unc_without_q)

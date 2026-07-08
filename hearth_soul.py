@@ -153,6 +153,20 @@ def _episode_entity(ep):
     return None
 
 
+def _episode_id(ep):
+    """Extract the real hearth_episodes.id from an episode dict or Row, if present.
+
+    Only used where a worldview write is triggered by one specific episode
+    (not an aggregate over several) — that id is the correct value for
+    source_episode_id. See hearth_worldview._validate_source_episode_id.
+    """
+    try:
+        val = ep["id"]
+        return val if val is not None else None
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
 def _episode_type(ep):
     """Extract an episode type string from an episode dict or Row."""
     for key in ("episode_type", "type"):
@@ -262,6 +276,10 @@ def _upsert_entity_repeat_uncertainty(conn, entity, count, source_run):
     Uses upsert_uncertainty() so existing rows survive a status change to
     question_surfaced — re-observing the same concern refreshes the row
     rather than creating a duplicate.
+
+    This reasons over multiple episodes for the entity (count >= threshold),
+    not one specific episode, so there is no single hearth_episodes.id to
+    attach — source_run carries the scan-level provenance instead.
     """
     subject_id = str(entity)
     text = (
@@ -279,7 +297,7 @@ def _upsert_entity_repeat_uncertainty(conn, entity, count, source_run):
         ),
         possible_question=f"Is entity {entity}'s recent concern volume expected or unusual?",
         confidence=_NEW_UNCERTAINTY_CONFIDENCE,
-        source_episode_id=source_run,
+        source_run=source_run,
     )
 
 
@@ -307,7 +325,7 @@ def _reinforce_recurrence_lesson(conn, episode_type, source_run):
         conn, lesson_text=lesson_text,
         topic_tags=f"episode_type,{episode_type},pattern",
         confidence=_NEW_BELIEF_CONFIDENCE,
-        source_episode_id=source_run,
+        source_run=source_run,
     )
     return lid, True
 
@@ -341,7 +359,7 @@ def _upsert_episode_type_change(conn, episode_type, count, source_run):
         current_state=f"{count} occurrence(s) in latest run",
         direction="increasing",
         confidence=_NEW_CHANGE_CONFIDENCE,
-        source_episode_id=source_run,
+        source_run=source_run,
     )
     return cid, True, None
 
@@ -360,7 +378,7 @@ def _is_individually_significant(ep, episode_type):
     return False
 
 
-def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run):
+def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run, episode_id=None):
     """Open or refresh a cautious living uncertainty for one individually meaningful episode.
 
     This is deliberately separate from _upsert_entity_repeat_uncertainty (keyed on
@@ -372,6 +390,11 @@ def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run):
     (i.e. the question was asked of Stacy) is still found and refreshed rather
     than duplicated on the next scan. Confidence stays in the cautious 0.45-0.55
     band — a single concern is worth watching, not a belief.
+
+    Unlike the aggregate helpers, this is triggered by one specific episode —
+    episode_id (the triggering episode's real hearth_episodes.id, if known) is
+    passed through as source_episode_id; source_run still carries which scan
+    produced the write.
     """
     subject_id = f"{episode_type}:{entity}"
     label = episode_type.replace("_", " ")
@@ -390,11 +413,12 @@ def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run):
         ),
         possible_question=f"Is the {label} episode for entity {entity} part of a larger pattern?",
         confidence=_SINGLE_SIGNIFICANCE_CONFIDENCE,
-        source_episode_id=source_run,
+        source_episode_id=episode_id,
+        source_run=source_run,
     )
 
 
-def _upsert_creator_quiet_watch(conn, entity, source_run):
+def _upsert_creator_quiet_watch(conn, entity, source_run, episode_id=None):
     """Open or refresh a cautious watched change for a creator_quiet episode that has
     already crossed into the medium/high severity band (see
     _CREATOR_QUIET_SIGNIFICANT_SEVERITIES) — quiet duration is motion, not a fixed
@@ -402,6 +426,10 @@ def _upsert_creator_quiet_watch(conn, entity, source_run):
 
     Duplicate protection: at most one watching change per entity (subject_type=
     "creator_quiet_entity"), refreshed in place rather than re-created each run.
+
+    Triggered by one specific creator_quiet episode — episode_id (its real
+    hearth_episodes.id, if known) is passed through as source_episode_id on
+    creation; source_run still carries which scan produced the write.
     """
     subject_id = str(entity)
     existing = hearth_worldview.get_watched_changes(
@@ -426,7 +454,8 @@ def _upsert_creator_quiet_watch(conn, entity, source_run):
         current_state="quiet as of latest run",
         direction="unclear",
         confidence=_SINGLE_SIGNIFICANCE_CONFIDENCE,
-        source_episode_id=source_run,
+        source_episode_id=episode_id,
+        source_run=source_run,
     )
     return cid, True
 
@@ -439,6 +468,10 @@ def _upsert_responsiveness_belief(conn, entity, source_run, confirm):
     an existing belief (challenges it) — a single negative event never
     creates a belief on its own, since optional participation is not failure.
     Duplicate protection: at most one active responsiveness belief per entity.
+
+    Reasons over an entity's resolved/new episode counts for the run, not
+    one specific episode, so there is no single hearth_episodes.id to
+    attach — source_run carries the scan-level provenance instead.
     """
     subject_id = str(entity)
     existing = hearth_worldview.get_active_beliefs(
@@ -462,7 +495,7 @@ def _upsert_responsiveness_belief(conn, entity, source_run, confirm):
         conn, subject_type="entity", subject_id=subject_id, belief_type="responsiveness",
         belief_text=f"Entity {entity} has shown episodes resolving, suggesting responsiveness to outreach.",
         confidence=_NEW_BELIEF_CONFIDENCE,
-        source_episode_id=source_run,
+        source_run=source_run,
     )
     return bid, True
 
@@ -577,6 +610,12 @@ def _upsert_momentum_belief(conn, entity_id, distinct_count, activity_types,
     On confirm: updates belief_text and confidence (never lowers), stamps
     last_confirmed_at. On creation: inserts with calculated confidence.
     Returns (belief_id, created: bool).
+
+    Momentum is computed from hearth_events (Pathway DB), not hearth_episodes
+    — there is never a hearth_episodes.id here, so source_episode_id must
+    stay None. distinct_count/activity_types are themselves aggregated over
+    many events in the rolling window, so there is no single event id to use
+    as source_signal_id either; source_run carries the scan-level provenance.
     """
     subject_id = str(entity_id)
     existing = hearth_worldview.get_active_beliefs(
@@ -610,7 +649,7 @@ def _upsert_momentum_belief(conn, entity_id, distinct_count, activity_types,
         belief_type="engagement_momentum",
         belief_text=belief_text,
         confidence=confidence,
-        source_episode_id=source_run,
+        source_run=source_run,
     )
     return bid, True
 
@@ -713,11 +752,16 @@ def reflect_on_worldview(conn, new_episodes=None, resolved_episodes=None, source
             continue
         if not _is_individually_significant(ep, ep_type):
             continue
+        episode_id = _episode_id(ep)
         if ep_type == "creator_quiet":
-            written["changes"].append(_upsert_creator_quiet_watch(conn, entity, source_run))
+            written["changes"].append(
+                _upsert_creator_quiet_watch(conn, entity, source_run, episode_id=episode_id)
+            )
         else:
             written["uncertainties"].append(
-                _upsert_single_episode_uncertainty(conn, ep_type, entity, source_run)
+                _upsert_single_episode_uncertainty(
+                    conn, ep_type, entity, source_run, episode_id=episode_id
+                )
             )
 
     for entity in resolved_entity_counts:
@@ -1014,7 +1058,7 @@ if __name__ == "__main__":
     for row in belief_rows:
         print(f"  id={row['id']} subject={row['subject_type']}:{row['subject_id']}"
               f" type={row['belief_type']} status={row['status']} confidence={row['confidence']}"
-              f" source_episode_id={row['source_episode_id']}")
+              f" source_episode_id={row['source_episode_id']} source_run={row['source_run']}")
         print(f"    belief_text: {row['belief_text']}")
     if not belief_rows:
         print("  (no rows)")
@@ -1024,7 +1068,7 @@ if __name__ == "__main__":
     for row in uncertainty_rows:
         print(f"  id={row['id']} subject={row['subject_type']}:{row['subject_id']}"
               f" status={row['status']} confidence={row['confidence']}"
-              f" source_episode_id={row['source_episode_id']}")
+              f" source_episode_id={row['source_episode_id']} source_run={row['source_run']}")
         print(f"    uncertainty_text: {row['uncertainty_text']}")
     if not uncertainty_rows:
         print("  (no rows)")
@@ -1034,7 +1078,7 @@ if __name__ == "__main__":
     for row in change_rows:
         print(f"  id={row['id']} subject={row['subject_type']}:{row['subject_id']}"
               f" status={row['status']} direction={row['direction']} confidence={row['confidence']}"
-              f" source_episode_id={row['source_episode_id']}")
+              f" source_episode_id={row['source_episode_id']} source_run={row['source_run']}")
         print(f"    change_text: {row['change_text']}")
         print(f"    previous_state={row['previous_state']!r} current_state={row['current_state']!r}")
     if not change_rows:
@@ -1046,7 +1090,7 @@ if __name__ == "__main__":
         print(f"  id={row['id']} status={row['status']} confidence={row['confidence']}"
               f" times_confirmed={row['times_confirmed']} times_challenged={row['times_challenged']}"
               f" candidate_for_principle={row['candidate_for_principle']}"
-              f" source_episode_id={row['source_episode_id']}")
+              f" source_episode_id={row['source_episode_id']} source_run={row['source_run']}")
         print(f"    lesson_text: {row['lesson_text']}")
     if not lesson_rows:
         print("  (no rows)")
