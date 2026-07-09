@@ -293,10 +293,12 @@ def collect_worldview_summary(memory_conn) -> WorldviewSummary:
                 open_uncertainties=[
                     _with_subject_name(memory_conn, pathway_conn, r)
                     for r in snapshot["open_uncertainties"]
+                    if not _is_never_brief_worldview_row(r)
                 ],
                 watched_changes=[
                     _with_subject_name(memory_conn, pathway_conn, r)
                     for r in snapshot["watched_changes"]
+                    if not _is_never_brief_worldview_row(r)
                 ],
                 recent_lessons=list(snapshot["recent_lessons"]),
             )
@@ -341,6 +343,50 @@ _NEVER_BRIEF_EPISODE_TYPES = {
     "probation",
     "training_comment_needs_response",  # legacy keyword-based detector; use training_comment_waiting instead
 }
+
+
+def _infer_worldview_episode_type(subject_type, subject_id):
+    """Best-effort recovery of the episode_type a worldview row was derived from.
+
+    hearth_worldview_changes/uncertainties have no type/category column — Soul
+    (hearth_soul.py) encodes provenance into subject_type/subject_id by
+    convention instead. Three conventions are known today:
+      - subject_type="episode_type"   -> subject_id IS the episode_type
+        (_upsert_episode_type_change: any spiking episode_type)
+      - subject_type="entity_episode" -> subject_id is "<episode_type>:<entity>"
+        (_upsert_single_episode_uncertainty: individually-significant episodes)
+      - subject_type="<episode_type>_entity" -> strip the "_entity" suffix
+        (_upsert_creator_quiet_watch: subject_type="creator_quiet_entity")
+    Returns None if subject_type/subject_id don't match any known convention —
+    callers must treat None as "not derived from an episode_type, render as-is."
+    """
+    if not subject_type:
+        return None
+    if subject_type == "episode_type":
+        return subject_id or None
+    if subject_type == "entity_episode" and subject_id and ":" in subject_id:
+        return subject_id.split(":", 1)[0] or None
+    if subject_type.endswith("_entity"):
+        return subject_type[: -len("_entity")] or None
+    return None
+
+
+def _is_never_brief_worldview_row(row) -> bool:
+    """True if this worldview row traces back to a _NEVER_BRIEF_EPISODE_TYPES episode.
+
+    Extends the Daily Brief 2.0 Attention-layer suppression principle to
+    Worldview watched-changes/uncertainties, which otherwise render
+    unconditionally regardless of episode-level suppression. This is a
+    blocklist check, not a safelist: a row with no recognized subject_type/
+    subject_id convention (see _infer_worldview_episode_type) is treated as
+    "not derived from a suppressed episode" and still renders. Any future
+    Soul-side convention for a suppressed episode type that isn't recognized
+    here will leak the same way this bug did — see hearth_context.py module
+    notes / the Daily Brief worldview leak fix for this residual risk.
+    """
+    row = dict(row)
+    inferred = _infer_worldview_episode_type(row.get("subject_type"), row.get("subject_id"))
+    return inferred in _NEVER_BRIEF_EPISODE_TYPES
 
 
 def _should_brief(ep, now_utc) -> bool:
@@ -851,3 +897,116 @@ def render_for_llm(context: HearthAwarenessContext) -> str:
         lines.append("")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Smoke test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import hearth_memory
+    import hearth_worldview
+
+    # NOTE: seeded via direct INSERT rather than hearth_worldview.record_change/
+    # upsert_uncertainty, and identified by change_text/uncertainty_text content
+    # rather than source_run — this local hearth_memory.db predates
+    # migrate_add_worldview_source_run.py (a pre-existing, unrelated migration
+    # gap), so the source_run column those functions write doesn't exist here
+    # yet. Only columns present in both schema versions are used below.
+    _QUIET_MARKER_TEXT = "SMOKE_TEST_CREATOR_QUIET_MARKER_never_brief_this"
+    _STUCK_MARKER_TEXT = "SMOKE_TEST_NEW_CREATOR_STUCK_MARKER_never_brief_this"
+    _BRIEFABLE_MARKER_TEXT = "SMOKE_TEST_BRIEFABLE_CHANGE_MARKER_should_still_brief"
+
+    conn = hearth_memory.get_memory_connection()
+    try:
+        hearth_worldview.ensure_worldview_tables(conn)
+        _now = datetime.now(timezone.utc).isoformat()
+
+        print("Step 1: seed a creator_quiet-derived watched change (the reported leak)")
+        conn.execute(
+            "INSERT INTO hearth_worldview_changes"
+            " (subject_type, subject_id, change_text, confidence, status, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?);",
+            ("creator_quiet_entity", "smoke_test_entity_1",
+             f"Entity smoke_test_entity_1 has gone quiet. {_QUIET_MARKER_TEXT}",
+             0.5, "watching", _now, _now),
+        )
+
+        print("Step 2: seed a new_creator_stuck-derived uncertainty (the other leak found in Phase 1)")
+        conn.execute(
+            "INSERT INTO hearth_worldview_uncertainties"
+            " (subject_type, subject_id, uncertainty_text, confidence, priority, status,"
+            "  created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+            ("entity_episode", "new_creator_stuck:smoke_test_entity_2",
+             f"new_creator_stuck for smoke_test_entity_2. {_STUCK_MARKER_TEXT}",
+             0.5, "normal", "open", _now, _now),
+        )
+
+        print("Step 3: seed a briefable watched change (not derived from a _NEVER_BRIEF episode type)")
+        conn.execute(
+            "INSERT INTO hearth_worldview_changes"
+            " (subject_type, subject_id, change_text, confidence, status, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?);",
+            ("episode_type", "checkin_feedback_waiting",
+             f"checkin_feedback_waiting spiking. {_BRIEFABLE_MARKER_TEXT}",
+             0.5, "watching", _now, _now),
+        )
+        conn.commit()
+
+        print("Step 4: collect_worldview_summary() + render_for_llm(), alongside a Needs Action Today item")
+        worldview = collect_worldview_summary(conn)
+        needs_action = PersonContext(
+            user_id=999999,
+            display_name="Smoke Test Person",
+            open_concerns=[OpenConcern(
+                description="SMOKE_TEST_NEEDS_ACTION_TODAY_MARKER",
+                first_seen=date.today().isoformat(), age_days=0,
+                severity="high", episode_type="support_request_waiting",
+                is_recurring=False,
+            )],
+            total_episode_count=1,
+        )
+        context = HearthAwarenessContext(
+            date="Smoke Test Day", person_contexts=[needs_action], worldview=worldview,
+        )
+        rendered = render_for_llm(context)
+
+        assert _QUIET_MARKER_TEXT not in rendered, \
+            "LEAK: creator_quiet watched-change rendered into Daily Brief-bound output"
+        assert _STUCK_MARKER_TEXT not in rendered, \
+            "LEAK: new_creator_stuck uncertainty rendered into Daily Brief-bound output"
+        assert _BRIEFABLE_MARKER_TEXT in rendered, \
+            "REGRESSION: a briefable watched change (not derived from a suppressed episode" \
+            " type) was incorrectly suppressed"
+        assert "SMOKE_TEST_NEEDS_ACTION_TODAY_MARKER" in rendered, \
+            "REGRESSION: Needs Action Today content did not render alongside worldview content"
+
+        print("  Suppressed: creator_quiet watched change, new_creator_stuck uncertainty")
+        print("  Preserved: checkin_feedback_waiting watched change, Needs Action Today item")
+        print("\nAll smoke test assertions passed.")
+    finally:
+        print("\nCleanup — removing all smoke-test rows")
+        conn.execute(
+            "DELETE FROM hearth_worldview_changes WHERE change_text LIKE ?;",
+            (f"%{_BRIEFABLE_MARKER_TEXT}%",),
+        )
+        conn.execute(
+            "DELETE FROM hearth_worldview_changes WHERE change_text LIKE ?;",
+            (f"%{_QUIET_MARKER_TEXT}%",),
+        )
+        conn.execute(
+            "DELETE FROM hearth_worldview_uncertainties WHERE uncertainty_text LIKE ?;",
+            (f"%{_STUCK_MARKER_TEXT}%",),
+        )
+        conn.commit()
+        remaining = conn.execute(
+            "SELECT"
+            " (SELECT COUNT(*) FROM hearth_worldview_changes"
+            "  WHERE change_text LIKE ? OR change_text LIKE ?)"
+            " + (SELECT COUNT(*) FROM hearth_worldview_uncertainties WHERE uncertainty_text LIKE ?);",
+            (f"%{_QUIET_MARKER_TEXT}%", f"%{_BRIEFABLE_MARKER_TEXT}%", f"%{_STUCK_MARKER_TEXT}%"),
+        ).fetchone()[0]
+        print(f"  Remaining smoke-test rows after cleanup: {remaining}")
+        conn.close()
+        print("\nSmoke test complete.")
