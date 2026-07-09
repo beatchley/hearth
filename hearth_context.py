@@ -326,15 +326,41 @@ _SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 _PATTERN_COOLDOWN_DAYS = 3
 
+# Daily Brief 2.0 (Attention layer): explicit episode_type overrides checked
+# before briefing_category. missing_discord is a deliberate reversal of its
+# 'awareness' categorization — always briefed while unresolved, not a
+# restoration of prior behavior (that categorization was intentional when
+# added). The _NEVER_BRIEF set fully excludes these from brief output even
+# though their briefing_category ('pattern' or 'action_needed') would
+# otherwise brief them on a cooldown or always — episodes keep being written
+# and stay queryable in Hearth City/admin, only brief visibility changes.
+_ALWAYS_BRIEF_EPISODE_TYPES = {"missing_discord"}
+_NEVER_BRIEF_EPISODE_TYPES = {
+    "creator_quiet",
+    "new_creator_stuck",
+    "probation",
+    "training_comment_needs_response",  # legacy keyword-based detector; use training_comment_waiting instead
+}
+
 
 def _should_brief(ep, now_utc) -> bool:
     """Return True if this episode should appear in today's briefing.
 
+    _ALWAYS_BRIEF_EPISODE_TYPES / _NEVER_BRIEF_EPISODE_TYPES override
+    briefing_category entirely for those specific episode types.
+
+    Otherwise, by briefing_category:
     awareness  → always False (tracked in memory, never surfaced in briefings)
     pattern    → True only if never briefed or last briefed 3+ days ago
     action_needed / critical → always True
     NULL / unrecognized      → always True (never silently drop unclassified)
     """
+    ep_type = ep["episode_type"]
+    if ep_type in _ALWAYS_BRIEF_EPISODE_TYPES:
+        return True
+    if ep_type in _NEVER_BRIEF_EPISODE_TYPES:
+        return False
+
     cat = ep["briefing_category"]
     if cat == "awareness":
         return False
@@ -410,33 +436,23 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
     today_str = today.isoformat()
     observations = []
 
-    # New users — informational; not tracked as episodes
-    new_users = data.get("New users (last 24 h)", [])
-    if isinstance(new_users, list):
-        for row in new_users:
-            observations.append(Observation(
-                text=f"{row['name']} joined recently.",
-                person=row["name"],
-            ))
+    # New users joining is informational, not a "Needs Action Today" item —
+    # Daily Brief 2.0 excludes it from brief output (data.get(...) itself is
+    # unaffected; this is the only place it was ever surfaced).
 
-    # Battles scheduled today — informational; trace each with full battle fields
+    # Battles scheduled today — informational, not a "Needs Action Today" item.
+    # Daily Brief 2.0 excludes it from brief output, but still traced (below)
+    # for developer-audit visibility, same as before.
     battles_today = data.get("Battles scheduled today", [])
     if isinstance(battles_today, list):
         for row in battles_today:
-            time_part = f" at {row['battle_time']}" if row["battle_time"] else ""
-            observations.append(Observation(
-                text=(
-                    f"{row['creator_screenname']} has a battle{time_part}"
-                    f" against {row['opponent_name']}."
-                ),
-                person=row["creator_screenname"],
-            ))
             try:
                 tracer.record(_ht.TraceEntry(
                     rule_name="battles_today_observation",
                     episode_type="battle_observation",
-                    action_taken="included_in_briefing",
-                    reason="battles.battle_date matches today — included as observation",
+                    action_taken="excluded_from_briefing",
+                    reason="battles.battle_date matches today — traced, but Daily Brief 2.0"
+                           " excludes battles_today from brief output",
                     source_table="battles",
                     source_record_id=row["id"],
                     source_fields={
@@ -457,14 +473,8 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
             except Exception:
                 pass
 
-    # Recent training comments — informational
-    comments = data.get("Recent training comments (last 24 h)", [])
-    if isinstance(comments, list) and comments:
-        count = len(comments)
-        if count == 1:
-            observations.append(Observation(text="One training comment came in over the last day."))
-        else:
-            observations.append(Observation(text=f"{count} training comments came in over the last day."))
+    # Recent training comment count is informational, not a "Needs Action
+    # Today" item — Daily Brief 2.0 excludes it from brief output.
 
     # Filter open episodes to only those that should appear in today's briefing.
     # awareness episodes are tracked in memory but never surfaced in briefings.
@@ -574,22 +584,15 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
         _SEVERITY_ORDER.get(p.open_concerns[0].severity if p.open_concerns else "low", 1),
     ))
 
-    # Shared-coach group signal: if 2+ people with the same coach have open concerns,
-    # surface that as an observation so the briefing can mention the pattern.
+    # Shared-coach group signal: if 2+ people with the same coach have open
+    # concerns, this computes that pattern (kept for potential future use,
+    # e.g. a Manager Dashboard view) but Daily Brief 2.0 does not append it
+    # as an observation — it must not reach the brief-bound context.
     # Prefer program-specific coach names; fall back to legacy coach_name.
     coach_groups = {}
     for pc in person_contexts:
         for cname in filter(None, [pc.cn_coach_name, pc.shop_coach_name, pc.coach_name]):
             coach_groups.setdefault(cname, set()).add(pc.display_name)
-    for coach_name, member_set in coach_groups.items():
-        if len(member_set) >= 2:
-            names = ", ".join(sorted(member_set))
-            observations.append(Observation(
-                text=(
-                    f"Multiple members connected to {coach_name} have open concerns: {names}."
-                ),
-                person=coach_name,
-            ))
 
     # Trace unattached concerns (no linked person)
     unattached_concerns = _sort_concerns(
@@ -792,17 +795,9 @@ def render_for_llm(context: HearthAwarenessContext) -> str:
             lines.append(f"  - {obs.text}")
         lines.append("")
 
-    if context.recent_resolutions:
-        lines.append("What's been resolved:")
-        for res in context.recent_resolutions:
-            if res.days_open > 1:
-                duration = f" (was open for {res.days_open} days)"
-            elif res.days_open == 1:
-                duration = " (was open since yesterday)"
-            else:
-                duration = ""
-            lines.append(f"  - {res.description}{duration}")
-        lines.append("")
+    # context.recent_resolutions is intentionally not rendered — Daily Brief
+    # 2.0 excludes positive/resolved updates from brief output. Still
+    # populated by build_context() in case a future non-brief consumer needs it.
 
     if context.person_contexts:
         lines.append("Who I'm watching:")

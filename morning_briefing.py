@@ -55,6 +55,12 @@ TRAINING_COMMENT_WAITING_DAYS   = 3   # flag a creator training comment after th
 SUPPORT_REQUEST_WAITING_DAYS    = 3   # flag an open support thread after this many days with no staff response
 NEW_CREATOR_STUCK_DAYS          = 14  # flag a new creator with zero engagement after this many days since joining
 
+# comment_type values (see hearth_comment_classifier.py) that represent the
+# creator actually needing something from staff. Anything else — including
+# NULL/unclassified — is not actionable and must not create a
+# training_comment_waiting concern.
+ACTIONABLE_COMMENT_TYPES = ("question", "help_request", "feedback_request", "discussion")
+
 
 # ---------------------------------------------------------------------------
 # Database helpers — read-only throughout
@@ -275,6 +281,12 @@ def query_checkin_feedback_waiting(conn, cutoff: datetime):
 def query_training_comment_waiting(conn, cutoff: datetime):
     """Creator comments on trainings with no staff response after TRAINING_COMMENT_WAITING_DAYS.
 
+    Only comments classified (comment_type) as one of ACTIONABLE_COMMENT_TYPES
+    are eligible — a comment actually has to be asking for something. NULL
+    (unclassified) comments are excluded rather than treated as needing
+    attention; run backfill_training_comment_classification.py to classify
+    any legacy NULL rows first.
+
     Creator identity here is creator flags (is_pathway_creator or
     is_shop_creator), independent of staff role — a creator-flagged user's
     comment is creator-originated even if they also hold a staff role. Staff
@@ -289,6 +301,7 @@ def query_training_comment_waiting(conn, cutoff: datetime):
     """
     staff_roles = tuple(hearth_identity.STAFF_ROLES)
     staff_placeholders = ", ".join("?" for _ in staff_roles)
+    type_placeholders = ", ".join("?" for _ in ACTIONABLE_COMMENT_TYPES)
     sql = f"""
         SELECT
             tc.id                                               AS comment_id,
@@ -304,6 +317,7 @@ def query_training_comment_waiting(conn, cutoff: datetime):
         JOIN trainings t ON t.id  = tc.training_id
         WHERE (u.is_pathway_creator = 1 OR u.is_shop_creator = 1)
           AND tc.created_at <= ?
+          AND tc.comment_type IN ({type_placeholders})
           AND NOT EXISTS (
               SELECT 1
               FROM training_comment_replies tcr
@@ -321,7 +335,7 @@ def query_training_comment_waiting(conn, cutoff: datetime):
           )
         ORDER BY tc.created_at ASC;
     """
-    params = (cutoff.isoformat(),) + staff_roles + staff_roles
+    params = (cutoff.isoformat(),) + ACTIONABLE_COMMENT_TYPES + staff_roles + staff_roles
     return safe_query(conn, "Training comments awaiting staff response", sql, params)
 
 
@@ -1628,7 +1642,7 @@ helpfulness — you just help. Write the way a trusted colleague speaks, not the
 software product communicates.
 
 --- FORMAT ---
-- Begin with exactly: "Good morning Stacy." (period, no exclamation mark, nothing else on that line)
+- Begin with exactly: "Good morning team." (period, no exclamation mark, nothing else on that line)
 - Write in natural prose. No headers. No bullet points. No bold labels. No numbered lists.
 - One or two short paragraphs is usually enough. Three at most.
 - End when you are done. No sign-off, no summary, no closing line.
@@ -1649,7 +1663,7 @@ Do not use emojis, section headers, or bold formatting.
 Do not give raw counts as the point ("3 users", "5 open concerns").
 Do not use filler phrases: "It's worth noting", "I wanted to flag", "Please be advised", \
 "Hope you're doing well", "Don't hesitate to reach out", "It's important to remember."
-Do not restate what Stacy can already see. Interpret it.
+Do not restate what the team can already see. Interpret it.
 Do not inflate a quiet day. If little needs attention, keep it to two or three sentences.\
 """
 
