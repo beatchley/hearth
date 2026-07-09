@@ -29,6 +29,7 @@ Does not modify: hearth_traversal.py, hearth_context.py, hearth_soul.py,
 hearth_worldview.py, or any watcher/detector code.
 """
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Optional
@@ -36,6 +37,9 @@ from typing import Optional
 import hearth_context
 import hearth_memory
 import hearth_traversal
+from hearth_gemini_config import GEMINI_MODEL_NAME
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -382,10 +386,14 @@ def _call_gemini(prompt: str, gemini_client) -> Optional[str]:
     if gemini_client is None:
         return None
     try:
-        response = gemini_client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        response = gemini_client.models.generate_content(model=GEMINI_MODEL_NAME, contents=prompt)
         text = getattr(response, "text", None)
         return text.strip() if text else None
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "[ask_hearth] Gemini generate_content() call failed — falling back to raw"
+            " summary: %s: %s", type(exc).__name__, exc,
+        )
         return None
 
 

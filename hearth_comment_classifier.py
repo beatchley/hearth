@@ -9,6 +9,8 @@ import json
 import logging
 import os
 
+from hearth_gemini_config import GEMINI_MODEL_NAME
+
 logger = logging.getLogger(__name__)
 
 _ALLOWED_CATEGORIES = frozenset({
@@ -93,7 +95,7 @@ Training comment:
     try:
         gemini_client = genai.Client(api_key=api_key)
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=GEMINI_MODEL_NAME,
             contents=prompt,
         )
         raw = response.text.strip() if response.text else ""

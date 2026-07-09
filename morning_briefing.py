@@ -30,6 +30,7 @@ import hearth_relationships
 import hearth_context
 import hearth_soul
 import hearth_trace
+from hearth_gemini_config import GEMINI_MODEL_NAME
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -1676,7 +1677,7 @@ def generate_hearth_message(awareness_context: hearth_context.HearthAwarenessCon
     prompt = HEARTH_SYSTEM_PROMPT.format(
         awareness=awareness_text, worldview_guidance=worldview_guidance
     )
-    response = gemini_client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    response = gemini_client.models.generate_content(model=GEMINI_MODEL_NAME, contents=prompt)
     return response.text
 
 
