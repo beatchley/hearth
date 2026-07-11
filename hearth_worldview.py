@@ -679,6 +679,62 @@ def update_change(conn, change_id, change_text=None, previous_state=None, curren
 
 
 # ---------------------------------------------------------------------------
+# Entity reflection refs
+# ---------------------------------------------------------------------------
+
+_VALID_REFLECTION_TYPES = ("worldview_belief", "worldview_uncertainty", "worldview_change")
+
+
+def create_entity_ref(conn, entity_id, reflection_type, reflection_id, source=None, confidence=None):
+    """Leave a breadcrumb linking a Building to a worldview artifact genuinely created for it.
+
+    This is Hearth's evidence trail: every time a belief, uncertainty, or
+    watched change is created (not merely refreshed) for a specific Building,
+    a ref records that link. This is what will eventually let Ask Hearth
+    answer "why does Hearth believe this" by following the breadcrumbs left
+    when Hearth learned something, rather than re-deriving the answer from
+    scratch. Deciding whether an artifact deserves a ref is the caller's job
+    (only on genuine creation, never on update/refresh of an existing
+    artifact) — this function only performs the write.
+
+    entity_id is the Hearth Building (hearth_entities.id) this artifact
+    belongs to. reflection_type is one of "worldview_belief",
+    "worldview_uncertainty", or "worldview_change" — no other values in V1.
+    reflection_id is the id of the actual belief/uncertainty/change row.
+
+    source and confidence describe the association itself — why this
+    artifact belongs to this Building, and how confident Hearth is in that
+    association — not the underlying artifact's own confidence field.
+
+    Idempotent via the existing UNIQUE(entity_id, reflection_type,
+    reflection_id) constraint: calling this twice for the same identity never
+    raises and always returns the same row id. Does not rely on
+    cursor.lastrowid after a conflict — SQLite's INSERT ... ON CONFLICT DO
+    NOTHING does not report a pre-existing row's id that way — so the row is
+    always looked up by its unique identity afterward, regardless of whether
+    this call created it or found it already there.
+    """
+    if reflection_type not in _VALID_REFLECTION_TYPES:
+        raise ValueError(
+            f"reflection_type must be one of {_VALID_REFLECTION_TYPES}, got {reflection_type!r}"
+        )
+    conn.execute(
+        "INSERT INTO hearth_entity_reflection_refs"
+        " (entity_id, reflection_type, reflection_id, source, confidence)"
+        " VALUES (?, ?, ?, ?, ?)"
+        " ON CONFLICT(entity_id, reflection_type, reflection_id) DO NOTHING;",
+        (entity_id, reflection_type, reflection_id, source, confidence),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT id FROM hearth_entity_reflection_refs"
+        " WHERE entity_id = ? AND reflection_type = ? AND reflection_id = ?;",
+        (entity_id, reflection_type, reflection_id),
+    ).fetchone()
+    return row["id"]
+
+
+# ---------------------------------------------------------------------------
 # Recent lessons
 # ---------------------------------------------------------------------------
 

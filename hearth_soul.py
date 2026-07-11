@@ -286,7 +286,7 @@ def _upsert_entity_repeat_uncertainty(conn, entity, count, source_run):
         f"Entity {entity} had {count} new concern episode(s) in a single run —"
         " unclear if this is a meaningful pattern or coincidence."
     )
-    return hearth_worldview.upsert_uncertainty(
+    result_id, created = hearth_worldview.upsert_uncertainty(
         conn,
         subject_type="entity",
         subject_id=subject_id,
@@ -299,6 +299,13 @@ def _upsert_entity_repeat_uncertainty(conn, entity, count, source_run):
         confidence=_NEW_UNCERTAINTY_CONFIDENCE,
         source_run=source_run,
     )
+    if created:
+        hearth_worldview.create_entity_ref(
+            conn, entity_id=entity, reflection_type="worldview_uncertainty",
+            reflection_id=result_id, source="_upsert_entity_repeat_uncertainty",
+            confidence=1.0,
+        )
+    return result_id, created
 
 
 def _reinforce_recurrence_lesson(conn, episode_type, source_run):
@@ -402,7 +409,7 @@ def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run, e
         f"It is unclear whether the {label} episode for entity {entity} reflects"
         " a meaningful pattern or an isolated event — worth watching."
     )
-    return hearth_worldview.upsert_uncertainty(
+    result_id, created = hearth_worldview.upsert_uncertainty(
         conn,
         subject_type="entity_episode",
         subject_id=subject_id,
@@ -416,6 +423,13 @@ def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run, e
         source_episode_id=episode_id,
         source_run=source_run,
     )
+    if created:
+        hearth_worldview.create_entity_ref(
+            conn, entity_id=entity, reflection_type="worldview_uncertainty",
+            reflection_id=result_id, source="_upsert_single_episode_uncertainty",
+            confidence=1.0,
+        )
+    return result_id, created
 
 
 def _upsert_creator_quiet_watch(conn, entity, source_run, episode_id=None):
@@ -457,6 +471,11 @@ def _upsert_creator_quiet_watch(conn, entity, source_run, episode_id=None):
         source_episode_id=episode_id,
         source_run=source_run,
     )
+    hearth_worldview.create_entity_ref(
+        conn, entity_id=entity, reflection_type="worldview_change",
+        reflection_id=cid, source="_upsert_creator_quiet_watch",
+        confidence=1.0,
+    )
     return cid, True
 
 
@@ -496,6 +515,11 @@ def _upsert_responsiveness_belief(conn, entity, source_run, confirm):
         belief_text=f"Entity {entity} has shown episodes resolving, suggesting responsiveness to outreach.",
         confidence=_NEW_BELIEF_CONFIDENCE,
         source_run=source_run,
+    )
+    hearth_worldview.create_entity_ref(
+        conn, entity_id=entity, reflection_type="worldview_belief",
+        reflection_id=bid, source="_upsert_responsiveness_belief",
+        confidence=1.0,
     )
     return bid, True
 
