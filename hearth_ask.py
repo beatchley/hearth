@@ -31,12 +31,13 @@ hearth_worldview.py, or any watcher/detector code.
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import hearth_context
 import hearth_memory
 import hearth_traversal
+from hearth_entity_resolution import EntityResolution, resolve_entity
 from hearth_gemini_config import GEMINI_MODEL_NAME
 
 logger = logging.getLogger(__name__)
@@ -50,15 +51,6 @@ class RoutedQuestion:
     """Deterministic routing decision for one question."""
     route: str  # tell_me_about_entity | connected_to_entity | needs_attention_today | unsupported
     entity_query: Optional[str] = None
-
-
-@dataclass
-class EntityResolution:
-    """Result of resolving a free-text entity query against hearth_entities."""
-    status: str  # resolved | ambiguous | not_found
-    entity_id: Optional[int] = None
-    entity_row: Optional[object] = None
-    candidate_names: list = field(default_factory=list)  # populated only when ambiguous
 
 
 @dataclass
@@ -136,66 +128,10 @@ def route_question(question_text: str) -> RoutedQuestion:
 
 
 # ---------------------------------------------------------------------------
-# 2. Entity resolution
+# 2. Entity resolution — see hearth_entity_resolution.py (EntityResolution,
+# resolve_entity imported above). Shared with the Furniture Fact Extractor
+# so the two never carry separate copies of the same matching rules.
 # ---------------------------------------------------------------------------
-
-def _resolved(row) -> EntityResolution:
-    return EntityResolution(status="resolved", entity_id=row["id"], entity_row=row)
-
-
-def _ambiguous(rows) -> EntityResolution:
-    names = sorted({row["display_name"] or f"Building {row['id']}" for row in rows})
-    return EntityResolution(status="ambiguous", candidate_names=names)
-
-
-def resolve_entity(memory_conn, query: str) -> EntityResolution:
-    """Layered, deterministic resolution of a free-text query to one Building.
-
-    Order: exact display_name match, case-insensitive display_name match,
-    alias match (hearth_entities.aliases, comma-separated convention — this
-    column has no write path anywhere today, so this layer is currently
-    always a no-op; kept for forward compatibility rather than removed).
-    Each layer only falls through to the next if it finds zero matches; two
-    or more matches at any layer is ambiguous, not a guess.
-
-    Fuzzy matching is deliberately not implemented — see module docstring /
-    Ask Hearth investigation notes for the proposed future rule and why it
-    was deferred.
-    """
-    query = (query or "").strip()
-    if not query:
-        return EntityResolution(status="not_found")
-
-    rows = memory_conn.execute(
-        "SELECT * FROM hearth_entities WHERE display_name = ?;", (query,)
-    ).fetchall()
-    if len(rows) == 1:
-        return _resolved(rows[0])
-    if len(rows) > 1:
-        return _ambiguous(rows)
-
-    rows = memory_conn.execute(
-        "SELECT * FROM hearth_entities WHERE LOWER(display_name) = LOWER(?);", (query,)
-    ).fetchall()
-    if len(rows) == 1:
-        return _resolved(rows[0])
-    if len(rows) > 1:
-        return _ambiguous(rows)
-
-    alias_candidates = memory_conn.execute(
-        "SELECT * FROM hearth_entities WHERE aliases IS NOT NULL AND aliases != '';"
-    ).fetchall()
-    query_lower = query.lower()
-    matched = [
-        row for row in alias_candidates
-        if query_lower in [a.strip().lower() for a in row["aliases"].split(",") if a.strip()]
-    ]
-    if len(matched) == 1:
-        return _resolved(matched[0])
-    if len(matched) > 1:
-        return _ambiguous(matched)
-
-    return EntityResolution(status="not_found")
 
 
 # ---------------------------------------------------------------------------
