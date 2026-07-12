@@ -743,6 +743,25 @@ def _age_note(concern: OpenConcern) -> str:
     return f"for {age} days — worth escalating"
 
 
+# Episode types whose description already states the real-world source age
+# (e.g. training_comment_waiting embeds the comment's actual unanswered age
+# from training_comments.created_at). For these, _age_note's tracking-age
+# suffix — derived from hearth_episodes.observed_at, i.e. how long Hearth has
+# known about the episode, not how long the underlying condition has existed —
+# must not be appended: a classifier change made old comments newly eligible
+# for detection, giving them a small observed_at-based age alongside a much
+# larger real age, and Gemini rendered the misleading small number. See the
+# July 2026 training-comment brief bug.
+_NO_TRACKING_AGE_SUFFIX_EPISODE_TYPES = frozenset({"training_comment_waiting"})
+
+
+def _age_suffix(concern: OpenConcern) -> str:
+    """Trailing ' (tracking age note)' for a concern line, or '' if suppressed."""
+    if concern.episode_type in _NO_TRACKING_AGE_SUFFIX_EPISODE_TYPES:
+        return ""
+    return f" ({_age_note(concern)})"
+
+
 def _subject_label(row) -> Optional[str]:
     """Return the resolved display name for a single-subject worldview row, if any."""
     try:
@@ -856,7 +875,7 @@ def render_for_llm(context: HearthAwarenessContext) -> str:
             for concern in person.open_concerns:
                 lines.append(
                     f"    - [{concern.severity.upper()}] {concern.description}"
-                    f" ({_age_note(concern)})"
+                    f"{_age_suffix(concern)}"
                 )
 
             if person.cn_coach_name:
@@ -883,7 +902,7 @@ def render_for_llm(context: HearthAwarenessContext) -> str:
         for concern in context.unattached_concerns:
             lines.append(
                 f"  - [{concern.severity.upper()}] {concern.description}"
-                f" ({_age_note(concern)})"
+                f"{_age_suffix(concern)}"
             )
         lines.append("")
 

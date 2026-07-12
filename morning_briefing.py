@@ -1414,6 +1414,13 @@ def detect_training_comment_waiting(memory_conn, data, tracer=None):
             reference_key=ref_key,
             briefing_category="action_needed",
         )
+        if action == "reused_open_episode":
+            # The comment's real unanswered age (desc, built from
+            # training_comments.created_at above) keeps growing each run;
+            # without this the episode's stored description — and the source
+            # age embedded in it — would freeze at first detection instead of
+            # reflecting current reality.
+            hearth_memory.refresh_episode(memory_conn, _ep_id, desc, severity=severity)
         try:
             tracer.record(hearth_trace.TraceEntry(
                 rule_name="training_comment_waiting",
