@@ -328,6 +328,28 @@ def main():
         )
         assert "Ethan" in result.answer, "expected the resolved display name 'Ethan' to appear instead"
 
+        # =======================================================================
+        print(f"\n\n{'#' * 78}\n# SCENARIO 8: outer-quote-wrapped input reaches the manager-advice path unaffected\n{'#' * 78}")
+        # hearth_ask.answer_question() now normalizes (incl. outer-quote
+        # stripping) once and passes that same normalized text into
+        # hearth_manager_advice.answer_manager_advice_question() — this is
+        # the primary scenario's exact question text, wrapped in a
+        # literal outer quote pair the way a browser/OS might produce one.
+        # A direct check (see completion report) already confirmed
+        # check_entity_mentions() itself tolerates outer quotes even without
+        # this fix — this proves the full pipeline (gate + cognitive path)
+        # still reaches the same "success" outcome end to end now that the
+        # normalized text flows all the way through, not just at the gate.
+        result = hearth_ask.answer_question(
+            '"I noticed Ethan has not been going live much lately and I was '
+            'thinking about reaching out to him. What do you think?"',
+            memory_conn=conn, gemini_client=gemini_client,
+        )
+        _print_result("Scenario 8: quote-wrapped input, manager-advice path", result)
+        assert result.status == "success", f"expected success, got {result.status}: {result.answer}"
+        assert result.entity_id == ethan_id
+        assert result.plan is not None
+
         print("\n\nAll manager-advice scenario assertions passed.")
 
     finally:

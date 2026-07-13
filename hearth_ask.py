@@ -107,6 +107,63 @@ _TELL_ME_ABOUT_PATTERNS = [
     re.compile(r"^what\s+can\s+you\s+tell\s+me\s+about\s+(?:the\s+)?(.+?)[\?\.!]*$"),
 ]
 
+# Straight ASCII quotes plus curly/smart quotes — browsers and OS-level
+# autocorrect frequently convert a typed " or ' into one of these, so a
+# quote-wrapped question ("Who needs attention today?") can arrive in any
+# of these forms.
+_OUTER_QUOTE_PAIRS = (
+    ('"', '"'),
+    ("'", "'"),
+    ("“", "”"),  # “ ”
+    ("‘", "’"),  # ‘ ’
+)
+
+
+def _strip_outer_quote_pair(text: str) -> str:
+    """Strip exactly one balanced pair of quote characters wrapping the
+    ENTIRE string, if present — never a quote appearing anywhere else in
+    the string. This is why the check is "does the string START and END
+    with a matching quote pair," not "does it contain a quote character":
+    text[1:-1] only ever removes the outermost two characters, so an
+    internal apostrophe (e.g. "What's connected to Ethan") is untouched
+    since neither of its ends is a quote.
+
+    Single pass only, even for doubled/nested outer quotes — e.g. the
+    literal input ""hello"" (two pairs) is stripped once, leaving "hello"
+    (one pair remaining), not hello: a second pass risks eating into
+    content that is genuinely part of the question (e.g. a Building whose
+    display_name itself begins or ends with a quote character) rather than
+    incidental wrapping. No entity in the current database has a
+    display_name starting or ending with a quote character (checked
+    directly), so this is a real but currently unobserved edge case, not a
+    guessed-at one — documented rather than silently guarded against with
+    more complexity than the data justifies.
+    """
+    if len(text) < 2:
+        return text
+    for open_q, close_q in _OUTER_QUOTE_PAIRS:
+        if text[0] == open_q and text[-1] == close_q:
+            return text[1:-1]
+    return text
+
+
+def _normalize_question_text(question_text: str) -> str:
+    """Shared normalization — the single place every route in this module
+    (the three fixed patterns below, and the Phase 4 manager-advice
+    eligibility gate in hearth_manager_advice.py, via answer_question()'s
+    call to it) sees text through, so a normalization fix like outer-quote
+    stripping only needs to happen once, not per caller.
+
+    Order matters: outer quotes are stripped only after trimming genuine
+    leading/trailing whitespace (so a quote is actually the first/last
+    character being checked, not preceded by stray spaces), and before the
+    internal-whitespace collapse (so any whitespace left just inside the
+    quotes — e.g. '" Who needs attention? "' — still gets collapsed).
+    """
+    stripped = (question_text or "").strip()
+    stripped = _strip_outer_quote_pair(stripped)
+    return " ".join(stripped.split())
+
 
 def route_question(question_text: str) -> RoutedQuestion:
     """Deterministically classify a free-text question. Never uses an LLM.
@@ -117,7 +174,7 @@ def route_question(question_text: str) -> RoutedQuestion:
     safe because lowercasing never changes string length for the text this
     handles).
     """
-    normalized = " ".join((question_text or "").strip().split())
+    normalized = _normalize_question_text(question_text)
     lowered = normalized.lower()
 
     if _NEEDS_ATTENTION_RE.match(lowered):
@@ -433,8 +490,13 @@ def answer_question(question_text: str, memory_conn=None, gemini_client=None) ->
             # This does not change routing for anything the three routes
             # above already handle — route_question()'s patterns are tried
             # first, unconditionally, and are untouched by this branch.
+            # Passes the same normalized text route_question() itself
+            # matched against (not the raw question_text) — the shared
+            # normalization step (outer-quote stripping, whitespace
+            # collapse) applies once, to every route, not just the three
+            # fixed patterns.
             advice_result, _gate = hearth_manager_advice.answer_manager_advice_question(
-                question_text, memory_conn, gemini_client,
+                _normalize_question_text(question_text), memory_conn, gemini_client,
             )
             if advice_result is not None:
                 return AskHearthResult(**advice_result)
@@ -502,7 +564,31 @@ if __name__ == "__main__":
     assert route_question("What needs attention?").route == "needs_attention_today"
     assert route_question("What's Ethan's coach?").route == "unsupported"
     assert route_question("").route == "unsupported"
-    print("  All routing assertions passed.")
+    print("  All routing assertions passed (unwrapped input, unchanged baseline).")
+
+    print("Step 1b: route_question() — outer-quote-wrapped input (regression test)")
+    # Straight ASCII double quotes, one per fixed pattern.
+    assert route_question('"Who needs attention today?"').route == "needs_attention_today"
+    assert route_question('"What is connected to Ethan?"').route == "connected_to_entity"
+    assert route_question('"What is connected to Ethan?"').entity_query == "Ethan"
+    assert route_question('"Tell me about Ethan"').route == "tell_me_about_entity"
+    assert route_question('"Tell me about Ethan"').entity_query == "Ethan"
+    # Straight ASCII single quotes.
+    assert route_question("'Who needs attention today?'").route == "needs_attention_today"
+    assert route_question("'Tell me about Ethan'").route == "tell_me_about_entity"
+    # Curly/smart double and single quotes (common browser/OS autocorrect output).
+    assert route_question("“Who needs attention today?”").route == "needs_attention_today"
+    assert route_question("“What is connected to Ethan?”").route == "connected_to_entity"
+    assert route_question("‘Tell me about Ethan’").route == "tell_me_about_entity"
+    # Whitespace just inside the wrapping quotes must still be handled.
+    assert route_question('"  Who needs attention today?  "').route == "needs_attention_today"
+    # Internal apostrophe, no outer quotes at all — must remain unaffected,
+    # matching exactly as before this fix (the case named explicitly in the
+    # bug report).
+    result = route_question("What's connected to Ethan")
+    assert result.route == "connected_to_entity"
+    assert result.entity_query == "Ethan"
+    print("  All quote-wrapped routing assertions passed.")
 
     conn = hearth_memory.get_memory_connection()
     hearth_memory.init_tables(conn)
