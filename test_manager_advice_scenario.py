@@ -143,6 +143,21 @@ def main():
             belief_text=f"Engagement momentum has been slowing over the last several weeks. [{MARKER}]",
             confidence=0.55,
         )
+        # Mirrors the actual production bug verbatim: hearth_soul.py's
+        # _upsert_responsiveness_belief() writes belief_text as
+        # f"Entity {entity} has shown episodes resolving, suggesting
+        # responsiveness to outreach." — a raw numeric entity_id embedded in
+        # stored free text, unlike _upsert_engagement_momentum_belief() above
+        # which correctly resolves display_name before writing. This belief
+        # exercises the rendering-time fix (_resolve_entity_id_mentions()).
+        hearth_worldview.add_belief(
+            conn, subject_type="entity", subject_id=ethan_id, belief_type="responsiveness",
+            belief_text=(
+                f"Entity {ethan_id} has shown episodes resolving, suggesting responsiveness "
+                f"to outreach. [{MARKER}]"
+            ),
+            confidence=0.6,
+        )
         conn.commit()
 
         # --- Seed: ambiguous duplicate-name pair -------------------------------
@@ -174,6 +189,13 @@ def main():
         assert isinstance(result.plan, dict)
         for key in ("goal", "known", "to_verify"):
             assert result.plan.get(key), f"expected non-empty plan.{key}, got {result.plan.get(key)!r}"
+        # Best-effort: if the model's plan happened to select get_active_beliefs
+        # this round, confirm the raw-entity-ID belief above didn't leak here
+        # too. Scenario 7 below forces this tool so the check is guaranteed,
+        # not left to chance.
+        assert f"Entity {ethan_id}" not in result.answer, (
+            f"raw entity ID leaked into the primary scenario's response: {result.answer!r}"
+        )
 
         # =======================================================================
         print(f"\n\n{'#' * 78}\n# SCENARIO 2: entity not found\n{'#' * 78}")
@@ -249,7 +271,13 @@ def main():
 
         # =======================================================================
         print(f"\n\n{'#' * 78}\n# SCENARIO 6: essential tool (primary evidence source) deliberately failing\n{'#' * 78}")
-        original_context_fn = hearth_manager_advice.TOOL_REGISTRY["get_building_context"]["fn"]
+        # run_manager_advice_path()'s Step 2 calls get_building_context(...)
+        # by its module-level name directly (not via TOOL_REGISTRY), so both
+        # the module attribute and the registry entry must be patched — and,
+        # critically, both must be restored, or every scenario run after this
+        # one silently keeps using the broken stub.
+        original_context_module_fn = hearth_manager_advice.get_building_context
+        original_context_registry_fn = hearth_manager_advice.TOOL_REGISTRY["get_building_context"]["fn"]
 
         def _exploding_get_building_context(entity_id):
             return {"status": "error", "data": None, "error": "simulated traversal outage"}
@@ -263,11 +291,42 @@ def main():
                 memory_conn=conn, gemini_client=gemini_client,
             )
         finally:
-            hearth_manager_advice.TOOL_REGISTRY["get_building_context"]["fn"] = original_context_fn
+            hearth_manager_advice.get_building_context = original_context_module_fn
+            hearth_manager_advice.TOOL_REGISTRY["get_building_context"]["fn"] = original_context_registry_fn
 
         _print_result("Scenario 6: essential tool failure (get_building_context)", result)
         assert result.status == "error", f"expected error (fail-closed), got {result.status}"
         assert "don't want to guess" in result.answer.lower() or "couldn't retrieve enough" in result.answer.lower()
+
+        # =======================================================================
+        print(f"\n\n{'#' * 78}\n# SCENARIO 7: raw entity-ID leak in stored belief text must not reach the response\n{'#' * 78}")
+        # Forces get_active_beliefs into the plan deterministically, so this
+        # is guaranteed to exercise the responsiveness belief seeded above
+        # (whose belief_text mirrors hearth_soul.py's actual
+        # f"Entity {entity} has shown episodes resolving..." bug verbatim),
+        # regardless of what the model would have chosen on its own.
+        original_plan_fn = hearth_manager_advice._get_plan_and_tool_selection
+
+        def _forced_beliefs_plan(question_text, display_name, gemini_client):
+            plan, _tools, source = original_plan_fn(question_text, display_name, gemini_client)
+            return plan, ["get_active_beliefs"], source
+
+        hearth_manager_advice._get_plan_and_tool_selection = _forced_beliefs_plan
+        try:
+            result = hearth_ask.answer_question(
+                "I noticed Ethan has not been going live much lately and I was "
+                "thinking about reaching out to him. What do you think?",
+                memory_conn=conn, gemini_client=gemini_client,
+            )
+        finally:
+            hearth_manager_advice._get_plan_and_tool_selection = original_plan_fn
+
+        _print_result("Scenario 7: raw entity-ID leak must resolve to display name", result)
+        assert result.status == "success", f"expected success, got {result.status}"
+        assert f"Entity {ethan_id}" not in result.answer, (
+            f"raw entity ID 'Entity {ethan_id}' leaked into the rendered response: {result.answer!r}"
+        )
+        assert "Ethan" in result.answer, "expected the resolved display name 'Ethan' to appear instead"
 
         print("\n\nAll manager-advice scenario assertions passed.")
 

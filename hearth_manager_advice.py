@@ -664,12 +664,64 @@ _EVIDENCE_RENDERERS = {
 }
 
 
+# --- Raw entity-ID leak fix ---------------------------------------------
+#
+# Root cause: several of hearth_soul.py's Worldview writers embed the raw
+# numeric entity_id directly into stored free text instead of a resolved
+# display name — e.g. _upsert_responsiveness_belief()'s
+# `belief_text=f"Entity {entity} has shown episodes resolving..."`, and the
+# same pattern in _upsert_entity_repeat_uncertainty() (uncertainty_text,
+# possible_question) and _upsert_creator_quiet_watch() (change_text). This
+# is inconsistent with _upsert_engagement_momentum_belief(), which already
+# resolves to display_name correctly before writing. That inconsistency
+# lives in hearth_soul.py's write path and is explicitly out of scope here
+# (see module docstring / completion report) — this module never writes
+# Worldview and does not touch how that text is stored.
+#
+# This is a rendering-time fix: every tool's rendered text passes through
+# _resolve_entity_id_mentions() before reaching a response, so a raw
+# "Entity 31" reference is caught and resolved to "Ethan" wherever it
+# appears — not just in belief text, in case the same leak class shows up
+# in any of the other five tools' output in the future.
+_ENTITY_ID_MENTION_RE = re.compile(r"\bEntity\s+(\d+)\b", re.IGNORECASE)
+
+
+def _resolve_entity_id_mentions(text: str) -> str:
+    """Replace every raw 'Entity <id>' reference in text with its resolved
+    display name. Leaves text untouched if it contains no such reference.
+    A referenced id that no longer resolves (e.g. a deleted Building) is
+    rendered as "an unresolved Building (id N)" rather than silently
+    dropped or invented — consistent with never fabricating a name.
+    """
+    if not text or not _ENTITY_ID_MENTION_RE.search(text):
+        return text
+
+    cache = {}
+    conn = hearth_memory.get_memory_connection()
+    try:
+        def _replace(match):
+            raw_id = match.group(1)
+            if raw_id not in cache:
+                row = conn.execute(
+                    "SELECT display_name FROM hearth_entities WHERE id = ?;", (int(raw_id),),
+                ).fetchone()
+                cache[raw_id] = row["display_name"] if row and row["display_name"] else None
+            return cache[raw_id] or f"an unresolved Building (id {raw_id})"
+
+        return _ENTITY_ID_MENTION_RE.sub(_replace, text)
+    except Exception as exc:
+        logger.warning("[manager_advice] entity-id-mention resolution failed, leaving text as-is: %s", exc)
+        return text
+    finally:
+        conn.close()
+
+
 def _render_evidence_block(display_name: str, evidence: dict) -> str:
     lines = _render_building_context(display_name, evidence.get("get_building_context") or {})
     for tool_name in OPTIONAL_TOOL_NAMES:
         if tool_name in evidence:
             lines += _EVIDENCE_RENDERERS[tool_name](evidence[tool_name])
-    return "\n".join(lines)
+    return _resolve_entity_id_mentions("\n".join(lines))
 
 
 # This scenario-specific gap (HEARTH_TOOLSET_MANAGER_ADVICE_SCENARIO.md
