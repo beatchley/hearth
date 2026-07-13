@@ -75,12 +75,17 @@ class AskHearthResult:
     (hearth_manager_advice.run_manager_advice_path()) — the structured
     retrieval plan (goal/known/to_verify) it produced, made inspectable
     rather than only logged. None for every other route/status, unchanged.
+    validation is populated only by that same path — the Phase 5 Grounded
+    Assertions validation record (hearth_assertion_validation.py) for the
+    assertions actually rendered into `answer`, made inspectable the same
+    way `plan` already is. None for every other route/status.
     """
     status: str
     answer: str
     source_summary: str
     entity_id: Optional[int] = None
     plan: Optional[dict] = None
+    validation: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------

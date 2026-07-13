@@ -44,6 +44,15 @@ so the collision cannot leak into this registry — see TOOL_REGISTRY.
 Does not modify: hearth_ask.py's three existing fixed-pattern routes,
 hearth_traversal.py, hearth_context.py, hearth_soul.py, hearth_worldview.py,
 hearth_entity_resolution.py, or any watcher/detector code.
+
+Phase 5 addition: _construct_response() no longer asks Gemini to write the
+final three-header prose directly. It now asks for a structured list of
+individual assertions (category + text + evidence_quote), which
+hearth_assertion_validation.py deterministically validates and corrects
+before hearth_assertion_validation.render_assertions() builds the final
+conversational text. See that module's docstring for the full validation
+architecture (Grounded Assertions, Phase 5) — this module's tool-call
+budget, eligibility gate, and retrieval planning are unchanged by it.
 """
 
 import json
@@ -52,6 +61,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+import hearth_assertion_validation
 import hearth_memory
 import hearth_traversal
 import hearth_worldview
@@ -736,27 +746,14 @@ _LIVESTREAM_GAP_NOTE = (
 )
 
 
-def _render_raw_three_part_text(display_name: str, plan: dict, evidence: dict, limitations: list) -> str:
-    """Deterministic fallback rendering — used verbatim if Gemini is
-    unavailable or fails. Preserves the Hearth Knowledge / General Reasoning
-    / Uncertainty separation even with zero model involvement, per
-    HEARTH_COGNITIVE_PROCESS.md Section 7 (this separation is settled
-    architecture, not an implementation detail Gemini's absence may collapse).
-    """
-    lines = ["Hearth Knowledge:", _render_evidence_block(display_name, evidence), ""]
-    lines += [
-        "General Reasoning:",
-        "Hearth's reasoning layer wasn't available to synthesize an opinion this "
-        "time — the evidence above is shown as retrieved, without added interpretation.",
-        "",
-    ]
-    lines.append("Uncertainty:")
-    for item in limitations:
-        lines.append(f"- {item}")
-    return "\n".join(lines)
+# Phase 5: initial attempt + one retry on a Category A (malformed structure)
+# or Category B (ungrounded knowledge assertion) failure, per the Grounded
+# Assertions build brief. Never more than one retry — see
+# hearth_assertion_validation.close_out_ungrounded_knowledge()'s docstring
+# for why a second failure converts rather than loops again.
+_MAX_ASSERTION_ATTEMPTS = 2
 
-
-_RESPONSE_PROMPT_TEMPLATE = """You are Hearth, answering a manager's request for advice about {display_name}. Use ONLY the retrieved evidence below — do not invent facts, and do not assume anything the evidence doesn't support.
+_ASSERTION_PROMPT_TEMPLATE = """You are Hearth, forming an internal set of assertions to answer a manager's request for advice about {display_name}. Do not write your final prose yet — you are producing structured claims that a deterministic system will validate before any of this reaches the manager.
 
 Manager's message: "{question_text}"
 
@@ -771,27 +768,62 @@ Retrieved evidence:
 Known limitations for this answer:
 {limitations_block}
 
-Write your answer in three clearly separated parts, in this order, using these exact three headers on their own line:
+Return ONLY a JSON object with one key, "assertions": a list of individual claims. Each item must have exactly these fields:
+{{
+  "category": "knowledge" | "reasoning" | "uncertainty",
+  "text": "<one clear, natural sentence, the way a trusted colleague would say it>",
+  "evidence_quote": "<exact substring copied character-for-character from the Retrieved Evidence above, or null>"
+}}
 
-Hearth Knowledge:
-Only what is directly grounded in the retrieved evidence above — cite specifics (episode types, dates, state values, beliefs, watched changes) rather than vague summary. If a category has no recorded signal, say so plainly rather than omitting it.
+Category rules:
+- "knowledge": a claim you can point to directly in the Retrieved Evidence above. evidence_quote is REQUIRED and must be an exact, verbatim substring of the Retrieved Evidence — do not paraphrase it, do not fix typos or punctuation. If you cannot quote it exactly, do not use this category; use "uncertainty" instead.
+- "reasoning": your own professional judgment or synthesis going beyond the raw evidence — e.g. what this pattern of evidence suggests, or advice about reaching out. This is where a real opinion belongs, since the manager asked "what do you think." evidence_quote must be null.
+- "uncertainty": something you genuinely do not know or cannot verify given what's available, including anything from the Known limitations list above and the livestream-signal gap if it's listed. evidence_quote must be null.
 
-General Reasoning:
-Your own judgment or synthesis going beyond the raw evidence above — e.g. what this pattern of evidence suggests, or general advice about reaching out. Make clear this is your own reasoning, not something retrieved from Hearth's memory. This is where a real opinion belongs, since the manager asked "what do you think."
-
-Uncertainty:
-What remains genuinely unclear or unverifiable given what's available, including anything in the limitations list above and the livestream-signal gap if it's listed.
-
-Do not blend these three sections together. Do not perform helpfulness with filler phrases ("it's worth noting", "I wanted to flag", "hope this helps"). Be warm, calm, specific, and honest about limits — the way a trusted colleague speaks, not a report.
+Rules:
+- Never invent or approximate an evidence_quote. A fabricated quote is worse than no knowledge claim at all — use "uncertainty" if you are not sure.
+- Include at least one "reasoning" assertion and at least one "uncertainty" assertion. Include "knowledge" assertions only where the evidence above actually supports them.
+- Do not blend categories within one assertion's text.
+- Do not perform helpfulness with filler phrases ("it's worth noting", "I wanted to flag", "hope this helps"). Be warm, calm, and specific — the way a trusted colleague speaks, not a report.
+- Return ONLY valid JSON, no markdown, no explanation.
 """
 
 
-def _construct_response(question_text, display_name, plan, evidence, limitations, gemini_client):
-    raw_text = _render_raw_three_part_text(display_name, plan, evidence, limitations)
-    if gemini_client is None:
-        return raw_text
+def _call_assertion_gemini(prompt: str, gemini_client):
+    """Best-effort structured-JSON call for one assertion-generation attempt.
+    Returns a parsed object, or None on any failure — validate_assertions()
+    treats None the same as any other malformed shape (Category A)."""
+    try:
+        response = gemini_client.models.generate_content(model=GEMINI_MODEL_NAME, contents=prompt)
+        raw = response.text.strip() if response.text else ""
+    except Exception as exc:
+        logger.warning("[manager_advice] assertion-generation Gemini call failed: %s", exc)
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("[manager_advice] assertion-generation response not valid JSON: %r", raw[:200])
+        return None
 
-    prompt = _RESPONSE_PROMPT_TEMPLATE.format(
+
+def _construct_response(question_text, display_name, plan, evidence, limitations, gemini_client):
+    """Phase 5 response construction: propose structured assertions, validate
+    them deterministically, render only what survives validation. Returns
+    (answer_text, ValidationOutcome) — the caller exposes the outcome on the
+    result dict (mirroring how `plan` was already made inspectable in Phase 4)
+    rather than only logging it.
+    """
+    evidence_pool = hearth_assertion_validation.build_evidence_pool(evidence, resolve_fn=_resolve_entity_id_mentions)
+
+    if gemini_client is None:
+        assertions = hearth_assertion_validation.deterministic_fallback_assertions(evidence_pool, limitations)
+        outcome = hearth_assertion_validation.ValidationOutcome(
+            ok=True, assertions=assertions, failure_category=None,
+            notes=["gemini_unavailable: deterministic fallback assertions rendered"],
+        )
+        return hearth_assertion_validation.render_assertions(assertions), outcome
+
+    prompt = _ASSERTION_PROMPT_TEMPLATE.format(
         display_name=display_name,
         question_text=question_text,
         goal=plan.get("goal", ""),
@@ -800,13 +832,31 @@ def _construct_response(question_text, display_name, plan, evidence, limitations
         evidence_block=_render_evidence_block(display_name, evidence),
         limitations_block="\n".join(f"- {item}" for item in limitations) if limitations else "- none",
     )
-    try:
-        response = gemini_client.models.generate_content(model=GEMINI_MODEL_NAME, contents=prompt)
-        text = response.text.strip() if response.text else None
-    except Exception as exc:
-        logger.warning("[manager_advice] response-construction Gemini call failed, using raw text: %s", exc)
-        text = None
-    return text if text else raw_text
+
+    outcome = None
+    for attempt in range(_MAX_ASSERTION_ATTEMPTS):
+        parsed = _call_assertion_gemini(prompt, gemini_client)
+        outcome = hearth_assertion_validation.validate_assertions(parsed, evidence_pool)
+        if outcome.failure_category not in ("A", "B"):
+            break
+        logger.info(
+            "[manager_advice] assertion validation failure_category=%s on attempt %d: %s",
+            outcome.failure_category, attempt + 1, outcome.notes,
+        )
+
+    if outcome.failure_category == "A":
+        # Category A persisted through the retry: fall back to deterministic
+        # assertions built straight from evidence, same as gemini_client=None
+        # above — never render nothing, never render unvalidated model prose.
+        assertions = hearth_assertion_validation.deterministic_fallback_assertions(evidence_pool, limitations)
+        outcome = hearth_assertion_validation.ValidationOutcome(
+            ok=True, assertions=assertions, failure_category=None,
+            notes=outcome.notes + ["Category A persisted after retry: deterministic fallback assertions rendered instead."],
+        )
+    elif outcome.failure_category == "B":
+        outcome = hearth_assertion_validation.close_out_ungrounded_knowledge(outcome)
+
+    return hearth_assertion_validation.render_assertions(outcome.assertions), outcome
 
 
 # --- Fail-closed builders ---------------------------------------------------
@@ -940,8 +990,12 @@ def run_manager_advice_path(question_text: str, candidate_name: str, gemini_clie
     # Section 6 — an internal check, not a second model call).
     assert tool_calls_made <= TOOL_CALL_CEILING, "tool-call ceiling must never be exceeded"
 
-    # Step 6 (respond): three-way separated construction.
-    answer_text = _construct_response(question_text, display_name, plan, evidence, limitations, gemini_client)
+    # Step 6 (respond): propose assertions, validate deterministically
+    # (Phase 5 — see hearth_assertion_validation.py), render only what
+    # survives validation.
+    answer_text, validation_outcome = _construct_response(
+        question_text, display_name, plan, evidence, limitations, gemini_client,
+    )
 
     checked = ", ".join(evidence.keys())
     source_summary = f"Manager-advice cognitive path ({tool_calls_made} tool call(s)) checked: {checked}."
@@ -959,6 +1013,21 @@ def run_manager_advice_path(question_text: str, candidate_name: str, gemini_clie
         # ultimately called. Generation is unchanged; this only exposes the
         # already-generated plan object (see Step 3 above).
         "plan": plan,
+        # Phase 5: internal validation record — never rendered to the
+        # manager, but inspectable the same way `plan` already is. See
+        # hearth_assertion_validation.ValidationOutcome.
+        "validation": {
+            "ok": validation_outcome.ok,
+            "failure_category": validation_outcome.failure_category,
+            "notes": validation_outcome.notes,
+            "assertions": [
+                {
+                    "category": a.category, "text": a.text,
+                    "evidence_quote": a.evidence_quote, "source": a.source,
+                }
+                for a in validation_outcome.assertions
+            ],
+        },
     }
 
 
