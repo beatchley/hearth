@@ -66,11 +66,17 @@ class RoutedQuestion:
 class AskHearthResult:
     """The structured result the future Flask layer renders.
 
-    status is one of: success, unsupported, ambiguous, not_found, error.
+    status is one of: success, unsupported, ambiguous, not_found, error,
+    not_authorized. not_authorized (Phase 6) is returned only by the
+    manager-advice cognitive path when actor_role isn't one of
+    hearth_manager_advice.AUTHORIZED_ACTOR_ROLES — distinct from
+    unsupported (the question shape wasn't recognized) and from error (a
+    retrieval failure): this specifically means the actor isn't allowed to
+    ask this kind of question at all, regardless of content.
     entity_id is populated whenever a specific Building was resolved (success
     or a retrieval error after resolution), so a future Inspector link can be
     built from it — it is None for needs_attention_today, unsupported,
-    ambiguous, and not_found.
+    ambiguous, not_found, and not_authorized.
     plan is populated only by the manager-advice cognitive path
     (hearth_manager_advice.run_manager_advice_path()) — the structured
     retrieval plan (goal/known/to_verify) it produced, made inspectable
@@ -475,13 +481,22 @@ def _answer_needs_attention_today(memory_conn, gemini_client) -> AskHearthResult
 # Top-level entry point
 # ---------------------------------------------------------------------------
 
-def answer_question(question_text: str, memory_conn=None, gemini_client=None) -> AskHearthResult:
+def answer_question(question_text: str, memory_conn=None, gemini_client=None, actor_role: Optional[str] = None) -> AskHearthResult:
     """Answer one free-text manager question. The only public entry point
     a future Flask layer should call.
 
     memory_conn is optional — if not provided, this opens and closes its own
     connection. gemini_client is optional — if not provided (or if it fails),
     the raw retrieved summary is returned instead of prose, never nothing.
+
+    actor_role (Phase 6): the calling user's role (e.g. "ceo", "manager",
+    "it", "coach"), passed straight through to the manager-advice cognitive
+    path, which independently refuses to run unless it's one of
+    hearth_manager_advice.AUTHORIZED_ACTOR_ROLES — the same role set
+    /admin/hearth/ask already gates on at the Flask route level. This is an
+    additional check, not a replacement for that route-level gate. The
+    three fixed patterns below are unaffected by actor_role — that gap, if
+    any, is out of this phase's scope (see completion report).
     """
     owns_conn = memory_conn is None
     if owns_conn:
@@ -501,7 +516,7 @@ def answer_question(question_text: str, memory_conn=None, gemini_client=None) ->
             # collapse) applies once, to every route, not just the three
             # fixed patterns.
             advice_result, _gate = hearth_manager_advice.answer_manager_advice_question(
-                _normalize_question_text(question_text), memory_conn, gemini_client,
+                _normalize_question_text(question_text), memory_conn, gemini_client, actor_role,
             )
             if advice_result is not None:
                 return AskHearthResult(**advice_result)

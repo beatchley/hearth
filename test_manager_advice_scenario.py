@@ -180,7 +180,7 @@ def main():
         result = hearth_ask.answer_question(
             "I noticed Ethan has not been going live much lately and I was thinking "
             "about reaching out to him. What do you think?",
-            memory_conn=conn, gemini_client=gemini_client,
+            memory_conn=conn, gemini_client=gemini_client, actor_role="manager",
         )
         _print_result("Scenario 1: Toxie/Ethan (primary scenario)", result)
         assert result.status == "success", f"expected success, got {result.status}"
@@ -202,7 +202,7 @@ def main():
         result = hearth_ask.answer_question(
             f"I noticed {GHOST_NAME} has not been going live much lately and I was "
             "thinking about reaching out. What do you think?",
-            memory_conn=conn, gemini_client=gemini_client,
+            memory_conn=conn, gemini_client=gemini_client, actor_role="manager",
         )
         _print_result("Scenario 2: entity not found", result)
         assert result.status == "not_found", f"expected not_found, got {result.status}: {result.answer}"
@@ -212,7 +212,7 @@ def main():
         result = hearth_ask.answer_question(
             f"I noticed {DUP_NAME} hasn't been very active lately — what do you think, "
             "should I reach out?",
-            memory_conn=conn, gemini_client=gemini_client,
+            memory_conn=conn, gemini_client=gemini_client, actor_role="manager",
         )
         _print_result("Scenario 3: ambiguous entity", result)
         assert result.status == "ambiguous", f"expected ambiguous, got {result.status}: {result.answer}"
@@ -231,7 +231,7 @@ def main():
         print(f"\n\n{'#' * 78}\n# SCENARIO 4b: ordinary conversation, no advice-seeking intent\n{'#' * 78}")
         result = hearth_ask.answer_question(
             f"{ETHAN_NAME} is one of my favorite creators, his content is really funny.",
-            memory_conn=conn, gemini_client=gemini_client,
+            memory_conn=conn, gemini_client=gemini_client, actor_role="manager",
         )
         _print_result("Scenario 4b: no advice-seeking intent", result)
         assert result.status == "unsupported", f"expected unsupported, got {result.status}: {result.answer}"
@@ -258,7 +258,7 @@ def main():
                 result = hearth_ask.answer_question(
                     "I noticed Ethan has not been going live much lately and I was "
                     "thinking about reaching out to him. What do you think?",
-                    memory_conn=conn, gemini_client=gemini_client,
+                    memory_conn=conn, gemini_client=gemini_client, actor_role="manager",
                 )
             finally:
                 hearth_manager_advice._get_plan_and_tool_selection = original_plan_fn
@@ -288,7 +288,7 @@ def main():
             result = hearth_ask.answer_question(
                 "I noticed Ethan has not been going live much lately and I was "
                 "thinking about reaching out to him. What do you think?",
-                memory_conn=conn, gemini_client=gemini_client,
+                memory_conn=conn, gemini_client=gemini_client, actor_role="manager",
             )
         finally:
             hearth_manager_advice.get_building_context = original_context_module_fn
@@ -316,7 +316,7 @@ def main():
             result = hearth_ask.answer_question(
                 "I noticed Ethan has not been going live much lately and I was "
                 "thinking about reaching out to him. What do you think?",
-                memory_conn=conn, gemini_client=gemini_client,
+                memory_conn=conn, gemini_client=gemini_client, actor_role="manager",
             )
         finally:
             hearth_manager_advice._get_plan_and_tool_selection = original_plan_fn
@@ -343,12 +343,77 @@ def main():
         result = hearth_ask.answer_question(
             '"I noticed Ethan has not been going live much lately and I was '
             'thinking about reaching out to him. What do you think?"',
-            memory_conn=conn, gemini_client=gemini_client,
+            memory_conn=conn, gemini_client=gemini_client, actor_role="manager",
         )
         _print_result("Scenario 8: quote-wrapped input, manager-advice path", result)
         assert result.status == "success", f"expected success, got {result.status}: {result.answer}"
         assert result.entity_id == ethan_id
         assert result.plan is not None
+
+        # =======================================================================
+        print(f"\n\n{'#' * 78}\n# SCENARIO 9 (Phase 6): each authorized role reaches the path exactly as before\n{'#' * 78}")
+        for role in ("ceo", "manager", "it"):
+            result = hearth_ask.answer_question(
+                "I noticed Ethan has not been going live much lately and I was "
+                "thinking about reaching out to him. What do you think?",
+                memory_conn=conn, gemini_client=gemini_client, actor_role=role,
+            )
+            _print_result(f"Scenario 9: authorized role={role!r}", result)
+            assert result.status == "success", f"role={role!r} expected success, got {result.status}: {result.answer}"
+            assert result.entity_id == ethan_id
+            assert result.plan is not None
+
+        # =======================================================================
+        print(f"\n\n{'#' * 78}\n# SCENARIO 10 (Phase 6): unauthorized role (coach) refused before any retrieval\n{'#' * 78}")
+        # Every function the eligibility gate or the cognitive path could
+        # possibly call is patched to raise if invoked at all — this proves
+        # the Phase 6 authorization check happens strictly before any of
+        # them, not merely that the final answer happens to look denied.
+        _explode = lambda *a, **k: (_ for _ in ()).throw(AssertionError("unauthorized actor reached retrieval"))
+
+        patched_targets = [
+            (hearth_manager_advice, "check_entity_mentions"),
+            (hearth_manager_advice, "classify_manager_advice_intent"),
+            (hearth_manager_advice, "resolve_building_by_name"),
+            (hearth_manager_advice, "get_building_context"),
+        ]
+        originals = [(obj, name, getattr(obj, name)) for obj, name in patched_targets]
+        tool_registry_originals = {
+            name: entry["fn"] for name, entry in hearth_manager_advice.TOOL_REGISTRY.items()
+        }
+        try:
+            for obj, name, _orig in originals:
+                setattr(obj, name, _explode)
+            for name in hearth_manager_advice.TOOL_REGISTRY:
+                hearth_manager_advice.TOOL_REGISTRY[name]["fn"] = _explode
+
+            result = hearth_ask.answer_question(
+                "I noticed Ethan has not been going live much lately and I was "
+                "thinking about reaching out to him. What do you think?",
+                memory_conn=conn, gemini_client=gemini_client, actor_role="coach",
+            )
+        finally:
+            for obj, name, orig in originals:
+                setattr(obj, name, orig)
+            for name, fn in tool_registry_originals.items():
+                hearth_manager_advice.TOOL_REGISTRY[name]["fn"] = fn
+
+        _print_result("Scenario 10: unauthorized role (coach)", result)
+        assert result.status == "not_authorized", f"expected not_authorized, got {result.status}: {result.answer}"
+        assert result.entity_id is None
+        assert result.plan is None
+        assert "Ethan" not in result.answer, "denial message must not leak any Building-specific detail"
+
+        # Also confirmed directly against the manager-advice module (no
+        # Flask/hearth_ask indirection), same zero-tool-call guarantee,
+        # for an omitted actor_role (None) — the fail-closed default.
+        advice_result, gate = hearth_manager_advice.answer_manager_advice_question(
+            "I noticed Ethan has not been going live much lately and I was "
+            "thinking about reaching out to him. What do you think?",
+            conn, gemini_client, actor_role=None,
+        )
+        assert advice_result["status"] == "not_authorized"
+        assert gate is None, "eligibility gate must never run when authorization fails first"
 
         print("\n\nAll manager-advice scenario assertions passed.")
 

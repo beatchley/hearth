@@ -53,6 +53,17 @@ before hearth_assertion_validation.render_assertions() builds the final
 conversational text. See that module's docstring for the full validation
 architecture (Grounded Assertions, Phase 5) — this module's tool-call
 budget, eligibility gate, and retrieval planning are unchanged by it.
+
+Phase 6 addition: this module is no longer authority-blind. Both
+answer_manager_advice_question() and run_manager_advice_path() now require
+an actor_role argument and refuse — before the eligibility gate, before any
+tool call — unless it is one of AUTHORIZED_ACTOR_ROLES ("ceo", "manager",
+"it"), the same literal role set /admin/hearth/ask already gates on at the
+Flask route level. That route-level gate is unchanged and remains in place;
+this is an additional, structural guarantee inside the cognitive path
+itself, not a replacement for it. Coach/creator access is explicitly out of
+scope. See the "1b. Authorization" section below and the Phase 6 completion
+report.
 """
 
 import json
@@ -331,6 +342,59 @@ _TOOL_LABELS = {
     "get_watched_changes": "watched changes",
     "get_living_uncertainties": "open uncertainties",
 }
+
+
+# ===========================================================================
+# 1b. Authorization — Phase 6.
+#
+# /admin/hearth/ask (the only page that calls this path today) already gates
+# access to ceo/manager/it at the Flask route level
+# (pathway-portal/backend/app/routes/main.py: `if current_user.role not in
+# ("ceo", "manager", "it")`). That gate is correct and unchanged by this
+# phase. What Phase 6 closes is that this module itself — and
+# run_manager_advice_path() specifically — trusted that check had already
+# happened rather than ever confirming it, which meant any future caller
+# (a new endpoint, a script, a scheduled job) could reach real Building
+# evidence with zero authorization. This is now a structural guarantee
+# enforced here, not an accident of "only one gated page currently calls
+# this."
+#
+# AUTHORIZED_ACTOR_ROLES is the exact literal role set already used by that
+# route — same three strings, same casing, deliberately not a new
+# permission model, not pathway-portal's separate has_permission()/
+# permissions.py granular-capability system (that system conflates this
+# coarse ceo/manager/it check with arbitrary per-user granted permissions;
+# see completion report). Coach and creator access are explicitly out of
+# scope — do not add them here without a separate, deliberate policy
+# decision.
+#
+# actor_role is checked before the eligibility gate and before any tool
+# call — an unauthorized or missing actor_role never reaches
+# check_entity_mentions(), classify_manager_advice_intent(), or any of the
+# six tool wrappers. Omitting actor_role entirely fails closed (denied),
+# the same as any other unrecognized role — this function has no implicit
+# "trusted caller" path.
+# ===========================================================================
+
+AUTHORIZED_ACTOR_ROLES = ("ceo", "manager", "it")
+
+_NOT_AUTHORIZED_MESSAGE = "This isn't something Hearth can help with for this account."
+
+
+def is_actor_authorized(actor_role: Optional[str]) -> bool:
+    return actor_role in AUTHORIZED_ACTOR_ROLES
+
+
+def _fail_closed_not_authorized() -> dict:
+    return {
+        "status": "not_authorized",
+        "answer": _NOT_AUTHORIZED_MESSAGE,
+        "source_summary": (
+            "Manager-advice cognitive path — refused before any retrieval: "
+            "actor is not authorized for advice-seeking questions."
+        ),
+        "entity_id": None,
+    }
 
 
 # ===========================================================================
@@ -903,13 +967,25 @@ def _fail_closed_essential_error(display_name: str, error: str, trace: list, ent
 
 # --- Main entry point --------------------------------------------------------
 
-def run_manager_advice_path(question_text: str, candidate_name: str, gemini_client) -> dict:
+def run_manager_advice_path(question_text: str, candidate_name: str, gemini_client, actor_role: Optional[str] = None) -> dict:
     """Run the full cognitive path once eligibility has already been confirmed.
 
     Returns a dict with the same shape as hearth_ask.AskHearthResult's
     fields (status/answer/source_summary/entity_id) — hearth_ask.py
     constructs the dataclass from this.
+
+    Phase 6: re-checks authorization as its own first step, even though
+    answer_manager_advice_question() (this function's only caller today)
+    already checked it before running the eligibility gate. Nothing else
+    calls this function directly today (confirmed during Phase 6's
+    investigation), so this is deliberate defense-in-depth rather than a
+    reachable gap being closed — see completion report. It keeps this
+    function honest on its own terms rather than depending on every future
+    caller to have gone through the one gate that currently exists.
     """
+    if not is_actor_authorized(actor_role):
+        return _fail_closed_not_authorized()
+
     trace = []
     tool_calls_made = 0
 
@@ -1031,15 +1107,26 @@ def run_manager_advice_path(question_text: str, candidate_name: str, gemini_clie
     }
 
 
-def answer_manager_advice_question(question_text: str, memory_conn, gemini_client):
+def answer_manager_advice_question(question_text: str, memory_conn, gemini_client, actor_role: Optional[str] = None):
     """Top-level entry point hearth_ask.answer_question() calls whenever its
     three fixed-pattern routes did not match. Read-only; writes nothing.
 
     Returns (result_dict_or_None, EligibilityResult). result_dict is None
     when the eligibility gate did not pass — the caller must fall through to
     its own existing unsupported response unchanged in that case.
+
+    Phase 6: authorization is checked first, before check_eligibility() —
+    before the entity-mention scan, before the classifier call, before any
+    of the six tool wrappers. An unauthorized (or omitted) actor_role
+    returns a "not_authorized" result_dict immediately and None for the
+    gate, since the eligibility gate never ran; this is distinct from every
+    other status this function can return (success/not_found/ambiguous/
+    error/unsupported-via-None) and must not be confused with any of them.
     """
+    if not is_actor_authorized(actor_role):
+        return _fail_closed_not_authorized(), None
+
     gate = check_eligibility(memory_conn, question_text, gemini_client)
     if not gate.eligible:
         return None, gate
-    return run_manager_advice_path(question_text, gate.candidate_name, gemini_client), gate
+    return run_manager_advice_path(question_text, gate.candidate_name, gemini_client, actor_role), gate
