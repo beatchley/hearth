@@ -27,6 +27,14 @@ silently diverge.
 
 Does not modify: hearth_traversal.py, hearth_context.py, hearth_soul.py,
 hearth_worldview.py, or any watcher/detector code.
+
+Phase 4 addition: when route_question() finds none of the three patterns
+above match, this module now tries one more thing before giving up — the
+bounded manager-advice cognitive path in hearth_manager_advice.py (see that
+module's docstring, and docs/HEARTH_TOOLSET_MANAGER_ADVICE_SCENARIO.md /
+docs/HEARTH_COGNITIVE_PROCESS.md). The three routes above, and route_question()
+itself, are unchanged by this addition — see answer_question()'s
+"unsupported" branch, the only place this is wired in.
 """
 
 import logging
@@ -35,6 +43,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import hearth_context
+import hearth_manager_advice
 import hearth_memory
 import hearth_traversal
 from hearth_entity_resolution import EntityResolution, resolve_entity
@@ -62,11 +71,16 @@ class AskHearthResult:
     or a retrieval error after resolution), so a future Inspector link can be
     built from it — it is None for needs_attention_today, unsupported,
     ambiguous, and not_found.
+    plan is populated only by the manager-advice cognitive path
+    (hearth_manager_advice.run_manager_advice_path()) — the structured
+    retrieval plan (goal/known/to_verify) it produced, made inspectable
+    rather than only logged. None for every other route/status, unchanged.
     """
     status: str
     answer: str
     source_summary: str
     entity_id: Optional[int] = None
+    plan: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +428,16 @@ def answer_question(question_text: str, memory_conn=None, gemini_client=None) ->
         routed = route_question(question_text)
 
         if routed.route == "unsupported":
+            # Phase 4: before giving up, try the bounded manager-advice
+            # cognitive path (docs/HEARTH_TOOLSET_MANAGER_ADVICE_SCENARIO.md).
+            # This does not change routing for anything the three routes
+            # above already handle — route_question()'s patterns are tried
+            # first, unconditionally, and are untouched by this branch.
+            advice_result, _gate = hearth_manager_advice.answer_manager_advice_question(
+                question_text, memory_conn, gemini_client,
+            )
+            if advice_result is not None:
+                return AskHearthResult(**advice_result)
             return AskHearthResult(
                 status="unsupported", answer=_UNSUPPORTED_MESSAGE, source_summary="", entity_id=None,
             )
