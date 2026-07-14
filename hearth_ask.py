@@ -35,6 +35,22 @@ module's docstring, and docs/HEARTH_TOOLSET_MANAGER_ADVICE_SCENARIO.md /
 docs/HEARTH_COGNITIVE_PROCESS.md). The three routes above, and route_question()
 itself, are unchanged by this addition — see answer_question()'s
 "unsupported" branch, the only place this is wired in.
+
+Phase 7a addition: answer_question() now takes an optional attention_frame
+(hearth_attention_frame.AttentionFrame) — Hearth's first session-scoped
+conversational continuity. When present, a pronoun referring to a person
+("he"/"him"/"his"/"she"/"her"/"they"/"them"/"their") is resolved to the
+frame's currently-focused Building's name before routing, so a follow-up
+question doesn't need to restate the name every turn; an entity-less
+follow-up gets the same fallback applied one level deeper, inside the
+manager-advice eligibility gate only (see hearth_manager_advice.py's
+fallback_entity_name). Every turn still runs route_question() or the full
+eligibility gate unchanged, still resolves/re-authorizes from scratch, and
+still completes Grounded Assertions validation before anything is
+returned — continuity can reduce retrieval (reusing a previous turn's
+evidence for the same Building) but never bypasses validation,
+authorization, or entity resolution. With attention_frame=None (the
+default), behavior is byte-for-byte identical to before this phase.
 """
 
 import logging
@@ -42,6 +58,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+import hearth_attention_frame
 import hearth_context
 import hearth_manager_advice
 import hearth_memory
@@ -92,6 +109,14 @@ class AskHearthResult:
     entity_id: Optional[int] = None
     plan: Optional[dict] = None
     validation: Optional[dict] = None
+
+
+# Every field AskHearthResult actually declares — used to filter dicts
+# returned by hearth_manager_advice.py before constructing the dataclass,
+# so an internal-only key that module adds for its own purposes (Phase 7a:
+# "evidence", stashed in the Attention Frame, never rendered to a manager)
+# can never leak into, or break, this dataclass's fixed shape.
+_ASKHEARTHRESULT_FIELDS = {"status", "answer", "source_summary", "entity_id", "plan", "validation"}
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +199,37 @@ def _normalize_question_text(question_text: str) -> str:
     stripped = (question_text or "").strip()
     stripped = _strip_outer_quote_pair(stripped)
     return " ".join(stripped.split())
+
+
+# ---------------------------------------------------------------------------
+# 1b. Attention Frame continuity (Phase 7a) — pronoun resolution only.
+#
+# Deliberately narrow, like every other piece of text handling in this
+# module: only clear third-person-singular/plural pronouns referring to a
+# person are substituted, and only when the frame has a focused Building.
+# This runs on the SAME normalized text every downstream consumer sees
+# (route_question()'s fixed patterns and hearth_manager_advice's
+# entity-mention scan both see the substituted form), so a follow-up like
+# "What is connected to him?" matches _CONNECTED_TO_RE exactly as if the
+# manager had typed the Building's name. A question naming a different,
+# explicit Building is never touched by this — pronoun substitution only
+# ever fires on a pronoun, never on a proper noun.
+# ---------------------------------------------------------------------------
+
+_FOCUS_PRONOUN_RE = re.compile(r"\b(he|him|his|she|her|they|them|their)\b", re.IGNORECASE)
+
+
+def _apply_attention_frame_pronouns(normalized_text: str, attention_frame) -> str:
+    """Substitute person pronouns with the frame's focused Building name.
+
+    No-op (returns normalized_text unchanged) when attention_frame is None,
+    has no focused Building yet, or the text contains no matching pronoun.
+    """
+    if attention_frame is None or not attention_frame.focused_entity_name:
+        return normalized_text
+    if not _FOCUS_PRONOUN_RE.search(normalized_text):
+        return normalized_text
+    return _FOCUS_PRONOUN_RE.sub(attention_frame.focused_entity_name, normalized_text)
 
 
 def route_question(question_text: str) -> RoutedQuestion:
@@ -481,7 +537,54 @@ def _answer_needs_attention_today(memory_conn, gemini_client) -> AskHearthResult
 # Top-level entry point
 # ---------------------------------------------------------------------------
 
-def answer_question(question_text: str, memory_conn=None, gemini_client=None, actor_role: Optional[str] = None) -> AskHearthResult:
+def _update_attention_frame(attention_frame, memory_conn, question_text: str, result: AskHearthResult, evidence: Optional[dict] = None, plan: Optional[dict] = None) -> None:
+    """Phase 7a: record this turn's outcome into the Attention Frame.
+
+    A no-op whenever attention_frame is None — every call site above
+    passes it through unconditionally so behavior with no frame is
+    identical to before this phase existed.
+
+    Only ever updates focused_entity_id/name when this turn actually
+    resolved a Building (result.entity_id is set) — a turn that didn't
+    resolve one (needs_attention_today, unsupported, not_found, ambiguous,
+    not_authorized) leaves a still-relevant earlier focus untouched rather
+    than clobbering it. The display name is looked up fresh from
+    hearth_entities here (not threaded through AskHearthResult, which has
+    no such field) — a single, cheap, read-only lookup.
+
+    This function stores a pointer to what was retrieved, never the
+    retrieved content as asserted fact — see module docstring's
+    Foundational Principle. It does not validate anything and must never
+    be treated as having done so.
+    """
+    if attention_frame is None:
+        return
+
+    attention_frame.turn_count += 1
+    attention_frame.goal = question_text
+    attention_frame.touch()
+
+    if result.entity_id is not None:
+        row = memory_conn.execute(
+            "SELECT display_name FROM hearth_entities WHERE id = ?;", (result.entity_id,)
+        ).fetchone()
+        if row and row["display_name"]:
+            attention_frame.focused_entity_id = result.entity_id
+            attention_frame.focused_entity_name = row["display_name"]
+
+    if evidence is not None:
+        attention_frame.last_evidence = evidence
+    if plan is not None:
+        attention_frame.last_plan = plan
+
+
+def answer_question(
+    question_text: str,
+    memory_conn=None,
+    gemini_client=None,
+    actor_role: Optional[str] = None,
+    attention_frame: Optional[hearth_attention_frame.AttentionFrame] = None,
+) -> AskHearthResult:
     """Answer one free-text manager question. The only public entry point
     a future Flask layer should call.
 
@@ -497,12 +600,29 @@ def answer_question(question_text: str, memory_conn=None, gemini_client=None, ac
     additional check, not a replacement for that route-level gate. The
     three fixed patterns below are unaffected by actor_role — that gap, if
     any, is out of this phase's scope (see completion report).
+
+    attention_frame (Phase 7a, optional, default None): the caller's
+    session-scoped hearth_attention_frame.AttentionFrame, if a conversation
+    is active. See module docstring's "Phase 7a addition" for what this
+    changes (pronoun resolution before routing, evidence reuse in the
+    manager-advice path) and, just as importantly, what it never changes:
+    routing itself, entity resolution, authorization, and Grounded
+    Assertions validation all run exactly as they would with no frame at
+    all. Every return path below updates the frame (a no-op if None) right
+    before returning, so the frame always reflects the most recent turn's
+    outcome by the time this function returns.
     """
     owns_conn = memory_conn is None
     if owns_conn:
         memory_conn = hearth_memory.get_memory_connection()
     try:
-        routed = route_question(question_text)
+        # Phase 7a: one shared normalization + pronoun-resolution pass, seen
+        # identically by route_question() below and by the manager-advice
+        # gate's entity-mention scan — see _apply_attention_frame_pronouns().
+        normalized = _normalize_question_text(question_text)
+        resolved_text = _apply_attention_frame_pronouns(normalized, attention_frame)
+
+        routed = route_question(resolved_text)
 
         if routed.route == "unsupported":
             # Phase 4: before giving up, try the bounded manager-advice
@@ -510,37 +630,54 @@ def answer_question(question_text: str, memory_conn=None, gemini_client=None, ac
             # This does not change routing for anything the three routes
             # above already handle — route_question()'s patterns are tried
             # first, unconditionally, and are untouched by this branch.
-            # Passes the same normalized text route_question() itself
-            # matched against (not the raw question_text) — the shared
+            # Passes the same pronoun-resolved, normalized text
+            # route_question() itself matched against — the shared
             # normalization step (outer-quote stripping, whitespace
-            # collapse) applies once, to every route, not just the three
-            # fixed patterns.
+            # collapse, Phase 7a pronoun resolution) applies once, to every
+            # route, not just the three fixed patterns.
+            fallback_name = attention_frame.focused_entity_name if attention_frame else None
+            prior_evidence = attention_frame.last_evidence if attention_frame else None
+            prior_entity_id = attention_frame.focused_entity_id if attention_frame else None
             advice_result, _gate = hearth_manager_advice.answer_manager_advice_question(
-                _normalize_question_text(question_text), memory_conn, gemini_client, actor_role,
+                resolved_text, memory_conn, gemini_client, actor_role,
+                fallback_entity_name=fallback_name,
+                prior_evidence=prior_evidence,
+                prior_entity_id=prior_entity_id,
             )
             if advice_result is not None:
-                return AskHearthResult(**advice_result)
-            return AskHearthResult(
+                evidence = advice_result.get("evidence")
+                plan = advice_result.get("plan")
+                filtered = {k: v for k, v in advice_result.items() if k in _ASKHEARTHRESULT_FIELDS}
+                result = AskHearthResult(**filtered)
+                _update_attention_frame(attention_frame, memory_conn, question_text, result, evidence=evidence, plan=plan)
+                return result
+            result = AskHearthResult(
                 status="unsupported", answer=_UNSUPPORTED_MESSAGE, source_summary="", entity_id=None,
             )
+            _update_attention_frame(attention_frame, memory_conn, question_text, result)
+            return result
 
         if routed.route == "needs_attention_today":
-            return _answer_needs_attention_today(memory_conn, gemini_client)
+            result = _answer_needs_attention_today(memory_conn, gemini_client)
+            _update_attention_frame(attention_frame, memory_conn, question_text, result)
+            return result
 
         # tell_me_about_entity / connected_to_entity — both need entity resolution
         resolution = resolve_entity(memory_conn, routed.entity_query)
 
         if resolution.status == "not_found":
-            return AskHearthResult(
+            result = AskHearthResult(
                 status="not_found",
                 answer=f"I couldn't find a Building matching '{routed.entity_query}'.",
                 source_summary="",
                 entity_id=None,
             )
+            _update_attention_frame(attention_frame, memory_conn, question_text, result)
+            return result
 
         if resolution.status == "ambiguous":
             names = ", ".join(resolution.candidate_names)
-            return AskHearthResult(
+            result = AskHearthResult(
                 status="ambiguous",
                 answer=(
                     f"I found more than one Building matching '{routed.entity_query}': "
@@ -549,12 +686,16 @@ def answer_question(question_text: str, memory_conn=None, gemini_client=None, ac
                 source_summary="",
                 entity_id=None,
             )
+            _update_attention_frame(attention_frame, memory_conn, question_text, result)
+            return result
 
-        return _answer_entity_question(
+        result = _answer_entity_question(
             resolution.entity_id,
             emphasize_connections=(routed.route == "connected_to_entity"),
             gemini_client=gemini_client,
         )
+        _update_attention_frame(attention_frame, memory_conn, question_text, result)
+        return result
     except Exception as exc:
         return AskHearthResult(
             status="error",

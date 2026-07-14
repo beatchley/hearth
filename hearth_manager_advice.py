@@ -374,6 +374,11 @@ _TOOL_LABELS = {
 # six tool wrappers. Omitting actor_role entirely fails closed (denied),
 # the same as any other unrecognized role — this function has no implicit
 # "trusted caller" path.
+#
+# Phase 7a: this authorization check is unaffected by, and runs before,
+# any Attention Frame continuity input (fallback_entity_name/prior_evidence
+# below) — a frame can help identify *who* a follow-up is about, never
+# bypass whether the actor is allowed to ask at all.
 # ===========================================================================
 
 AUTHORIZED_ACTOR_ROLES = ("ceo", "manager", "it")
@@ -459,7 +464,7 @@ def _extract_capitalized_spans(text: str) -> list:
     return deduped
 
 
-def check_entity_mentions(memory_conn, text: str):
+def check_entity_mentions(memory_conn, text: str, fallback_entity_name: Optional[str] = None):
     """Deterministic half 1 of the eligibility gate.
 
     Returns (status, name) where status is "one" / "none" / "multiple".
@@ -475,6 +480,16 @@ def check_entity_mentions(memory_conn, text: str):
     "ambiguous" and stop before any further retrieval. Two *different* names
     mentioned (e.g. "Ethan and Sarah") correctly fail this check as multiple
     candidate Buildings, per the Phase 4 build brief.
+
+    fallback_entity_name (Phase 7a): the Attention Frame's currently-focused
+    Building, if any — used only when the text names zero candidates at all
+    ("none"). This is how a completely entity-less follow-up ("What do you
+    think about that?") keeps referring to whichever Building the
+    conversation already centers on, without the fixed-pattern regex routes
+    or the capitalized-span heuristic needing to know anything about
+    conversation history. It never overrides a name the text actually
+    mentions — "one" and "multiple" are decided from the text alone, exactly
+    as before this parameter existed.
     """
     known_rows = find_entity_mentions(memory_conn, text)
     distinct_names = sorted({row["display_name"] for row in known_rows if row["display_name"]})
@@ -488,6 +503,9 @@ def check_entity_mentions(memory_conn, text: str):
         return "one", spans[0]
     if len(spans) > 1:
         return "multiple", None
+
+    if fallback_entity_name:
+        return "one", fallback_entity_name
     return "none", None
 
 
@@ -558,13 +576,21 @@ def classify_manager_advice_intent(text: str, candidate_name: str, gemini_client
     return is_seeking, confidence
 
 
-def check_eligibility(memory_conn, text: str, gemini_client) -> EligibilityResult:
+def check_eligibility(
+    memory_conn, text: str, gemini_client, fallback_entity_name: Optional[str] = None,
+) -> EligibilityResult:
     """Run both halves of the eligibility gate. Both must pass.
 
     Consistent with HEARTH_CANONICAL_IDENTITY.md Section 10: when
     eligibility is unclear, do not proceed into the cognitive path.
+
+    fallback_entity_name (Phase 7a): passed straight through to
+    check_entity_mentions() — see that function's docstring. The
+    classifier call below still runs, and still independently decides
+    whether the (possibly frame-resolved) message is genuinely
+    advice-seeking; continuity only helps identify *who*, never *whether*.
     """
-    mention_status, name = check_entity_mentions(memory_conn, text)
+    mention_status, name = check_entity_mentions(memory_conn, text, fallback_entity_name=fallback_entity_name)
     if mention_status != "one":
         return EligibilityResult(eligible=False, reason=f"entity_mention_check={mention_status}")
 
@@ -967,12 +993,24 @@ def _fail_closed_essential_error(display_name: str, error: str, trace: list, ent
 
 # --- Main entry point --------------------------------------------------------
 
-def run_manager_advice_path(question_text: str, candidate_name: str, gemini_client, actor_role: Optional[str] = None) -> dict:
+def run_manager_advice_path(
+    question_text: str,
+    candidate_name: str,
+    gemini_client,
+    actor_role: Optional[str] = None,
+    prior_evidence: Optional[dict] = None,
+    prior_entity_id: Optional[int] = None,
+) -> dict:
     """Run the full cognitive path once eligibility has already been confirmed.
 
     Returns a dict with the same shape as hearth_ask.AskHearthResult's
-    fields (status/answer/source_summary/entity_id) — hearth_ask.py
-    constructs the dataclass from this.
+    fields (status/answer/source_summary/entity_id), plus one extra key,
+    "evidence", present only on a "success" return — the raw tool_name ->
+    data dict this turn gathered/reused, made available so a caller can
+    stash it in the Attention Frame for the *next* turn (hearth_ask.py
+    strips this key back out before constructing AskHearthResult, which
+    has no such field — this is an internal caller-to-caller signal, never
+    rendered to a manager).
 
     Phase 6: re-checks authorization as its own first step, even though
     answer_manager_advice_question() (this function's only caller today)
@@ -982,6 +1020,19 @@ def run_manager_advice_path(question_text: str, candidate_name: str, gemini_clie
     reachable gap being closed — see completion report. It keeps this
     function honest on its own terms rather than depending on every future
     caller to have gone through the one gate that currently exists.
+
+    Phase 7a: prior_evidence/prior_entity_id let a caller offer up the
+    Attention Frame's evidence from a previous turn about the same
+    Building. Reused ONLY when prior_entity_id matches this turn's
+    freshly-resolved entity_id (Step 1 below always re-resolves and
+    re-authorizes from scratch — reuse never substitutes for either), and
+    only for the four *optional* tools; resolve_building_by_name and
+    get_building_context always run fresh every turn regardless, since
+    they are this path's essential, deterministic, cheap grounding steps
+    (see TOOL_REGISTRY comments) and the Building's existence/identity
+    should never be assumed stale. Reuse reduces retrieval only — Step 6's
+    deterministic Grounded Assertions validation still runs on whatever
+    evidence (fresh or reused) ends up in play, every turn, unconditionally.
     """
     if not is_actor_authorized(actor_role):
         return _fail_closed_not_authorized()
@@ -1035,6 +1086,19 @@ def run_manager_advice_path(question_text: str, candidate_name: str, gemini_clie
     evidence = {"get_building_context": context_result["data"]}
     limitations = [_LIVESTREAM_GAP_NOTE]
 
+    # Phase 7a: seed already-gathered optional-tool evidence from the
+    # Attention Frame, but ONLY when it was gathered about this exact
+    # Building — a subject change mid-conversation (prior_entity_id !=
+    # entity_id) must never leak one Building's evidence into another's
+    # answer. get_building_context is deliberately excluded from reuse
+    # (see run_manager_advice_path docstring) — it was just re-fetched
+    # fresh above unconditionally.
+    reusable_evidence = {}
+    if prior_evidence and prior_entity_id == entity_id:
+        reusable_evidence = {
+            k: v for k, v in prior_evidence.items() if k in OPTIONAL_TOOL_NAMES
+        }
+
     # Step 4 (gather context, continued): execute the model's plan.
     # HEARTH_COGNITIVE_PROCESS.md Section 4's "stop earlier than the ceiling
     # whenever sufficient evidence has been gathered" is satisfied here by
@@ -1042,6 +1106,16 @@ def run_manager_advice_path(question_text: str, candidate_name: str, gemini_clie
     # i.e. 3-4 total calls) rather than by an iterative multi-round loop —
     # see the completion report for why this simplification was made.
     for tool_name in requested_tools:
+        if tool_name in reusable_evidence:
+            # Working Memory reducing unnecessary retrieval (Phase 7a): this
+            # tool was already called for this same Building this session —
+            # reuse its data instead of calling it again. Does not count
+            # against tool_calls_made/the ceiling, since no call happened.
+            # Grounded Assertions validation (Step 6) still runs on this
+            # data exactly as if it had been freshly fetched.
+            evidence[tool_name] = reusable_evidence[tool_name]
+            trace.append({"tool": tool_name, "outcome": "reused_from_attention_frame"})
+            continue
         if tool_calls_made >= TOOL_CALL_CEILING:
             limitations.append("Stopped before calling every planned tool: hard ceiling of 5 tool calls reached.")
             break
@@ -1083,6 +1157,12 @@ def run_manager_advice_path(question_text: str, candidate_name: str, gemini_clie
         "answer": answer_text,
         "source_summary": source_summary,
         "entity_id": entity_id,
+        # Phase 7a: the raw evidence dict this turn ended up with (fresh
+        # and/or reused) — not part of AskHearthResult's shape, not
+        # rendered to the manager; hearth_ask.py lifts this out to stash in
+        # the Attention Frame for a possible next turn, then discards it
+        # before constructing AskHearthResult.
+        "evidence": evidence,
         # Made visible here, not just logged, so any caller — tests, a
         # future debug view, a human reviewing a past response — can see
         # what Hearth thought it needed to check, not just which tools it
@@ -1107,7 +1187,15 @@ def run_manager_advice_path(question_text: str, candidate_name: str, gemini_clie
     }
 
 
-def answer_manager_advice_question(question_text: str, memory_conn, gemini_client, actor_role: Optional[str] = None):
+def answer_manager_advice_question(
+    question_text: str,
+    memory_conn,
+    gemini_client,
+    actor_role: Optional[str] = None,
+    fallback_entity_name: Optional[str] = None,
+    prior_evidence: Optional[dict] = None,
+    prior_entity_id: Optional[int] = None,
+):
     """Top-level entry point hearth_ask.answer_question() calls whenever its
     three fixed-pattern routes did not match. Read-only; writes nothing.
 
@@ -1122,11 +1210,21 @@ def answer_manager_advice_question(question_text: str, memory_conn, gemini_clien
     gate, since the eligibility gate never ran; this is distinct from every
     other status this function can return (success/not_found/ambiguous/
     error/unsupported-via-None) and must not be confused with any of them.
+
+    Phase 7a: fallback_entity_name/prior_evidence/prior_entity_id are all
+    optional Attention Frame continuity inputs, straight passthroughs to
+    check_eligibility() and run_manager_advice_path() respectively — see
+    those functions' docstrings. None of the three change what this
+    function checks or in what order; a caller with no frame (all three
+    None/absent) behaves identically to before this phase.
     """
     if not is_actor_authorized(actor_role):
         return _fail_closed_not_authorized(), None
 
-    gate = check_eligibility(memory_conn, question_text, gemini_client)
+    gate = check_eligibility(memory_conn, question_text, gemini_client, fallback_entity_name=fallback_entity_name)
     if not gate.eligible:
         return None, gate
-    return run_manager_advice_path(question_text, gate.candidate_name, gemini_client, actor_role), gate
+    return run_manager_advice_path(
+        question_text, gate.candidate_name, gemini_client, actor_role,
+        prior_evidence=prior_evidence, prior_entity_id=prior_entity_id,
+    ), gate
