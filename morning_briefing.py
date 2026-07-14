@@ -168,6 +168,7 @@ def query_training_comments_recent(conn, since: datetime):
         FROM training_comments tc
         LEFT JOIN users u ON u.id = tc.user_id
         WHERE tc.created_at >= ?
+          AND tc.acknowledged_at IS NULL
         ORDER BY tc.created_at DESC;
     """
     return safe_query(conn, "Training comments for review (48 h)", sql, (since.isoformat(),))
@@ -318,6 +319,7 @@ def query_training_comment_waiting(conn, cutoff: datetime):
         JOIN trainings t ON t.id  = tc.training_id
         WHERE (u.is_pathway_creator = 1 OR u.is_shop_creator = 1)
           AND tc.created_at <= ?
+          AND tc.acknowledged_at IS NULL
           AND tc.comment_type IN ({type_placeholders})
           AND NOT EXISTS (
               SELECT 1
