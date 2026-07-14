@@ -708,7 +708,73 @@ def collect_data(conn):
 # Resolution detection — closes episodes no longer present in Pathway
 # ---------------------------------------------------------------------------
 
-def resolve_stale_issues(memory_conn, data, tracer=None):
+def _training_comment_waiting_resolution_reason(conn, comment_id):
+    """Determine why a training_comment_waiting episode's comment_id dropped out of
+    query_training_comment_waiting()'s result set, checked in an explicit priority
+    order — one at a time — instead of assuming "absent means resolved".
+
+    Set-difference alone can't distinguish a real resolution from an unrelated
+    disappearance (an eligibility-query change, a creator-flag glitch, a join
+    hiccup): on June 22, a creator-eligibility query change silently marked two of
+    a creator's genuinely unanswered comments resolved this way.
+
+    Returns one of six resolution_reason values, or None if none apply — callers
+    must treat None as "cannot confirm resolution" and leave the episode open
+    rather than close it with a guessed reason.
+    """
+    row = conn.execute(
+        "SELECT training_id, user_id, created_at, comment_type, acknowledged_at"
+        " FROM training_comments WHERE id = ?;",
+        (comment_id,),
+    ).fetchone()
+    if row is None:
+        return "comment_deleted"
+
+    if row["acknowledged_at"] is not None:
+        return "acknowledged_externally"
+
+    # Same staff-reply / later-staff-comment logic as query_training_comment_waiting
+    # (confirmed correct, unchanged), re-run for this one comment_id.
+    staff_roles = tuple(hearth_identity.STAFF_ROLES)
+    staff_placeholders = ", ".join("?" for _ in staff_roles)
+
+    staff_reply = conn.execute(
+        f"""
+        SELECT 1 FROM training_comment_replies tcr
+        JOIN users ru ON ru.id = tcr.user_id
+        WHERE tcr.comment_id = ?
+          AND lower(trim(ru.role)) IN ({staff_placeholders})
+        LIMIT 1;
+        """,
+        (comment_id,) + staff_roles,
+    ).fetchone()
+    if staff_reply is not None:
+        return "staff_reply_received"
+
+    later_staff_comment = conn.execute(
+        f"""
+        SELECT 1 FROM training_comments tc2
+        JOIN users ru2 ON ru2.id = tc2.user_id
+        WHERE tc2.training_id = ?
+          AND tc2.created_at > ?
+          AND lower(trim(ru2.role)) IN ({staff_placeholders})
+        LIMIT 1;
+        """,
+        (row["training_id"], row["created_at"]) + staff_roles,
+    ).fetchone()
+    if later_staff_comment is not None:
+        return "later_staff_comment_received"
+
+    if row["comment_type"] not in ACTIONABLE_COMMENT_TYPES:
+        return "comment_non_actionable"
+
+    if row["user_id"] in hearth_identity.get_inactive_user_ids([row["user_id"]], conn=conn):
+        return "creator_deactivated"
+
+    return None
+
+
+def resolve_stale_issues(memory_conn, data, tracer=None, pathway_conn=None):
     """
     Compare current Pathway data against open Hearth episodes and resolve
     any episode whose condition is no longer present.
@@ -719,6 +785,15 @@ def resolve_stale_issues(memory_conn, data, tracer=None):
       training_comment_needs_response — stays open until manually resolved; auto-resolution
                                         requires a Pathway query for subsequent manager responses
                                         on the same training (TODO for a future version)
+      training_comment_waiting       — explicit terminal-reason check (see
+                                        _training_comment_waiting_resolution_reason), not
+                                        set-difference — a comment absent from the current
+                                        scan's results is resolved only if one of six specific
+                                        conditions is confirmed true; otherwise the episode is
+                                        left open and the inconsistency is logged. Requires
+                                        pathway_conn (a live, read-only Pathway connection); if
+                                        not provided, these episodes are left open rather than
+                                        guessed at.
 
     If a query failed (returned a string instead of rows), that type is
     skipped entirely so we never accidentally close valid open episodes
@@ -865,6 +940,73 @@ def resolve_stale_issues(memory_conn, data, tracer=None):
                 pass
             continue
 
+        # training_comment_waiting — explicit terminal-reason resolution (fix for
+        # the June 22 lossy set-difference bug). Handled here, ahead of the
+        # generic should_resolve chain below, because each of the six legitimate
+        # resolution paths needs its own resolution_reason recorded on the
+        # episode row, and because "none of the six apply" must leave the
+        # episode open rather than fall through to a generic resolved reason.
+        if ep_type == "training_comment_waiting" and current_comment_waiting_keys is not None:
+            if ref_key is None or ref_key in current_comment_waiting_keys:
+                continue  # still present in this scan's results — still open
+
+            comment_id_str = ref_key[len("training_comment_waiting_"):]
+            try:
+                comment_id = int(comment_id_str)
+            except ValueError:
+                comment_id = None
+
+            reason = None
+            if pathway_conn is not None and comment_id is not None:
+                reason = _training_comment_waiting_resolution_reason(pathway_conn, comment_id)
+
+            if reason is not None:
+                hearth_memory.resolve_episode(
+                    memory_conn, ep["id"], now, resolution_reason=reason,
+                )
+                try:
+                    tracer.record(hearth_trace.TraceEntry(
+                        rule_name="resolve_training_comment_waiting",
+                        episode_type=ep_type,
+                        action_taken="resolved_episode",
+                        reason=reason,
+                        reference_key=ref_key,
+                        source_table="training_comments",
+                        source_record_id=comment_id,
+                        entity_user_id=user_id,
+                        entity_display_name=ep["display_name"],
+                        confidence="high",
+                    ))
+                except Exception:
+                    pass
+            else:
+                print(
+                    f"[HEARTH WARNING] training_comment_waiting episode {ep['id']} "
+                    f"(comment_id={comment_id_str}) is absent from the current scan's "
+                    "query_training_comment_waiting() results, but none of the six known "
+                    "resolution conditions could be confirmed — leaving the episode open "
+                    "for investigation instead of auto-resolving it."
+                )
+                try:
+                    tracer.record(hearth_trace.TraceEntry(
+                        rule_name="training_comment_waiting_unexplained_disappearance",
+                        episode_type=ep_type,
+                        action_taken="left_open_inconsistency",
+                        reason=(
+                            "comment absent from query_training_comment_waiting() results "
+                            "but none of the six known resolution conditions were confirmed"
+                        ),
+                        reference_key=ref_key,
+                        source_table="training_comments",
+                        source_record_id=comment_id,
+                        entity_user_id=user_id,
+                        entity_display_name=ep["display_name"],
+                        confidence="low",
+                    ))
+                except Exception:
+                    pass
+            continue
+
         should_resolve = False
         resolve_reason = None
 
@@ -897,11 +1039,6 @@ def resolve_stale_issues(memory_conn, data, tracer=None):
             should_resolve = ref_key is not None and ref_key not in current_feedback_waiting_keys
             if should_resolve:
                 resolve_reason = "feedback provided or submission no longer awaiting review"
-
-        elif ep_type == "training_comment_waiting" and current_comment_waiting_keys is not None:
-            should_resolve = ref_key is not None and ref_key not in current_comment_waiting_keys
-            if should_resolve:
-                resolve_reason = "staff response received or comment no longer exists"
 
         elif ep_type == "support_request_waiting" and current_support_waiting_keys is not None:
             should_resolve = ref_key is not None and ref_key not in current_support_waiting_keys
@@ -1834,10 +1971,10 @@ def run_pipeline(db_path=None, gemini_api_key=None, scan_mode="morning",
             hearth_relationships.discover_recruiter_relationships(memory_conn, conn)
             hearth_relationships.discover_program_coach_relationships(memory_conn, conn)
             data = collect_data(conn)
+            resolve_stale_issues(memory_conn, data, tracer, pathway_conn=conn)
         finally:
             conn.close()
 
-        resolve_stale_issues(memory_conn, data, tracer)
         resolve_legacy_unlinked_battles(memory_conn, tracer)
         # Captured right after the resolve calls above so it reflects only
         # episodes this run closed, not older resolutions from a prior scan.
