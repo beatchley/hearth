@@ -834,7 +834,14 @@ if __name__ == "__main__":
         assert _MARKER in result.answer  # support_request_waiting concern present
         assert "Creator quiet" not in result.answer  # _NEVER_BRIEF_EPISODE_TYPES suppressed
 
-        result = answer_question("What's the weather like?", memory_conn=conn, gemini_client=None)
+        # actor_role="manager" (authorized): this question is meant to prove
+        # the *genuinely unsupported* path (no fixed pattern matches, and the
+        # manager-advice gate finds zero entity mentions) — not to
+        # accidentally exercise Phase 6's authorization refusal instead. An
+        # omitted/unauthorized actor_role would fail closed as
+        # "not_authorized" before reaching that gate at all, which is a
+        # different code path than this assertion is testing.
+        result = answer_question("What's the weather like?", memory_conn=conn, gemini_client=None, actor_role="manager")
         assert result.status == "unsupported"
         assert result.answer == _UNSUPPORTED_MESSAGE
 
