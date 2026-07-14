@@ -73,6 +73,7 @@ def init_tables(conn):
         "ALTER TABLE hearth_entities ADD COLUMN source TEXT DEFAULT 'pathway_sync';",
         "ALTER TABLE hearth_entities ADD COLUMN canonical_key TEXT;",
         "ALTER TABLE hearth_entities ADD COLUMN aliases TEXT;",
+        "ALTER TABLE hearth_episodes ADD COLUMN resolution_reason TEXT;",
     ):
         try:
             conn.execute(migration)
@@ -294,15 +295,34 @@ def get_recent_episodes(memory_conn, limit=50):
     ).fetchall()
 
 
-def resolve_episode(memory_conn, episode_id, resolved_at=None):
-    """Mark a single episode as resolved. Idempotent — safe to call twice."""
+def resolve_episode(memory_conn, episode_id, resolved_at=None, resolution_reason=None):
+    """Mark a single episode as resolved. Idempotent — safe to call twice.
+
+    resolution_reason (optional): a short, distinct machine-readable tag
+    (e.g. "creator_deactivated") stored in hearth_episodes.resolution_reason,
+    separate from the human-readable text hearth_trace.py already logs for
+    every resolution. Existing callers that omit it are unaffected — the
+    column stays NULL, identical to this function's behavior before this
+    parameter existed. Added so a resolution driven by something other than
+    a normal per-type "condition no longer present" check (e.g. Fix 2's
+    general deactivation sweep in morning_briefing.resolve_stale_issues())
+    is distinguishable on the episode row itself later, not only in an
+    ephemeral trace log.
+    """
     if resolved_at is None:
         resolved_at = datetime.now(timezone.utc).isoformat()
-    memory_conn.execute(
-        "UPDATE hearth_episodes SET resolved = 1, resolved_at = ?"
-        " WHERE id = ? AND resolved = 0;",
-        (resolved_at, episode_id),
-    )
+    if resolution_reason is not None:
+        memory_conn.execute(
+            "UPDATE hearth_episodes SET resolved = 1, resolved_at = ?, resolution_reason = ?"
+            " WHERE id = ? AND resolved = 0;",
+            (resolved_at, resolution_reason, episode_id),
+        )
+    else:
+        memory_conn.execute(
+            "UPDATE hearth_episodes SET resolved = 1, resolved_at = ?"
+            " WHERE id = ? AND resolved = 0;",
+            (resolved_at, episode_id),
+        )
     memory_conn.commit()
 
 

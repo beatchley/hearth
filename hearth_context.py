@@ -470,7 +470,8 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
     the person's total historical episode count and any Hearth summary notes.
     Without it, the context is still person-aware — just less historically deep.
     """
-    import hearth_memory       # local imports to avoid circular dependency
+    import hearth_identity     # local imports to avoid circular dependency
+    import hearth_memory
     import hearth_relationships
     import hearth_trace as _ht
 
@@ -522,12 +523,30 @@ def build_context(data: dict, open_episodes: list, memory_conn=None,
     # Recent training comment count is informational, not a "Needs Action
     # Today" item — Daily Brief 2.0 excludes it from brief output.
 
+    # Defense-in-depth (Fix 3): even if morning_briefing.py's source-query
+    # filtering and resolve_stale_issues() sweep both somehow missed a
+    # case, never let an episode belonging to a currently-deactivated
+    # Pathway user reach a briefing. This is a live, independent check —
+    # it does not rely on `data` carrying deactivation info (some callers,
+    # e.g. hearth_ask.py's needs_attention_today route, intentionally pass
+    # data={} to avoid that path's write side effects) or on the sweep
+    # having run recently (it only runs on morning_briefing.py's own
+    # schedule, not on every request that reaches build_context()).
+    # get_inactive_user_ids() never raises and degrades to "nothing
+    # filtered" if Pathway is unreachable, matching this function's
+    # existing never-crash-the-brief discipline.
+    candidate_user_ids = {ep["user_id"] for ep in (open_episodes or []) if ep["user_id"] is not None}
+    inactive_user_ids = hearth_identity.get_inactive_user_ids(candidate_user_ids) if candidate_user_ids else set()
+
     # Filter open episodes to only those that should appear in today's briefing.
     # awareness episodes are tracked in memory but never surfaced in briefings.
     # pattern episodes respect a 3-day cooldown via last_briefed_at.
     # Hearth City and hearth_reader receive the full open_episodes list — only
     # the context passed to Gemini gets the filtered briefable_episodes.
-    briefable_episodes = [ep for ep in (open_episodes or []) if _should_brief(ep, now_utc)]
+    briefable_episodes = [
+        ep for ep in (open_episodes or [])
+        if _should_brief(ep, now_utc) and ep["user_id"] not in inactive_user_ids
+    ]
 
     # Group episodes by entity_id — None means no linked person
     by_entity = {}  # entity_id (int) -> list of episode rows

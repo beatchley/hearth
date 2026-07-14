@@ -84,6 +84,45 @@ def get_user_identity(user_id, conn=None):
             conn.close()
 
 
+def get_inactive_user_ids(user_ids, conn=None):
+    """Return the subset of user_ids currently deactivated in Pathway
+    (status = 'inactive'). One bulk query, not one query per id.
+
+    Never raises: returns an empty set (== "no known deactivations," not
+    an error signal) if user_ids is empty, the connection is unavailable,
+    or the query fails — callers that use this for defensive filtering
+    should not distinguish "confirmed nobody is inactive" from "couldn't
+    check right now"; degrading to no filtering is the correct fail-open
+    behavior for a read path that must never crash on Pathway being
+    briefly unreachable.
+
+    Uses conn if provided (any existing Pathway connection); otherwise
+    opens and closes its own read-only connection via get_pathway_connection().
+    """
+    ids = [uid for uid in (user_ids or []) if uid is not None]
+    if not ids:
+        return set()
+
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_pathway_connection()
+    if conn is None:
+        return set()
+
+    try:
+        placeholders = ", ".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT id FROM users WHERE status = 'inactive' AND id IN ({placeholders});",
+            ids,
+        ).fetchall()
+        return {row["id"] for row in rows}
+    except sqlite3.Error:
+        return set()
+    finally:
+        if owns_conn:
+            conn.close()
+
+
 def get_user_display_name(user_id, conn=None):
     """Return the best available human-readable name for user_id.
 

@@ -124,16 +124,24 @@ def safe_query(conn, label, sql, params=None):
 
 
 def query_new_users(conn, since: datetime):
+    # status != 'inactive' (not status = 'approved'): this section is meant
+    # to surface brand-new signups for review, which are normally still
+    # 'pending' at this point — only a deactivated account should be hidden.
     sql = """
         SELECT id, name, email, joined_on
         FROM users
         WHERE joined_on >= ?
+          AND status != 'inactive'
         ORDER BY joined_on DESC;
     """
     return safe_query(conn, "New users (last 24 h)", sql, (since.isoformat(),))
 
 
 def query_battles_today(conn, today_str: str):
+    # u.id IS NULL OR u.status = 'approved': u is a LEFT JOIN (a battle can
+    # exist with no matching user row), so a plain u.status = 'approved'
+    # would also drop legitimate creator_user_id-less battles — only a
+    # known, deactivated creator should be excluded here.
     sql = """
         SELECT b.id,
                COALESCE(NULLIF(b.creator_screenname, ''), u.tiktok_handle, u.name) AS creator_screenname,
@@ -143,6 +151,7 @@ def query_battles_today(conn, today_str: str):
         FROM battles b
         LEFT JOIN users u ON u.id = b.creator_user_id
         WHERE b.battle_date = ?
+          AND (u.id IS NULL OR u.status = 'approved')
         ORDER BY b.battle_time;
     """
     return safe_query(conn, "Battles scheduled today", sql, (today_str,))
@@ -161,6 +170,9 @@ def query_unresponded_comments(conn, since: datetime):
 
 def query_training_comments_recent(conn, since: datetime):
     """Fetch recent training comments with user role info for response-need detection."""
+    # u.id IS NULL OR u.status = 'approved': u is a LEFT JOIN — see
+    # query_battles_today's comment for why a plain u.status = 'approved'
+    # would be wrong here (it would also drop orphaned/unmatched rows).
     sql = """
         SELECT tc.id, tc.training_id, tc.user_id, tc.content, tc.created_at,
                COALESCE(NULLIF(u.tiktok_handle, ''), u.name) AS display_name,
@@ -169,6 +181,7 @@ def query_training_comments_recent(conn, since: datetime):
         LEFT JOIN users u ON u.id = tc.user_id
         WHERE tc.created_at >= ?
           AND tc.acknowledged_at IS NULL
+          AND (u.id IS NULL OR u.status = 'approved')
         ORDER BY tc.created_at DESC;
     """
     return safe_query(conn, "Training comments for review (48 h)", sql, (since.isoformat(),))
@@ -185,11 +198,15 @@ def query_users_on_probation(conn):
 
 
 def query_missing_discord(conn):
+    # u.status != 'inactive' (not status = 'approved'): onboarding can be
+    # in progress before a user is fully approved — only a deactivated
+    # account should be hidden here, not every not-yet-approved one.
     sql = """
         SELECT u.id, u.name, u.email
         FROM users u
         JOIN onboarding_records o ON o.user_id = u.id
-        WHERE o.added_discord = 'needed' OR o.added_discord IS NULL
+        WHERE (o.added_discord = 'needed' OR o.added_discord IS NULL)
+          AND u.status != 'inactive'
         ORDER BY o.created_at DESC
         LIMIT 20;
     """
@@ -198,6 +215,8 @@ def query_missing_discord(conn):
 
 def query_trainings_no_engagement(conn, since: datetime, cutoff: datetime):
     """Trainings at least 24 h old (but no more than 7 days) with zero comments."""
+    # u.id IS NULL OR u.status = 'approved': u is a LEFT JOIN (t.created_by
+    # may not resolve to a user row) — see query_battles_today's comment.
     sql = """
         SELECT t.id, t.title, t.created_at, t.created_by,
                COALESCE(NULLIF(u.tiktok_handle, ''), u.name) AS creator_name
@@ -205,6 +224,7 @@ def query_trainings_no_engagement(conn, since: datetime, cutoff: datetime):
         LEFT JOIN users u ON u.id = t.created_by
         WHERE t.created_at >= ?
           AND t.created_at <= ?
+          AND (u.id IS NULL OR u.status = 'approved')
           AND NOT EXISTS (
               SELECT 1 FROM training_comments tc WHERE tc.training_id = t.id
           )
@@ -232,6 +252,7 @@ def query_checkins_not_submitted(conn):
         WHERE ci.status = 'Sent'
           AND cs.status = 'Assigned'
           AND (julianday('now') - julianday(ci.updated_at)) >= 7
+          AND u.status = 'approved'
         ORDER BY days_overdue DESC;
     """
     return safe_query(conn, "Check-ins not submitted (7+ days)", sql)
@@ -275,6 +296,7 @@ def query_checkin_feedback_waiting(conn, cutoff: datetime):
         WHERE cs.status = 'Submitted'
           AND cs.submitted_at IS NOT NULL
           AND cs.submitted_at <= ?
+          AND u.status = 'approved'
         ORDER BY cs.submitted_at ASC;
     """
     return safe_query(conn, "Check-ins awaiting feedback", sql, (cutoff.isoformat(),))
@@ -318,6 +340,7 @@ def query_training_comment_waiting(conn, cutoff: datetime):
         JOIN users u     ON u.id  = tc.user_id
         JOIN trainings t ON t.id  = tc.training_id
         WHERE (u.is_pathway_creator = 1 OR u.is_shop_creator = 1)
+          AND u.status = 'approved'
           AND tc.created_at <= ?
           AND tc.acknowledged_at IS NULL
           AND tc.comment_type IN ({type_placeholders})
@@ -392,6 +415,7 @@ def query_support_request_waiting(conn, cutoff: datetime):
         LEFT JOIN last_msg_detail lmd ON lmd.thread_id = st.id
         WHERE st.status = 'open'
           AND (u.is_pathway_creator = 1 OR u.is_shop_creator = 1)
+          AND u.status = 'approved'
           AND (
               lmd.thread_id IS NULL
               OR lower(trim(lmd.last_author_role)) NOT IN ({staff_placeholders})
@@ -493,6 +517,23 @@ def query_new_creator_stuck(conn):
         ORDER BY c.days_since_joining DESC;
     """
     return safe_query(conn, "New creators stuck (14+ days)", sql, (NEW_CREATOR_STUCK_DAYS,))
+
+
+def query_deactivated_user_ids(conn):
+    """Internal-only: every user currently deactivated in Pathway (status =
+    'inactive'). NOT a brief section — collect_data() only surfaces a query
+    result to a manager when some detect_*/render function explicitly reads
+    its label via data.get(...); nothing does that for this one. Exists
+    solely so resolve_stale_issues()'s general deactivation sweep (Fix 2)
+    has access to current Pathway status after the read-only Pathway
+    connection collect_data() used has already been closed.
+    """
+    sql = """
+        SELECT id
+        FROM users
+        WHERE status = 'inactive';
+    """
+    return safe_query(conn, "_internal_deactivated_user_ids", sql)
 
 
 def query_creator_quiet(conn):
@@ -655,6 +696,7 @@ def collect_data(conn):
         lambda: query_support_request_waiting(conn, support_cutoff),
         lambda: query_new_creator_stuck(conn),
         lambda: query_creator_quiet(conn),
+        lambda: query_deactivated_user_ids(conn),
     ]
     for q in queries:
         label, data = q()
@@ -762,10 +804,67 @@ def resolve_stale_issues(memory_conn, data, tracer=None):
     else:
         current_stuck_keys = None  # query failed — skip this type
 
+    # Build the set of user_ids currently deactivated in Pathway (Fix 2 —
+    # general deactivation sweep, see below). Independent of every set
+    # above: those are each "is this specific condition still true," this
+    # one is "has the underlying account itself been deactivated," which
+    # should close an episode regardless of episode_type.
+    deactivated_rows = data.get("_internal_deactivated_user_ids", [])
+    if isinstance(deactivated_rows, list):
+        current_deactivated_user_ids = {row["id"] for row in deactivated_rows}
+    else:
+        current_deactivated_user_ids = None  # query failed — skip the sweep this run
+
     for ep in hearth_memory.get_open_episodes(memory_conn):
         ep_type = ep["episode_type"]
         user_id = ep["user_id"]
         ref_key = ep["reference_key"]
+
+        # Fix 2 — general deactivation sweep. Runs BEFORE the per-type
+        # branches below and takes priority over them: applies to ALL open
+        # episode types linked to a user who is now deactivated in
+        # Pathway, not just the episode types with a Fix-1-protected
+        # source query — this is what catches
+        # training_comment_needs_response (this function's own docstring
+        # notes it "stays open until manually resolved" otherwise) and any
+        # other current or future episode_type the per-type branches don't
+        # (or don't yet) cover. Running first also matters for the 9 types
+        # Fix 1 *does* cover: once a deactivated user's row is excluded
+        # from a source query's results, the matching per-type branch
+        # below would "correctly" but misleadingly resolve the episode
+        # with a reason like "user now has Discord access" — checking
+        # deactivation first ensures the actual reason is recorded, stored
+        # with a distinct resolution_reason ("creator_deactivated") on the
+        # episode row itself, separate from the free-text reasons below,
+        # so it's auditable later even without the (ephemeral, stdout-only)
+        # trace log. Purely additive: every per-type branch below is
+        # byte-for-byte unchanged, and any episode belonging to a user who
+        # is NOT currently deactivated reaches them exactly as before.
+        if (
+            user_id is not None
+            and current_deactivated_user_ids is not None
+            and user_id in current_deactivated_user_ids
+        ):
+            hearth_memory.resolve_episode(
+                memory_conn, ep["id"], now, resolution_reason="creator_deactivated",
+            )
+            try:
+                tracer.record(hearth_trace.TraceEntry(
+                    rule_name="resolve_deactivated_creator",
+                    episode_type=ep_type,
+                    action_taken="resolved_episode",
+                    reason="creator account deactivated in Pathway (status=inactive)",
+                    reference_key=ref_key,
+                    source_table="users",
+                    source_record_id=user_id,
+                    entity_user_id=user_id,
+                    entity_display_name=ep["display_name"],
+                    confidence="high",
+                ))
+            except Exception:
+                pass
+            continue
+
         should_resolve = False
         resolve_reason = None
 
