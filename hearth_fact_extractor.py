@@ -352,6 +352,16 @@ Furniture facts stand on their own, with no reasoning required. Examples of fact
 - Frequently streams FPS games.
 - Prefers evening livestreams.
 - Has experience in retail management.
+- Favorite food is cheeseburgers and french fries.
+
+Furniture is NOT limited to facts about platform or creator activity. A genuinely
+personal preference or trait — a favorite food, a favorite color, a hobby, a pet,
+and similar — is just as valid a Furniture candidate as a platform-related one,
+as long as it still passes the because test above: a standalone, durable fact
+stated with reasonable confidence, needing no external context to make sense. Do
+not reject a fact merely because it has nothing to do with the platform or
+creator work. This does not lower the bar on confidence or evidence — the same
+because test and the same conservative bias below still apply in full.
 
 Examples that DO NOT belong (these require interpretation/reasoning — reject them):
 - Is struggling because sales have dropped.

@@ -320,6 +320,20 @@ def run():
         check("NOT-Furniture example ('seems discouraged'/'might be burning out') produces no candidate",
               bad_result is None, f"got {bad_result}")
 
+        # Personal preferences unrelated to platform/creator activity are still
+        # valid Furniture under "preference" — regression case for the real
+        # community post that surfaced this gap ("has_furniture_candidate: false"
+        # for a stated favorite food, before the prompt clarification below).
+        personal_preference_text = (
+            "If occurs to me that my favorite food is Cheese Burgers and French Fries."
+        )
+        preference_result = fx._evaluate_candidate(client, hansolo_row, personal_preference_text)
+        check("personal preference unrelated to platform activity ('favorite food') produces a candidate",
+              preference_result is not None, f"got {preference_result}")
+        if preference_result:
+            check("personal preference candidate is categorized as 'preference'",
+                  preference_result["category"] == "preference", f"got {preference_result['category']}")
+
         relationship_text = "HanSolo has been dating Billybob for a few months now."
         rel_result = fx._evaluate_candidate(client, hansolo_row, relationship_text)
         check("relationship-shaped fact produces no candidate (never falls back to 'other')",
