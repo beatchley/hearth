@@ -360,24 +360,28 @@ if __name__ == "__main__":
     print("\nStep 8: HEARTH_WORLDVIEW_QUESTIONS_ENABLED default")
     print(f"  HEARTH_WORLDVIEW_QUESTIONS_ENABLED={HEARTH_WORLDVIEW_QUESTIONS_ENABLED}")
 
-    _TEST_MARKER = "session_5_smoke_test"
     hearth_worldview.ensure_worldview_tables(conn)
     test_uncertainty_ids = []
 
     try:
         print("\nStep 9: open_uncertainty() — one with possible_question, one without")
+        # NOTE: no source_episode_id is passed here. open_uncertainty() validates
+        # source_episode_id must be a real hearth_episodes.id (int/digit-string) or
+        # None — see hearth_worldview._validate_source_episode_id, added in commit
+        # 13e2296 precisely to stop scan-level labels being stored in this field.
+        # Test rows are instead tracked via test_uncertainty_ids for cleanup below.
         unc_with_q = hearth_worldview.open_uncertainty(
             conn, subject_type="creator", subject_id="session_5_test_creator",
             uncertainty_text="SESSION 5 SMOKE TEST: is creator still engaged with weekly check-ins?",
             why_it_matters="Determines whether to escalate to coach.",
             possible_question="Is the creator still doing weekly check-ins, or have they quietly stopped?",
-            priority="high", source_episode_id=_TEST_MARKER,
+            priority="high",
         )
         unc_without_q = hearth_worldview.open_uncertainty(
             conn, subject_type="creator", subject_id="session_5_test_creator_2",
             uncertainty_text="SESSION 5 SMOKE TEST: unclear why response time has slowed",
             why_it_matters="Could indicate burnout or just a busy week.",
-            priority="normal", source_episode_id=_TEST_MARKER,
+            priority="normal",
         )
         test_uncertainty_ids += [unc_with_q, unc_without_q]
         print(f"  unc_with_q={unc_with_q}, unc_without_q={unc_without_q}")
@@ -449,7 +453,7 @@ if __name__ == "__main__":
         print("\nStep 14: resolved uncertainties stop resurfacing")
         unc_for_resolution = hearth_worldview.open_uncertainty(
             conn, uncertainty_text="SESSION 5 SMOKE TEST: will resolve before ever surfacing",
-            priority="low", source_episode_id=_TEST_MARKER,
+            priority="low",
         )
         test_uncertainty_ids.append(unc_for_resolution)
         hearth_worldview.resolve_uncertainty(conn, unc_for_resolution)
@@ -464,7 +468,7 @@ if __name__ == "__main__":
         print("\nStep 15: feature flag disabled — behaves as before Session 5")
         unc_flag_test = hearth_worldview.open_uncertainty(
             conn, uncertainty_text="SESSION 5 SMOKE TEST: should not surface while flag disabled",
-            priority="high", source_episode_id=_TEST_MARKER,
+            priority="high",
         )
         test_uncertainty_ids.append(unc_flag_test)
         HEARTH_WORLDVIEW_QUESTIONS_ENABLED = False
@@ -486,15 +490,15 @@ if __name__ == "__main__":
         print("\nStep 17: cleanup — removing all session_5_smoke_test rows")
         for unc_id in test_uncertainty_ids:
             conn.execute("DELETE FROM hearth_questions WHERE worldview_uncertainty_id = ?;", (unc_id,))
-        conn.execute(
-            "DELETE FROM hearth_worldview_uncertainties WHERE source_episode_id = ?;",
-            (_TEST_MARKER,),
-        )
+            conn.execute("DELETE FROM hearth_worldview_uncertainties WHERE id = ?;", (unc_id,))
         conn.commit()
-        remaining_unc = conn.execute(
-            "SELECT COUNT(*) FROM hearth_worldview_uncertainties WHERE source_episode_id = ?;",
-            (_TEST_MARKER,),
-        ).fetchone()[0]
+        remaining_unc = sum(
+            conn.execute(
+                "SELECT COUNT(*) FROM hearth_worldview_uncertainties WHERE id = ?;",
+                (unc_id,),
+            ).fetchone()[0]
+            for unc_id in test_uncertainty_ids
+        )
         remaining_q = sum(
             conn.execute(
                 "SELECT COUNT(*) FROM hearth_questions WHERE worldview_uncertainty_id = ?;",

@@ -2011,6 +2011,18 @@ def run_pipeline(db_path=None, gemini_api_key=None, scan_mode="morning",
         )
         print(f"[HEARTH REFLECTION] reflection_id={reflection_id} source_run={scan_mode}")
 
+        # Runs after generate_reflection() (which drives reflect_on_worldview())
+        # so any worldview uncertainties created/updated this run are fresh
+        # material to consider surfacing, not stale data from a prior run.
+        # No-ops safely if HEARTH_WORLDVIEW_QUESTIONS_ENABLED is off or worldview
+        # is unavailable — see hearth_questions.surface_worldview_questions().
+        surfaced_question_ids = hearth_questions.surface_worldview_questions(memory_conn)
+        if surfaced_question_ids:
+            print(
+                f"[HEARTH QUESTIONS] surfaced {len(surfaced_question_ids)} worldview"
+                f" question(s): {surfaced_question_ids}"
+            )
+
         if not effective_send_brief:
             print("[HEARTH BRIEF] skipped: non-morning scan")
             if HEARTH_TRACE:
