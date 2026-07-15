@@ -13,6 +13,46 @@ from datetime import datetime, timedelta, timezone
 _LOCAL_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hearth_memory.db")
 MEMORY_DB_PATH = os.environ.get("HEARTH_DB_PATH", _LOCAL_DB_PATH)
 
+# episode_type values written by hearth_experience_evaluator.py's promotion
+# path, and the reference_key prefix it uses. Until evaluator promotion has
+# been independently verified and manually re-enabled (see
+# HEARTH_EXPERIENCE_EVALUATOR_PROMOTE), rows matching this shape must stay
+# out of every consumer that treats hearth_episodes as trusted
+# organizational evidence — Daily Brief, Soul, Worldview reflection,
+# belief-confidence updates, manager-facing summaries, recurring-pattern
+# calculations. This is the single shared definition other modules
+# (hearth_traversal.py, hearth_manager_advice.py, and pathway-portal's
+# hearth_reader.py) should import rather than re-deriving the same check.
+EVALUATOR_PROMOTED_EPISODE_TYPES = frozenset({"resolution", "momentum", "concern"})
+EVALUATOR_REFERENCE_KEY_PREFIX = "pulse_event_"
+
+
+def is_evaluator_promoted(episode_type, reference_key):
+    """True if a hearth_episodes row was written by the Experience Evaluator's
+    promotion path (see hearth_experience_evaluator.py), based on the same
+    (episode_type, reference_key-prefix) shape hearth_reader.py's
+    _exclude_promoted_evaluator_sql() checks in raw SQL.
+    """
+    return (
+        episode_type in EVALUATOR_PROMOTED_EPISODE_TYPES
+        and bool(reference_key)
+        and reference_key.startswith(EVALUATOR_REFERENCE_KEY_PREFIX)
+    )
+
+
+def _exclude_evaluator_promoted_sql(alias=""):
+    """SQL fragment excluding evaluator-promoted rows, for raw-SQL callers
+    that can't filter in Python (e.g. aggregate COUNT queries). Mirrors
+    is_evaluator_promoted's logic exactly — keep the two in sync.
+    """
+    prefix = f"{alias}." if alias else ""
+    placeholders = ", ".join("?" for _ in EVALUATOR_PROMOTED_EPISODE_TYPES)
+    return (
+        f" AND {prefix}episode_type NOT IN ({placeholders})"
+        f" AND ({prefix}reference_key IS NULL OR {prefix}reference_key NOT LIKE"
+        f" '{EVALUATOR_REFERENCE_KEY_PREFIX}%')"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Connection
@@ -230,25 +270,35 @@ def create_episode(memory_conn, entity_id, episode_type, description,
     return cur.lastrowid, "created_episode"
 
 
-def get_open_episodes(memory_conn, entity_id=None):
+def get_open_episodes(memory_conn, entity_id=None, include_evaluator_promoted=False):
     """Return all unresolved episodes, optionally filtered to one entity.
 
     Each row includes user_id and display_name from hearth_entities so the
     context builder can group by person without extra queries.
+
+    Excludes Experience-Evaluator-promoted rows (see
+    EVALUATOR_PROMOTED_EPISODE_TYPES) by default — they remain untrusted
+    until promotion is independently verified and manually re-enabled. Pass
+    include_evaluator_promoted=True for tools that deliberately need full
+    visibility (e.g. hearth_episode_dedup.py's diagnostic scan, or the
+    Experience Evaluator cleanup utility itself).
     """
+    exclude_sql = "" if include_evaluator_promoted else _exclude_evaluator_promoted_sql("e")
+    exclude_params = () if include_evaluator_promoted else tuple(EVALUATOR_PROMOTED_EPISODE_TYPES)
     if entity_id is not None:
         return memory_conn.execute(
             "SELECT e.*, en.user_id, en.display_name FROM hearth_episodes e"
             " LEFT JOIN hearth_entities en ON en.id = e.entity_id"
-            " WHERE e.entity_id = ? AND e.resolved = 0"
+            f" WHERE e.entity_id = ? AND e.resolved = 0{exclude_sql}"
             " ORDER BY e.observed_at;",
-            (entity_id,),
+            (entity_id, *exclude_params),
         ).fetchall()
     return memory_conn.execute(
         "SELECT e.*, en.user_id, en.display_name FROM hearth_episodes e"
         " LEFT JOIN hearth_entities en ON en.id = e.entity_id"
-        " WHERE e.resolved = 0"
-        " ORDER BY e.observed_at;"
+        f" WHERE e.resolved = 0{exclude_sql}"
+        " ORDER BY e.observed_at;",
+        exclude_params,
     ).fetchall()
 
 
@@ -326,19 +376,23 @@ def resolve_episode(memory_conn, episode_id, resolved_at=None, resolution_reason
     memory_conn.commit()
 
 
-def get_recent_resolutions(memory_conn, hours=24):
+def get_recent_resolutions(memory_conn, hours=24, include_evaluator_promoted=False):
     """Return episodes resolved in the last N hours, joined to entity display_name.
 
     Used by the context builder so Hearth can mention positive progress alongside
-    open concerns rather than only ever surfacing problems.
+    open concerns rather than only ever surfacing problems, and by Soul to
+    confirm the responsiveness belief — so this excludes Experience-Evaluator-
+    promoted rows by default for the same reason get_open_episodes does.
     """
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    exclude_sql = "" if include_evaluator_promoted else _exclude_evaluator_promoted_sql("e")
+    exclude_params = () if include_evaluator_promoted else tuple(EVALUATOR_PROMOTED_EPISODE_TYPES)
     return memory_conn.execute(
         "SELECT e.*, en.user_id, en.display_name FROM hearth_episodes e"
         " LEFT JOIN hearth_entities en ON en.id = e.entity_id"
-        " WHERE e.resolved = 1 AND e.resolved_at >= ?"
+        f" WHERE e.resolved = 1 AND e.resolved_at >= ?{exclude_sql}"
         " ORDER BY e.resolved_at DESC;",
-        (since,),
+        (since, *exclude_params),
     ).fetchall()
 
 
@@ -426,11 +480,18 @@ def process_entity_observations(memory_conn, entity_id):
     once — never from a single data point. Concerns reflect currently open
     episodes. Strengths are left for future phases when positive signal types
     exist. Summary is factual and evidence-backed.
+
+    Experience-Evaluator-promoted rows (see EVALUATOR_PROMOTED_EPISODE_TYPES)
+    are excluded from this computation entirely — not just from the
+    "awareness" carve-out below — so an invalid promotion can never surface
+    in an entity's summary/patterns_noticed/concerns/first_observed_at/
+    last_observed_at until promotion is independently verified.
     """
     all_episodes = memory_conn.execute(
         "SELECT episode_type, severity, resolved, observed_at, briefing_category"
-        " FROM hearth_episodes WHERE entity_id = ? ORDER BY observed_at;",
-        (entity_id,),
+        " FROM hearth_episodes WHERE entity_id = ?" + _exclude_evaluator_promoted_sql() +
+        " ORDER BY observed_at;",
+        (entity_id, *EVALUATOR_PROMOTED_EPISODE_TYPES),
     ).fetchall()
 
     if not all_episodes:

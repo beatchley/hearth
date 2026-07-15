@@ -13,6 +13,7 @@ hearth_relationships row.
 
 import sqlite3
 
+import hearth_memory
 from hearth_memory import get_memory_connection
 
 # Furniture facts are a compact snapshot, not a dossier — cap what
@@ -134,8 +135,9 @@ def get_context_pointers(memory_conn, entity_ids):
     for row in memory_conn.execute(
         "SELECT entity_id, COUNT(*) AS c FROM hearth_episodes"
         f" WHERE entity_id IN ({placeholders})"
+        + hearth_memory._exclude_evaluator_promoted_sql() +
         " GROUP BY entity_id;",
-        unique_ids,
+        unique_ids + list(hearth_memory.EVALUATOR_PROMOTED_EPISODE_TYPES),
     ).fetchall():
         pointers[row["entity_id"]]["episode_count"] = row["c"]
 

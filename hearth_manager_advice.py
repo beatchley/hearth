@@ -198,8 +198,9 @@ def get_recent_episodes(entity_id: int, limit: int = _RECENT_EPISODES_LIMIT) -> 
     try:
         rows = conn.execute(
             "SELECT * FROM hearth_episodes WHERE entity_id = ?"
+            + hearth_memory._exclude_evaluator_promoted_sql() +
             " ORDER BY observed_at DESC LIMIT ?;",
-            (entity_id, limit),
+            (entity_id, *hearth_memory.EVALUATOR_PROMOTED_EPISODE_TYPES, limit),
         ).fetchall()
         return {"status": "ok", "data": [dict(r) for r in rows], "error": None}
     except Exception as exc:

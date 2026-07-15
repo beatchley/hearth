@@ -23,17 +23,76 @@ Covers: `hearth_pulse.py`, `hearth_experience_evaluator.py`. These sit in a stri
 
 ## Hearth Experience Evaluator (`hearth_experience_evaluator.py`)
 
-- **Purpose**: Decide whether a Pulse-classified event is *meaningful relative to what Hearth already believes* (worldview), and optionally promote that meaning into a durable Episode. "The rule is not 'training_viewed becomes an episode.' The rule is 'a signal becomes an episode when it changes understanding relative to worldview.'" Stated pipeline: `Pulse (hearth_events) → Experience Evaluator → episode candidate → [future] episode → Soul → worldview`.
-- **What it knows**: Keyword taxonomies for matching worldview text to situational categories (`_QUIET_STUCK_KEYWORDS`, `_WAITING_KEYWORDS`) and a conservative per-event-type resolution mapping (currently only `checkin_submitted`). A fixed decision tree: waiting-hit + matching resolution keyword → `resolution`; quiet/stuck-hit + positive-activity event type → `momentum`; waiting-hit with no resolution match → `concern`; no matching worldview entry → `no_action`.
-- **What it can read**: Pathway's `hearth_events` (read-only, only rows already `processed=1` with `experience_level IN ('signal','observation')` — trace rows are never read here). `hearth_memory.db` read-only: `hearth_entities`, and worldview via `get_active_beliefs`/`get_open_uncertainties`/`get_watched_changes` scoped by subject.
-- **What it can write**: Nothing by default. When `HEARTH_EXPERIENCE_EVALUATOR_PROMOTE=1` (default `0`), it writes rows into `hearth_episodes` via `hearth_memory.create_episode()`, with `episode_type ∈ {resolution, momentum, concern}` and `reference_key = "pulse_event_{id}"` for idempotent dedup. It never writes to `hearth_events` and never writes to worldview tables directly.
-- **What it can propose**: Not in the literal `hearth_furniture_proposals`-style sense. Its default (`PROMOTE=0`) mode is the closest thing to a dry-run: it returns a `candidates` list and only logs "would promote signal... as {candidate_type}" — no backing table, not queryable after the run ends.
-- **What it can never do**: Write `hearth_worldview_*` tables. Update `hearth_events`. Read/evaluate `trace`-level events (excluded by the query itself, not just by rule). Treat `message_sent` differently than any other unlisted event type — it isn't in the positive-activity set, so it can only ever reach `concern`/`no_action` for it, never `momentum`/`resolution`, consistent with the private-message exclusion carried over from Pulse.
-- **Rooms touched**: Reads Identity and Worldview, read-only. Writes Episodes only when `PROMOTE=1`.
-- **Dependencies**: `hearth_memory`, `hearth_worldview`. Also imports `hearth_identity.get_user_identity, is_staff_user` — but **neither name is referenced anywhere else in the file** (dead import, likely a vestige of a planned staff-filtering feature that was never built — see conflicts document).
-- **Consumers**: `hearth_scheduler.py:hearth_pulse_job()`, immediately after Pulse, gated on `HEARTH_EXPERIENCE_EVALUATOR_ENABLED` (default on). No other module in `hearth/` imports this. On the Pathway side, `hearth_reader.py` explicitly names and excludes this module's output — `concern`/`momentum`/`resolution` episode types are filtered from every manager-facing dashboard query via `_exclude_promoted_evaluator_sql()`, because their `description` field is "internal Pulse-signal debug text... not written for manager consumption." They remain visible to `hearth_memory` and Soul, just not to the admin UI.
+**Architecture decision: momentum-only, permanently.** The Experience
+Evaluator detects momentum/trend patterns from general Pathway activity —
+nothing else. Concern and resolution detection are permanently out of
+scope for this module, by deliberate architecture decision, not because
+the rules haven't been written yet or Pathway hasn't emitted the right
+events yet. Concerns and resolutions belong exclusively to purpose-built
+Watchers (`morning_briefing.py`'s `detect_*`/`resolve_*` functions), which
+have real, specific knowledge of the condition they check — an unanswered
+training comment, a missing Discord invite, a check-in still awaiting
+feedback. This module only ever sees Pulse's general activity stream; it
+has no comparable specific knowledge, and guessing at it from general
+activity is exactly what caused a real production defect: duplicate and
+contradictory episodes affecting active entities 11 and 39, plus invalid
+episodes on the 15/16 duplicate-inactive-entity pair. The fix (a durable
+per-event ledger, structural target discovery, deleting the false
+`checkin_submitted → checkin_feedback_waiting` resolution mapping and the
+generic "any event + any waiting item = concern" fallback) was originally
+scoped as "no live resolution/concern rule exists *yet*"; a follow-up
+decision made it permanent instead — see the module's own docstring
+("Permanent scope: momentum only") for the full reasoning, and
+`hearth_experience_evaluator_cleanup.py` for the one-time repair of the
+affected entities.
 
-**Currently a write-only feature with no display consumer**: even with promotion enabled, its episodes are excluded from every dashboard query, including the one that feeds Coach Hub routing. As of this reading, no manager-facing surface displays them. Documented as intentional V1 scope in `hearth_reader.py`, not a bug — but worth naming plainly: the promotion feature exists in code and is not yet "live" in any user-facing sense.
+- **Purpose**: Decide whether a Pulse-classified event is a genuine
+  momentum/reactivation signal *relative to what Hearth already believes*
+  (worldview), and optionally promote that into a durable Episode.
+- **What it knows**: One allowlisted rule table (`_MOMENTUM_RULES`) matching
+  positive-activity event types against structurally-identified "quiet/stuck"
+  worldview targets — `hearth_soul`-authored `entity_episode` uncertainties
+  (`new_creator_stuck`) and `creator_quiet_entity` watched changes. Target
+  discovery is structural (subject_type/subject_id equality), not keyword
+  text-matching. There is no resolution-rule table and no concern-rule
+  table — not empty ones, no code path that could hold one.
+- **What it can read**: Pathway's `hearth_events` (read-only, only rows
+  already `processed=1` with `experience_level IN ('signal','observation')`
+  — trace rows are never read here). `hearth_memory.db` read-only:
+  `hearth_entities`, and worldview via `get_living_uncertainties`/
+  `get_watched_changes` scoped by subject. Its own durable ledger,
+  `hearth_experience_evaluations` — one row per source event, recording the
+  terminal classification, exact matched target, and rule that fired.
+- **What it can write**: Nothing by default. When
+  `HEARTH_EXPERIENCE_EVALUATOR_PROMOTE=1` (default `0`), it writes rows
+  into `hearth_episodes` via `hearth_memory.create_episode()`, with
+  `episode_type = 'momentum'` (the only value it ever writes) and
+  `reference_key = "pulse_event_{id}"` for idempotent dedup, hardened by a
+  database-level partial unique index. It never writes to `hearth_events`
+  and never writes to worldview tables directly. A source event is
+  evaluated at most once, ever — a later `EVALUATOR_VERSION` bump does not
+  cause it to be reconsidered; that would require a separate, deliberately
+  human-invoked tool.
+- **What it can never do**: Write `hearth_worldview_*` tables. Update
+  `hearth_events`. Read/evaluate `trace`-level events. Produce a
+  `resolution` or `concern` episode, under any circumstances — structurally,
+  not just by policy.
+- **Rooms touched**: Reads Identity and Worldview, read-only. Writes
+  Episodes only when `PROMOTE=1`.
+- **Dependencies**: `hearth_memory`, `hearth_worldview`.
+- **Consumers**: `hearth_scheduler.py:hearth_pulse_job()`, immediately after
+  Pulse, gated on `HEARTH_EXPERIENCE_EVALUATOR_ENABLED` (default on). No
+  other module in `hearth/` imports this. On the Pathway side,
+  `hearth_reader.py` and `hearth_memory.py` both exclude this module's
+  promoted rows from every manager-facing/trusted-evidence consumer
+  (Daily Brief, Soul, manager dashboards) until promotion has been
+  independently verified — see `hearth_memory.EVALUATOR_PROMOTED_EPISODE_TYPES`.
+
+**Currently a write-only feature with no display consumer**: even with
+promotion enabled, its episodes are excluded from every dashboard query,
+including the one that feeds Coach Hub routing. As of this reading, no
+manager-facing surface displays them. Documented as intentional scope in
+`hearth_reader.py`, not a bug.
 
 ---
 
@@ -41,7 +100,7 @@ Covers: `hearth_pulse.py`, `hearth_experience_evaluator.py`. These sit in a stri
 
 Both `hearth_experience_evaluator.py` (episode_type `"momentum"`) and `hearth_soul.py` (belief_type `"engagement_momentum"`) use the word "momentum" for genuinely different mechanisms with no cross-reference between them:
 
-- **Experience Evaluator's `momentum`**: a single-event, worldview-*gated* signal — fires only when an entity already has an open quiet/stuck-related worldview entry and a positive-activity event then arrives. Reactive to a pre-existing concern.
+- **Experience Evaluator's `momentum`**: a single-event, worldview-*gated* signal — fires only when an entity already has a living quiet/stuck-related worldview target and a positive-activity event then arrives. Reactive to a pre-existing quiet/stuck situation — not to be confused with the (removed, permanently out-of-scope) `concern` episode_type, a different and unrelated concept.
 - **Soul's `engagement_momentum` belief**: an aggregate, rolling-14-day-window pattern — counts distinct eligible activity types regardless of whether any concern was ever open, forming/reinforcing a belief once ≥4 distinct types are seen. Has no dependency on Experience Evaluator at all.
 
 Same English word, disjoint mechanisms, disjoint rooms (Episode vs. Worldview belief), disjoint tables. This is a genuine naming collision worth flagging for intelligence-layer design, not a duplicate implementation to consolidate — see `HEARTH_MIND_99_CONFLICTS_AND_OPEN_QUESTIONS.md`.
