@@ -51,6 +51,18 @@ returned — continuity can reduce retrieval (reusing a previous turn's
 evidence for the same Building) but never bypasses validation,
 authorization, or entity resolution. With attention_frame=None (the
 default), behavior is byte-for-byte identical to before this phase.
+
+Phase 7b addition: answer_question() now also takes an optional
+actor_user_id, and the "unsupported" branch below stages every
+routing-eligible human turn into the Conversation Ledger
+(hearth_conversation_ledger.py) — conversations become the Furniture Fact
+Extractor's eighth observational source. Eligibility is decided purely from
+routed.route (== "unsupported", i.e. none of the three fixed patterns
+below matched) and actor authorization, never from message content — see
+_stage_eligible_conversation_turn() below. This does not change what
+answer_question() returns, does not add a new proposal workflow, and does
+not perform any extraction itself; it only appends to a durable staging
+table that hearth_fact_extractor.py's existing daily batch now also reads.
 """
 
 import logging
@@ -60,6 +72,7 @@ from typing import Optional
 
 import hearth_attention_frame
 import hearth_context
+import hearth_conversation_ledger
 import hearth_manager_advice
 import hearth_memory
 import hearth_traversal
@@ -534,6 +547,57 @@ def _answer_needs_attention_today(memory_conn, gemini_client) -> AskHearthResult
 
 
 # ---------------------------------------------------------------------------
+# 6. Conversation Ledger staging (Phase 7b)
+#
+# Scope is enforced here by routing, not message content, per the Phase 7b
+# build brief: eligible = routed.route == "unsupported" (none of the three
+# fixed patterns above matched — the same routing decision that sends a
+# message to hearth_manager_advice.py at all) AND the actor is authorized
+# (the same ceo/manager/it check hearth_manager_advice.is_actor_authorized()
+# applies, checked independently here so an unauthorized actor's text is
+# never even written to staging, regardless of what hearth_manager_advice.py
+# itself would go on to do with it).
+#
+# This deliberately does NOT additionally require hearth_manager_advice's
+# own internal eligibility gate (entity-mention scan + advice-seeking
+# classifier) to have passed. That gate decides whether Hearth will *answer*
+# with advice; it does not decide whether a conversational turn is eligible
+# Furniture-extraction material. A plain self-fact statement ("My favorite
+# food is cheeseburgers.") names no Building and is not advice-seeking, so
+# hearth_manager_advice's gate would reject it — but it is exactly the kind
+# of open, conversational turn this phase exists to capture. Staging
+# therefore runs before, and independently of, that inner gate.
+# ---------------------------------------------------------------------------
+
+def _stage_eligible_conversation_turn(
+    memory_conn, attention_frame, actor_role: Optional[str], actor_user_id, resolved_text: str,
+) -> None:
+    """Append this turn to the Conversation Ledger if (and only if) it is
+    eligible — see the scope note above. Best-effort: any failure here is
+    logged and swallowed, never allowed to affect the manager's actual
+    answer. Only ever called with the human's incoming message text, never
+    with anything Hearth generates — Hearth's own responses are never
+    staged, by construction (this function has no access to them).
+    """
+    if not hearth_manager_advice.is_actor_authorized(actor_role):
+        return
+    try:
+        hearth_conversation_ledger.stage_conversation_turn(
+            memory_conn,
+            resolved_text,
+            session_id=attention_frame.session_id if attention_frame else None,
+            author_user_id=actor_user_id,
+            actor_role=actor_role,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[ask_hearth] failed to stage conversation turn for Fact Extractor"
+            " staging (non-fatal — the manager's answer is unaffected): %s: %s",
+            type(exc).__name__, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Top-level entry point
 # ---------------------------------------------------------------------------
 
@@ -584,6 +648,7 @@ def answer_question(
     gemini_client=None,
     actor_role: Optional[str] = None,
     attention_frame: Optional[hearth_attention_frame.AttentionFrame] = None,
+    actor_user_id=None,
 ) -> AskHearthResult:
     """Answer one free-text manager question. The only public entry point
     a future Flask layer should call.
@@ -611,6 +676,15 @@ def answer_question(
     all. Every return path below updates the frame (a no-op if None) right
     before returning, so the frame always reflects the most recent turn's
     outcome by the time this function returns.
+
+    actor_user_id (Phase 7b, optional, default None): the calling manager's
+    Pathway users.id, passed straight through to Conversation Ledger
+    staging as the turn's author/default subject candidate (the same role
+    subject_user_column plays for every other Fact Extractor source — see
+    hearth_fact_extractor.py). Omitting it does not disable staging, only
+    the author-as-subject candidate for that staged turn; named-Building
+    mentions in the text are still captured via the extractor's existing
+    entity-mention scan.
     """
     owns_conn = memory_conn is None
     if owns_conn:
@@ -638,6 +712,14 @@ def answer_question(
             fallback_name = attention_frame.focused_entity_name if attention_frame else None
             prior_evidence = attention_frame.last_evidence if attention_frame else None
             prior_entity_id = attention_frame.focused_entity_id if attention_frame else None
+            # Phase 7b: stage before running the cognitive path itself — see
+            # the scope note above _stage_eligible_conversation_turn(). This
+            # is what makes staging happen "immediately when received"
+            # rather than only after (and conditional on) a successful
+            # answer.
+            _stage_eligible_conversation_turn(
+                memory_conn, attention_frame, actor_role, actor_user_id, resolved_text,
+            )
             advice_result, _gate = hearth_manager_advice.answer_manager_advice_question(
                 resolved_text, memory_conn, gemini_client, actor_role,
                 fallback_entity_name=fallback_name,

@@ -50,6 +50,18 @@ still undefined. Private creator DMs, private creator-to-creator metadata,
 and anything outside these approved sources are never inspected — this is
 Hearth's permanent privacy boundary (see HEARTH_SENSORY_POLICY.md).
 
+Phase 7b addition: Ask Hearth conversations are now an eighth approved
+source, via hearth_conversation_ledger.py. Unlike the seven sources above,
+this one is not read from the Pathway DB (pathway_conn) — it is staged by
+hearth_ask.py directly into hearth_memory.db (memory_conn) the moment an
+eligible human turn is received, then read and purged here. Eligibility
+(only manager-advice-cognitive-path turns from an authorized ceo/manager/it
+actor, never a fixed-pattern lookup, never Hearth's own responses) is
+decided entirely in hearth_ask.py at write time — see that module's
+_stage_eligible_conversation_turn(). This is Ask Hearth conversation
+between staff and Hearth itself, never creator-to-creator communication;
+the permanent DM privacy boundary above is unaffected by this addition.
+
 Source edits/deletions: no special handling. hearth_processed_sources keys
 on content_hash, so an edited record is a new identity and will be
 evaluated again on its own terms; a previously-written proposal is never
@@ -65,6 +77,7 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 
+import hearth_conversation_ledger
 import hearth_entity_resolution
 import hearth_furniture
 import hearth_furniture_proposals
@@ -199,6 +212,13 @@ SOURCE_CONFIGS = (
 # generic single-table path — its author/timestamp live on the parent
 # checkin_submissions row, not on the answer row itself (see investigation).
 CHECKIN_ANSWERS_SOURCE_TYPE = "checkin_answers"
+
+# Ask Hearth conversations (Phase 7b): also handled outside the generic
+# single-table path — it lives in hearth_memory.db (memory_conn), not the
+# Pathway DB, since it's Hearth's own staging table rather than a Pathway
+# table. See hearth_conversation_ledger.py and _process_conversation_ledger()
+# below.
+CONVERSATION_LEDGER_SOURCE_TYPE = hearth_conversation_ledger.SOURCE_TYPE
 
 
 # ---------------------------------------------------------------------------
@@ -748,6 +768,40 @@ def run_batch(batch_limit_per_source=DEFAULT_BATCH_LIMIT_PER_SOURCE, dry_run=Fal
             except Exception as exc:
                 source_summary["record_errors"] += 1
                 log(f"[fact_extractor] record error in checkin_answers#{row['id']}: "
+                    f"{type(exc).__name__}: {exc}")
+                continue
+
+        # Ask Hearth conversations (Phase 7b): special-cased fetch/purge, like
+        # checkin_answers above, but reading from memory_conn instead of
+        # pathway_conn — see hearth_conversation_ledger.py and the module
+        # docstring's Phase 7b addition note.
+        source_summary = _empty_source_summary()
+        summary[CONVERSATION_LEDGER_SOURCE_TYPE] = source_summary
+        ledger_rows = hearth_conversation_ledger.get_pending_entries(memory_conn, batch_limit_per_source)
+        source_summary["records_seen"] = len(ledger_rows)
+        for row in ledger_rows:
+            try:
+                text = (row["message_text"] or "").strip()
+                if not text:
+                    continue
+                author_user_id = row["author_user_id"]
+                _process_record(
+                    memory_conn, gemini_client, CONVERSATION_LEDGER_SOURCE_TYPE, row["id"], text,
+                    author_user_id, author_user_id, source_summary, dry_run, log,
+                )
+                # Purge policy: once this turn has been evaluated (whether
+                # newly processed just now, or found already processed from
+                # a prior interrupted run — see get_pending_entries()'s
+                # docstring), it must not linger in staging. Never purge on
+                # dry_run, matching every other source's dry_run discipline
+                # of writing nothing. Only reached if _process_record() did
+                # not raise — a record error below leaves the row staged
+                # for retry on the next run, never silently dropped.
+                if not dry_run:
+                    hearth_conversation_ledger.delete_entry(memory_conn, row["id"])
+            except Exception as exc:
+                source_summary["record_errors"] += 1
+                log(f"[fact_extractor] record error in {CONVERSATION_LEDGER_SOURCE_TYPE}#{row['id']}: "
                     f"{type(exc).__name__}: {exc}")
                 continue
 
