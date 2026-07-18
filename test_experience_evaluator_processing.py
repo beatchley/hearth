@@ -27,7 +27,11 @@ def test_same_event_repeated_unchanged_worldview_stays_stable():
     pconn, ppath = h.make_pathway_db()
     try:
         entity_id = h.make_entity(mconn, user_id=1)
-        eid = h.insert_event(pconn, "message_sent", actor_user_id=1)  # no living targets -> no_match
+        # event type doesn't matter for no_match (triggered by missing targets,
+        # checked before event_type) — must be a SAFE_HEARTH_EVENT_TYPES member
+        # now that the source query filters on it (message_sent no longer
+        # reaches evaluation at all; see test_hearth_experience_evaluator.py).
+        eid = h.insert_event(pconn, "training_viewed", actor_user_id=1)  # no living targets -> no_match
 
         r1 = ev.evaluate_recent_signals(pathway_conn=pconn, memory_conn=mconn, promote=False)
         assert r1["evaluated"] == 1 and r1["no_match"] == 1
@@ -149,7 +153,7 @@ def test_no_match_not_repeatedly_reconsidered():
     mconn, mpath = h.make_memory_db()
     pconn, ppath = h.make_pathway_db()
     try:
-        eid = h.insert_event(pconn, "message_sent", actor_user_id=999)  # no entity exists for user 999
+        eid = h.insert_event(pconn, "training_viewed", actor_user_id=999)  # no entity exists for user 999
         r1 = ev.evaluate_recent_signals(pathway_conn=pconn, memory_conn=mconn, promote=False)
         assert r1["no_match"] == 1
         row = _ledger_row(mconn, eid)
@@ -181,7 +185,7 @@ def test_version_bump_does_not_auto_replay_history():
     pconn, ppath = h.make_pathway_db()
     try:
         entity_id = h.make_entity(mconn, user_id=999)
-        eid = h.insert_event(pconn, "message_sent", actor_user_id=999)  # no target yet -> no_match
+        eid = h.insert_event(pconn, "training_viewed", actor_user_id=999)  # no target yet -> no_match
 
         r1 = ev.evaluate_recent_signals(pathway_conn=pconn, memory_conn=mconn, promote=False, evaluator_version="1")
         assert r1["evaluated"] == 1 and r1["no_match"] == 1

@@ -25,6 +25,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 import hearth_memory
+from hearth_event_types import SAFE_HEARTH_EVENT_TYPES
 
 load_dotenv()
 
@@ -360,10 +361,20 @@ def _process_unprocessed_hearth_events_detailed(limit=100, include_worldview_con
 
     results = []
     try:
+        # Ingestion-boundary allowlist (Hearth Sensory Policy): only ever
+        # select rows whose event_type is explicitly known-safe, and only the
+        # columns classifiers actually use — not SELECT *. This is what
+        # actually stops a private event type (message_sent or any future
+        # one) from ever loading into Pulse's process, not just from being
+        # acted on downstream. See hearth_event_types.py.
+        placeholders = ", ".join("?" for _ in SAFE_HEARTH_EVENT_TYPES)
         rows = write_conn.execute(
-            "SELECT * FROM hearth_events WHERE processed = 0"
+            "SELECT id, event_type, actor_user_id, target_user_id,"
+            "       reference_id, reference_type, occurred_at"
+            " FROM hearth_events"
+            f" WHERE processed = 0 AND event_type IN ({placeholders})"
             " ORDER BY occurred_at ASC LIMIT ?;",
-            (limit,),
+            (*SAFE_HEARTH_EVENT_TYPES, limit),
         ).fetchall()
 
         needs_memory = any(row["event_type"] == "checkin_submitted" for row in rows)

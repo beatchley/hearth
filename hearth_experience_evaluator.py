@@ -108,6 +108,7 @@ from dotenv import load_dotenv
 
 import hearth_memory
 import hearth_worldview
+from hearth_event_types import SAFE_HEARTH_EVENT_TYPES
 
 load_dotenv()
 
@@ -549,14 +550,26 @@ def _get_unevaluated_signal_events(pathway_conn, memory_conn, limit):
     "Not yet terminally processed" is checked across ALL evaluator
     versions (see _already_processed_event_ids) — a version bump never
     re-queues history here; see EVALUATOR_VERSION's docstring.
+
+    Also filters event_type against SAFE_HEARTH_EVENT_TYPES directly in
+    SQL — defense in depth, matching hearth_soul.py's
+    _collect_momentum_activity() pattern (explicit columns + an
+    event_type IN allowlist). Pulse's own classification already keeps
+    private event types at 'trace' today (excluded here via
+    experience_level), so this never changes observed behavior; it
+    protects against that upstream gate being wrong or missing in the
+    future. See hearth_event_types.py.
     """
     scan_window = max(limit * _SCAN_WINDOW_MULTIPLIER, _MIN_SCAN_WINDOW)
-    placeholders = ", ".join("?" for _ in _EVALUABLE_EXPERIENCE_LEVELS)
+    level_placeholders = ", ".join("?" for _ in _EVALUABLE_EXPERIENCE_LEVELS)
+    type_placeholders = ", ".join("?" for _ in SAFE_HEARTH_EVENT_TYPES)
     candidates = pathway_conn.execute(
-        "SELECT * FROM hearth_events"
-        f" WHERE processed = 1 AND experience_level IN ({placeholders})"
+        "SELECT id, event_type, actor_user_id, target_user_id, occurred_at"
+        " FROM hearth_events"
+        f" WHERE processed = 1 AND experience_level IN ({level_placeholders})"
+        f"   AND event_type IN ({type_placeholders})"
         " ORDER BY id ASC LIMIT ?;",
-        (*_EVALUABLE_EXPERIENCE_LEVELS, scan_window),
+        (*_EVALUABLE_EXPERIENCE_LEVELS, *SAFE_HEARTH_EVENT_TYPES, scan_window),
     ).fetchall()
 
     already_processed = _already_processed_event_ids(memory_conn)

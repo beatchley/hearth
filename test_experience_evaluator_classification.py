@@ -43,22 +43,38 @@ def test_one_terminal_classification_per_event_even_if_worldview_later_changes()
 
 
 def test_unrelated_event_is_rejected_not_promoted():
+    """Unit-level test of the classification rule, not an integration test
+    through evaluate_recent_signals(). Previously this seeded a real
+    message_sent event and ran it through the full pipeline — but Layer 3
+    of the message_sent privacy fix (see hearth_event_types.py) added an
+    event_type IN (SAFE_HEARTH_EVENT_TYPES) filter directly to
+    _get_unevaluated_signal_events()'s SQL, which is the *same* 7-value
+    allowlist _POSITIVE_ACTIVITY_EVENT_TYPES already used for rule matching
+    below. That makes "a real event type that exists in hearth_events but
+    isn't positive-activity" impossible to produce end-to-end any more —
+    message_sent (previously the only such type ever written) is now
+    excluded before evaluate_recent_signals() ever sees it, so rejected_unrelated
+    is unreachable via the live pipeline with any real data. The
+    classification rule itself is still real code (defense in depth for
+    any future SAFE_HEARTH_EVENT_TYPES/_POSITIVE_ACTIVITY_EVENT_TYPES
+    divergence), so it's still tested directly here, at the unit level.
+    """
     mconn, mpath = h.make_memory_db()
-    pconn, ppath = h.make_pathway_db()
     try:
         entity_id = h.make_entity(mconn, user_id=2)
         watcher_id = h.make_watcher_episode(mconn, entity_id, "creator_quiet", reference_key="creator_quiet_2")
         h.make_quiet_change_target(mconn, entity_id, source_episode_id=watcher_id)
-        eid = h.insert_event(pconn, "message_sent", actor_user_id=2)  # not a positive-activity type
 
-        r = ev.evaluate_recent_signals(pathway_conn=pconn, memory_conn=mconn, promote=True)
-        assert r["rejected"] == 1 and r["promoted"] == 0
-        episodes = mconn.execute("SELECT COUNT(*) AS c FROM hearth_episodes;").fetchone()["c"]
-        assert episodes == 1, "only the original watcher episode should exist — nothing promoted"
+        targets = ev._gather_entity_targets(mconn, entity_id)
+        assert targets, "expected a living quiet-family target for this entity"
+
+        fake_event = {"id": 999, "event_type": "some_unallowlisted_type"}
+        result = ev._classify_event(fake_event, entity_id, targets, ev._MOMENTUM_RULES)
+        assert result["classification"] == "rejected_unrelated"
+        assert result["target_type"] is None and result["target_id"] is None
         print("[OK] unrelated event/target combination is rejected, not promoted")
     finally:
         h.cleanup_db(mconn, mpath)
-        h.cleanup_db(pconn, ppath)
 
 
 def test_multiple_quiet_targets_resolve_deterministically():
@@ -144,6 +160,12 @@ def test_resolution_and_concern_are_structurally_impossible():
     (so classification isn't trivially "no_match" for everything) and
     confirms every resulting classification, episode, and ledger row is
     limited to momentum/no_match/rejected_unrelated.
+
+    message_sent deliberately removed from this battery: the source query
+    now excludes it via SAFE_HEARTH_EVENT_TYPES (see hearth_event_types.py),
+    so it's no longer real coverage of anything reaching classify_event —
+    see test_unrelated_event_is_rejected_not_promoted for where that
+    rejection path is still tested, at the unit level.
     """
     mconn, mpath = h.make_memory_db()
     pconn, ppath = h.make_pathway_db()
@@ -152,11 +174,11 @@ def test_resolution_and_concern_are_structurally_impossible():
         watcher_id = h.make_watcher_episode(mconn, entity_id, "creator_quiet", reference_key="creator_quiet_6")
         h.make_quiet_change_target(mconn, entity_id, source_episode_id=watcher_id)
 
-        for event_type in ("checkin_submitted", "training_viewed", "message_sent", "battle_requested"):
+        for event_type in ("checkin_submitted", "training_viewed", "battle_requested"):
             h.insert_event(pconn, event_type, actor_user_id=6, reference_id=9001, reference_type="checkin_submission")
 
         r = ev.evaluate_recent_signals(pathway_conn=pconn, memory_conn=mconn, promote=True, limit=10)
-        assert r["evaluated"] == 4
+        assert r["evaluated"] == 3
 
         for c in r["candidates"]:
             assert c["classification"] == "momentum"

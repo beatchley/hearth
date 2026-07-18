@@ -551,7 +551,14 @@ def _upsert_responsiveness_belief(conn, entity, source_run, confirm):
 # organizational activity over time — not from episode resolution, but from
 # Pulse-classified hearth_events in the Pathway DB. Private DM event types
 # (message_sent, private_messages) are never included; this exclusion is
-# permanent per HEARTH_SENSORY_POLICY.md Category B.
+# permanent per HEARTH_SENSORY_POLICY.md Category B. This module's query
+# below already applies that exclusion as an explicit allowlist (event_type
+# IN (...), not a denylist) — the proven pattern hearth_event_types.py's
+# shared SAFE_HEARTH_EVENT_TYPES now also applies to Pulse and the
+# Experience Evaluator. This set is intentionally NOT the same constant:
+# it's a narrower business-logic subset (which activity types count toward
+# a "diverse engagement" momentum belief — notably excluding
+# user_signed_in), not itself a security boundary, so it stays independent.
 # ---------------------------------------------------------------------------
 
 _MOMENTUM_ELIGIBLE_EVENT_TYPES = frozenset({
