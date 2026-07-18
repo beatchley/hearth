@@ -64,6 +64,8 @@ def ensure_questions_table(conn):
     """)
     _ensure_column(conn, "hearth_questions", "source_type", "TEXT")
     _ensure_column(conn, "hearth_questions", "worldview_uncertainty_id", "INTEGER")
+    _ensure_column(conn, "hearth_questions", "resolution_reason", "TEXT")
+    _ensure_column(conn, "hearth_questions", "resolved_at", "TEXT")
     conn.commit()
 
 
@@ -167,6 +169,46 @@ def dismiss_question(conn, question_id):
         "UPDATE hearth_questions SET status = 'dismissed'"
         " WHERE question_id = ? AND status = 'open';",
         (question_id,),
+    )
+    conn.commit()
+    _resolve_linked_uncertainty(conn, question_id)
+
+
+def list_open_worldview_questions(conn):
+    """Return ALL open questions sourced from a worldview uncertainty (i.e.
+    worldview_uncertainty_id IS NOT NULL), unlimited, oldest first.
+
+    Used by the standing auto-resolution pass (see
+    hearth_soul.resolve_cleared_worldview_questions) and the one-time backlog
+    cleanup utility, both of which must consider the full open backlog every
+    run rather than a capped page. Legacy questions (no worldview link) have
+    no recomputable condition and are correctly excluded — only Soul's own
+    generate_reflection() path knows how to resolve those, if ever.
+    """
+    return conn.execute(
+        "SELECT * FROM hearth_questions"
+        " WHERE status = 'open' AND worldview_uncertainty_id IS NOT NULL"
+        " ORDER BY created_at ASC;"
+    ).fetchall()
+
+
+def auto_resolve_question(conn, question_id, resolution_reason):
+    """Close an open question because the condition it describes has cleared
+    on its own — not because a human answered or dismissed it.
+
+    Sets status='dismissed' (so it drops out of list_open_questions() like
+    any other closed question) plus resolution_reason and resolved_at, which
+    together distinguish this from a human's dismiss_question() call. Only
+    acts on open questions (idempotent — safe to call twice). Also resolves
+    the linked worldview uncertainty, matching mark_question_answered/
+    dismiss_question's existing behavior so it does not resurface either.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE hearth_questions"
+        " SET status = 'dismissed', resolution_reason = ?, resolved_at = ?"
+        " WHERE question_id = ? AND status = 'open';",
+        (resolution_reason, now, question_id),
     )
     conn.commit()
     _resolve_linked_uncertainty(conn, question_id)

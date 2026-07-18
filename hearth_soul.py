@@ -18,6 +18,7 @@ import sqlite3
 import traceback
 from datetime import datetime, timedelta, timezone
 
+import hearth_memory
 import hearth_principles
 import hearth_questions
 import hearth_worldview
@@ -829,6 +830,149 @@ def reflect_on_worldview(conn, new_episodes=None, resolved_episodes=None, source
         traceback.print_exc()
 
     return written
+
+
+# ---------------------------------------------------------------------------
+# Question auto-resolution
+#
+# Neither question type has reliable per-episode provenance: entity_episode
+# uncertainties only ever store the FIRST triggering episode's id (never
+# updated on refresh), and entity (repeat-volume) uncertainties have no
+# per-episode link at all. So resolution never looks at historical
+# provenance — it recomputes the current qualifying condition fresh, using
+# the exact same source query (hearth_memory.get_open_episodes) and counting
+# logic (_group_episode_counts) the trigger path above uses, and closes the
+# question only if that condition no longer holds right now.
+# ---------------------------------------------------------------------------
+
+QUESTION_AUTO_RESOLVE_REASON = "condition_cleared"
+
+
+def _parse_entity_episode_subject(subject_id):
+    """Parse an entity_episode subject_id ("<episode_type>:<entity_id>") into
+    (episode_type, entity_id). Returns (None, None) if subject_id doesn't
+    match that shape — callers must treat that as "cannot recompute", not as
+    entity_id=None being a valid value.
+    """
+    if not subject_id or ":" not in subject_id:
+        return None, None
+    episode_type, _, entity_id_str = subject_id.partition(":")
+    if not episode_type or not entity_id_str:
+        return None, None
+    try:
+        entity_id = int(entity_id_str)
+    except (TypeError, ValueError):
+        return None, None
+    return episode_type, entity_id
+
+
+def _entity_open_episode_count(conn, entity_id):
+    """Current count of open episodes for entity_id, across all types — the
+    same source query (hearth_memory.get_open_episodes) and grouping
+    (_group_episode_counts) _upsert_entity_repeat_uncertainty's trigger path
+    counts against, so resolution can never drift from the trigger condition.
+    """
+    open_for_entity = hearth_memory.get_open_episodes(conn, entity_id=entity_id)
+    entity_counts, _ = _group_episode_counts(open_for_entity)
+    return entity_counts.get(entity_id, 0)
+
+
+def _entity_episode_type_open_count(conn, entity_id, episode_type):
+    """Current count of open episodes of episode_type for entity_id — same
+    source query and grouping as above, just reading the type side of the
+    same _group_episode_counts() call instead of the entity side.
+    """
+    open_for_entity = hearth_memory.get_open_episodes(conn, entity_id=entity_id)
+    _, type_counts = _group_episode_counts(open_for_entity)
+    return type_counts.get(episode_type, 0)
+
+
+def question_condition_cleared(conn, subject_type, subject_id):
+    """Whether the condition a worldview-sourced question describes has
+    stopped holding, recomputed fresh from current open-episode data.
+
+    Returns True (condition cleared, question should resolve), False
+    (condition still holds, question should stay open), or None if
+    subject_type/subject_id can't be interpreted — callers must leave those
+    rows untouched and log them for manual review rather than guessing.
+    """
+    if subject_type == "entity_episode":
+        episode_type, entity_id = _parse_entity_episode_subject(subject_id)
+        if entity_id is None:
+            return None
+        return _entity_episode_type_open_count(conn, entity_id, episode_type) == 0
+
+    if subject_type == "entity":
+        try:
+            entity_id = int(subject_id)
+        except (TypeError, ValueError):
+            return None
+        return _entity_open_episode_count(conn, entity_id) < _REPEAT_CONCERN_THRESHOLD
+
+    return None
+
+
+def resolve_cleared_worldview_questions(conn, dry_run=False):
+    """Standing auto-resolution pass over the open worldview-question backlog.
+
+    For every open question sourced from a worldview uncertainty (see
+    hearth_questions.list_open_worldview_questions), recomputes whether its
+    underlying condition still holds via question_condition_cleared() and
+    closes it (hearth_questions.auto_resolve_question(),
+    resolution_reason=QUESTION_AUTO_RESOLVE_REASON) if not. dry_run=True
+    recomputes and reports without mutating anything — used by the one-time
+    backlog cleanup utility (hearth_question_resolution_cleanup.py) so the
+    exact same decision logic drives both the standing per-scan pass and the
+    cleanup script; there is no second, parallel implementation to drift.
+
+    Returns a list of dicts, one per question considered:
+        {"question_id", "subject_type", "subject_id", "action", "reason"}
+    where action is one of:
+        "resolve" — condition cleared (closed unless dry_run)
+        "keep"    — condition still holds, left open
+        "skip"    — unrecognized/unparseable subject, or a dangling link to
+                    a worldview uncertainty row that no longer exists; never
+                    touched
+    """
+    results = []
+    for question in hearth_questions.list_open_worldview_questions(conn):
+        uncertainty = hearth_worldview.get_uncertainty(conn, question["worldview_uncertainty_id"])
+        if uncertainty is None:
+            results.append({
+                "question_id": question["question_id"], "subject_type": None, "subject_id": None,
+                "action": "skip",
+                "reason": "linked worldview uncertainty not found (dangling reference)",
+            })
+            continue
+
+        subject_type = uncertainty["subject_type"]
+        subject_id = uncertainty["subject_id"]
+        cleared = question_condition_cleared(conn, subject_type, subject_id)
+
+        if cleared is None:
+            results.append({
+                "question_id": question["question_id"], "subject_type": subject_type,
+                "subject_id": subject_id, "action": "skip",
+                "reason": f"unrecognized/unparseable subject_type={subject_type!r} subject_id={subject_id!r}",
+            })
+        elif cleared:
+            if not dry_run:
+                hearth_questions.auto_resolve_question(
+                    conn, question["question_id"], resolution_reason=QUESTION_AUTO_RESOLVE_REASON,
+                )
+            results.append({
+                "question_id": question["question_id"], "subject_type": subject_type,
+                "subject_id": subject_id, "action": "resolve",
+                "reason": "underlying condition no longer holds",
+            })
+        else:
+            results.append({
+                "question_id": question["question_id"], "subject_type": subject_type,
+                "subject_id": subject_id, "action": "keep",
+                "reason": "underlying condition still holds",
+            })
+
+    return results
 
 
 # ---------------------------------------------------------------------------

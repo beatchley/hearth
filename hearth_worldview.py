@@ -461,6 +461,14 @@ def open_uncertainty(conn, subject_type=None, subject_id=None, uncertainty_text=
     return cur.lastrowid
 
 
+def get_uncertainty(conn, uncertainty_id):
+    """Return one uncertainty row by id, or None if not found."""
+    return conn.execute(
+        "SELECT * FROM hearth_worldview_uncertainties WHERE id = ?;",
+        (uncertainty_id,),
+    ).fetchone()
+
+
 def get_open_uncertainties(conn, subject_type=None, subject_id=None, priority=None, limit=None):
     """Return open uncertainties (status='open'), optionally filtered, ordered by updated_at DESC.
 

@@ -2023,6 +2023,25 @@ def run_pipeline(db_path=None, gemini_api_key=None, scan_mode="morning",
                 f" question(s): {surfaced_question_ids}"
             )
 
+        # Standing auto-resolution: close any open worldview-sourced question
+        # whose underlying condition (recomputed fresh from current open
+        # episodes, not historical provenance — see hearth_soul.py) no longer
+        # holds. Runs every scan so the Questions page stops accumulating
+        # faster than it can be reviewed.
+        resolution_results = hearth_soul.resolve_cleared_worldview_questions(memory_conn)
+        resolved_ids = [r["question_id"] for r in resolution_results if r["action"] == "resolve"]
+        skipped = [r for r in resolution_results if r["action"] == "skip"]
+        if resolved_ids:
+            print(
+                f"[HEARTH QUESTIONS] auto-resolved {len(resolved_ids)} question(s) whose"
+                f" condition cleared: {resolved_ids}"
+            )
+        for r in skipped:
+            print(
+                f"[HEARTH QUESTIONS] question_id={r['question_id']} left untouched"
+                f" (needs manual review): {r['reason']}"
+            )
+
         if not effective_send_brief:
             print("[HEARTH BRIEF] skipped: non-morning scan")
             if HEARTH_TRACE:
