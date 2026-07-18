@@ -709,9 +709,11 @@ def collect_data(conn):
 # ---------------------------------------------------------------------------
 
 def _training_comment_waiting_resolution_reason(conn, comment_id):
-    """Determine why a training_comment_waiting episode's comment_id dropped out of
-    query_training_comment_waiting()'s result set, checked in an explicit priority
-    order — one at a time — instead of assuming "absent means resolved".
+    """Determine why a training_comments.id no longer needs attention, checked in
+    an explicit priority order — one at a time — instead of assuming "absent means
+    resolved". Purely a function of comment_id, so it's shared by both
+    training_comment_waiting and training_comment_needs_response episodes (both
+    track the same training_comments table; only the detection query differs).
 
     Set-difference alone can't distinguish a real resolution from an unrelated
     disappearance (an eligibility-query change, a creator-flag glitch, a join
@@ -782,9 +784,13 @@ def resolve_stale_issues(memory_conn, data, tracer=None, pathway_conn=None):
     Each episode type has a defined resolution condition:
       probation                      — user is no longer on probation
       missing_discord                — user now has Discord access
-      training_comment_needs_response — stays open until manually resolved; auto-resolution
-                                        requires a Pathway query for subsequent manager responses
-                                        on the same training (TODO for a future version)
+      training_comment_needs_response — same explicit terminal-reason check as
+                                        training_comment_waiting below (both track a
+                                        training_comments.id and share the identical six
+                                        resolution conditions via
+                                        _training_comment_waiting_resolution_reason).
+                                        Previously had no resolution path at all and stayed
+                                        open until manually resolved.
       training_comment_waiting       — explicit terminal-reason check (see
                                         _training_comment_waiting_resolution_reason), not
                                         set-difference — a comment absent from the current
@@ -862,6 +868,20 @@ def resolve_stale_issues(memory_conn, data, tracer=None, pathway_conn=None):
         }
     else:
         current_comment_waiting_keys = None  # query failed — skip this type
+
+    # Build the set of comment reference_keys still flagged as needing a response
+    # (training_comment_needs_response) — same 48h source query and _comment_needs_response
+    # classifier the detection loop uses, so "still present" here means the same thing it
+    # means there.
+    needs_response_rows = data.get("Training comments for review (48 h)", [])
+    if isinstance(needs_response_rows, list):
+        current_needs_response_keys = {
+            f"training_comment_{row['id']}"
+            for row in needs_response_rows
+            if _comment_needs_response(row["content"], row["role"], row["permissions"])[0]
+        }
+    else:
+        current_needs_response_keys = None  # query failed — skip this type
 
     # Build the set of support thread reference_keys still awaiting staff response
     support_waiting_rows = data.get("Support requests awaiting response", [])
@@ -995,6 +1015,73 @@ def resolve_stale_issues(memory_conn, data, tracer=None, pathway_conn=None):
                         reason=(
                             "comment absent from query_training_comment_waiting() results "
                             "but none of the six known resolution conditions were confirmed"
+                        ),
+                        reference_key=ref_key,
+                        source_table="training_comments",
+                        source_record_id=comment_id,
+                        entity_user_id=user_id,
+                        entity_display_name=ep["display_name"],
+                        confidence="low",
+                    ))
+                except Exception:
+                    pass
+            continue
+
+        # training_comment_needs_response — same six-condition explicit resolution
+        # as training_comment_waiting above (this legacy watcher previously had no
+        # resolution path at all — see this function's docstring). Both episode
+        # types track a training_comments.id (ref_key "training_comment_<id>" here
+        # vs "training_comment_waiting_<id>" above), so the shared per-comment
+        # reason lookup applies unchanged.
+        if ep_type == "training_comment_needs_response" and current_needs_response_keys is not None:
+            if ref_key is None or ref_key in current_needs_response_keys:
+                continue  # still present in this scan's flagged results — still open
+
+            comment_id_str = ref_key[len("training_comment_"):]
+            try:
+                comment_id = int(comment_id_str)
+            except ValueError:
+                comment_id = None
+
+            reason = None
+            if pathway_conn is not None and comment_id is not None:
+                reason = _training_comment_waiting_resolution_reason(pathway_conn, comment_id)
+
+            if reason is not None:
+                hearth_memory.resolve_episode(
+                    memory_conn, ep["id"], now, resolution_reason=reason,
+                )
+                try:
+                    tracer.record(hearth_trace.TraceEntry(
+                        rule_name="resolve_training_comment_needs_response",
+                        episode_type=ep_type,
+                        action_taken="resolved_episode",
+                        reason=reason,
+                        reference_key=ref_key,
+                        source_table="training_comments",
+                        source_record_id=comment_id,
+                        entity_user_id=user_id,
+                        entity_display_name=ep["display_name"],
+                        confidence="high",
+                    ))
+                except Exception:
+                    pass
+            else:
+                print(
+                    f"[HEARTH WARNING] training_comment_needs_response episode {ep['id']} "
+                    f"(comment_id={comment_id_str}) is absent from the current scan's "
+                    "flagged results, but none of the six known resolution conditions "
+                    "could be confirmed — leaving the episode open for investigation "
+                    "instead of auto-resolving it."
+                )
+                try:
+                    tracer.record(hearth_trace.TraceEntry(
+                        rule_name="training_comment_needs_response_unexplained_disappearance",
+                        episode_type=ep_type,
+                        action_taken="left_open_inconsistency",
+                        reason=(
+                            "comment absent from current scan's flagged results but none "
+                            "of the six known resolution conditions were confirmed"
                         ),
                         reference_key=ref_key,
                         source_table="training_comments",
@@ -1809,6 +1896,11 @@ def detect_new_creator_stuck(memory_conn, data, tracer=None):
             reference_key=ref_key,
             briefing_category="pattern",
         )
+        if action == "reused_open_episode":
+            # days_since_joining (baked into desc above) keeps growing each
+            # run; without this the episode's stored description would freeze
+            # at first detection instead of reflecting current reality.
+            hearth_memory.refresh_episode(memory_conn, _ep_id, desc, severity=severity)
         try:
             tracer.record(hearth_trace.TraceEntry(
                 rule_name="new_creator_stuck",

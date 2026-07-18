@@ -30,6 +30,10 @@ import os
 import sqlite3
 import sys
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import hearth_entity_resolution
 import hearth_fact_extractor as fx
 import hearth_furniture

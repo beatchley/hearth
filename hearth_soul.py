@@ -271,6 +271,19 @@ def _confidence_delta(conn, topic_tag):
     return _UNGROUNDED_DELTA
 
 
+def _entity_display_name(conn, entity_id):
+    """Resolve an entity_id to its display_name for use in stored worldview text.
+
+    Falls back to "a team member" (matching hearth_memory.py's convention for
+    a missing display_name) rather than leaking the raw numeric id into text
+    that becomes a belief/uncertainty/change record.
+    """
+    row = conn.execute(
+        "SELECT display_name FROM hearth_entities WHERE id = ?;", (entity_id,),
+    ).fetchone()
+    return (row["display_name"] if row else None) or "a team member"
+
+
 def _upsert_entity_repeat_uncertainty(conn, entity, count, source_run):
     """Open or refresh a living uncertainty about repeated same-run concerns.
 
@@ -283,8 +296,9 @@ def _upsert_entity_repeat_uncertainty(conn, entity, count, source_run):
     attach — source_run carries the scan-level provenance instead.
     """
     subject_id = str(entity)
+    display_name = _entity_display_name(conn, entity)
     text = (
-        f"Entity {entity} had {count} new concern episode(s) in a single run —"
+        f"{display_name} had {count} new concern episode(s) in a single run —"
         " unclear if this is a meaningful pattern or coincidence."
     )
     result_id, created = hearth_worldview.upsert_uncertainty(
@@ -296,7 +310,7 @@ def _upsert_entity_repeat_uncertainty(conn, entity, count, source_run):
             "Repeated same-run concerns may indicate an emerging issue, but a"
             " single run is not enough evidence on its own."
         ),
-        possible_question=f"Is entity {entity}'s recent concern volume expected or unusual?",
+        possible_question=f"Is {display_name}'s recent concern volume expected or unusual?",
         confidence=_NEW_UNCERTAINTY_CONFIDENCE,
         source_run=source_run,
     )
@@ -406,8 +420,9 @@ def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run, e
     """
     subject_id = f"{episode_type}:{entity}"
     label = episode_type.replace("_", " ")
+    display_name = _entity_display_name(conn, entity)
     text = (
-        f"It is unclear whether the {label} episode for entity {entity} reflects"
+        f"It is unclear whether the {label} episode for {display_name} reflects"
         " a meaningful pattern or an isolated event — worth watching."
     )
     result_id, created = hearth_worldview.upsert_uncertainty(
@@ -419,7 +434,7 @@ def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run, e
             f"A single {label} episode may or may not indicate something worth"
             " acting on — Hearth is unsure without more data."
         ),
-        possible_question=f"Is the {label} episode for entity {entity} part of a larger pattern?",
+        possible_question=f"Is the {label} episode for {display_name} part of a larger pattern?",
         confidence=_SINGLE_SIGNIFICANCE_CONFIDENCE,
         source_episode_id=episode_id,
         source_run=source_run,
@@ -462,8 +477,9 @@ def _upsert_creator_quiet_watch(conn, entity, source_run, episode_id=None):
     cid = hearth_worldview.record_change(
         conn, subject_type="creator_quiet_entity", subject_id=subject_id,
         change_text=(
-            f"Entity {entity} has gone quiet for an extended period. This may indicate"
-            " disengagement, or it may be a temporary lull — it is unclear yet."
+            f"{_entity_display_name(conn, entity)} has gone quiet for an extended period."
+            " This may indicate disengagement, or it may be a temporary lull —"
+            " it is unclear yet."
         ),
         previous_state="not previously flagged at this severity",
         current_state="quiet as of latest run",
@@ -513,7 +529,10 @@ def _upsert_responsiveness_belief(conn, entity, source_run, confirm):
 
     bid = hearth_worldview.add_belief(
         conn, subject_type="entity", subject_id=subject_id, belief_type="responsiveness",
-        belief_text=f"Entity {entity} has shown episodes resolving, suggesting responsiveness to outreach.",
+        belief_text=(
+            f"{_entity_display_name(conn, entity)} has shown episodes resolving,"
+            " suggesting responsiveness to outreach."
+        ),
         confidence=_NEW_BELIEF_CONFIDENCE,
         source_run=source_run,
     )

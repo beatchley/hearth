@@ -767,22 +767,25 @@ _EVIDENCE_RENDERERS = {
 
 # --- Raw entity-ID leak fix ---------------------------------------------
 #
-# Root cause: several of hearth_soul.py's Worldview writers embed the raw
-# numeric entity_id directly into stored free text instead of a resolved
-# display name — e.g. _upsert_responsiveness_belief()'s
+# Root cause (historical): several of hearth_soul.py's Worldview writers
+# used to embed the raw numeric entity_id directly into stored free text
+# instead of a resolved display name — e.g. _upsert_responsiveness_belief()'s
 # `belief_text=f"Entity {entity} has shown episodes resolving..."`, and the
 # same pattern in _upsert_entity_repeat_uncertainty() (uncertainty_text,
-# possible_question) and _upsert_creator_quiet_watch() (change_text). This
-# is inconsistent with _upsert_engagement_momentum_belief(), which already
-# resolves to display_name correctly before writing. That inconsistency
-# lives in hearth_soul.py's write path and is explicitly out of scope here
-# (see module docstring / completion report) — this module never writes
-# Worldview and does not touch how that text is stored.
+# possible_question), _upsert_creator_quiet_watch() (change_text), and
+# _upsert_single_episode_uncertainty() (uncertainty_text, possible_question).
+# This was inconsistent with _upsert_engagement_momentum_belief(), which
+# already resolved to display_name correctly before writing. That
+# inconsistency has since been fixed at the source in hearth_soul.py (all
+# four writers now resolve display_name via _entity_display_name() before
+# writing), so newly-written text no longer carries a raw id.
 #
-# This is a rendering-time fix: every tool's rendered text passes through
-# _resolve_entity_id_mentions() before reaching a response, so a raw
-# "Entity 31" reference is caught and resolved to "Ethan" wherever it
-# appears — not just in belief text, in case the same leak class shows up
+# This module keeps the rendering-time fix regardless: every tool's rendered
+# text passes through _resolve_entity_id_mentions() before reaching a
+# response, so any raw "Entity 31" reference already stored in older rows
+# (written before the source-level fix) is still caught and resolved to
+# "Ethan" wherever it appears — not just in belief text, in case the same
+# leak class shows up
 # in any of the other five tools' output in the future.
 _ENTITY_ID_MENTION_RE = re.compile(r"\bEntity\s+(\d+)\b", re.IGNORECASE)
 
