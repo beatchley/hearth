@@ -1,6 +1,6 @@
 # HEARTH CANONICAL IDENTITY
 
-**Version 1.1 — July 12, 2026**
+**Version 1.2 — July 19, 2026**
 **Status: Canonical. Authoritative for all future Hearth work.**
 
 ---
@@ -222,11 +222,19 @@ This section is more forward-looking than the rest of this document, because it 
 
 Hearth's intelligence, wherever and however it is built, exists to interpret, organize, and explain organizational knowledge — the same three things Soul, Ask Hearth, and the Daily Brief already do separately, each within its own narrow scope. It does not replace human judgment. Section 7's governing principle — Hearth proposes, humans approve — is not superseded by a more capable reasoning layer; if anything, more capable reasoning raises the cost of a wrong proposal, not the case for skipping the human. It exists to help people make better decisions by combining memory (Hearth's own mind and each Building's rooms), evidence (episodes, furniture, and everything else Hearth has actually observed), and reasoning — always within the constitutional boundaries already established in this document, not around them. The same posture toward uncertainty described in Section 10 should get stronger as reasoning grows more capable, not weaker: an intelligence able to investigate more broadly is not thereby entitled to guess more confidently.
 
+**Capabilities, not implementations.** Hearth reasons in terms of capabilities, not implementations. A cognitive process requests what it needs — organizational memory, current information, a calculation, a document read — and the underlying platform determines which specific implementation fulfills that request. Implementations may evolve over time (a weather lookup implemented one way today, a different way in five years) without changing how Hearth reasons about what it needs.
+
+This principle is documentation of a future direction, not a description of current infrastructure. As of this writing, Hearth's real capabilities remain the same explicitly approved, bounded tools and data sources already in use — this principle does not grant, imply, or authorize any new tool, external service, or data source today. [^2]
+
+Critically, this abstraction applies only to how Hearth reasons about what it needs — never to security. Every implementation that could ever fulfill a capability requires its own independent security review, explicit permissions, trust classification, and safeguards, decided on its own merits. Two implementations that satisfy the same capability (for example, a narrow weather API versus open web search both satisfying "current information") may carry very different risk profiles and must never automatically inherit the same trust policy just because they answer the same kind of request. Capability-level thinking must never be used to justify skipping implementation-level review.
+
 ---
 
 ## Footnotes
 
 **[^1]:** This section states what the architecture currently, actually does — it does not resolve the open question underneath it. Worldview writes happen directly, with no proposal/approval gate, in contrast to Furniture and State, which are both structurally barred from direct writes and require human approval via a formal proposal table. `HEARTH_MIND_99_CONFLICTS_AND_OPEN_QUESTIONS.md` finding #9 documents this inconsistency in full — including that the parallel rule for Worldview's "recent lessons" ("only a human promotes a lesson into a principle") is asserted in code comments but has no implementing workflow anywhere, unlike Furniture's formal proposal table. Whether Worldview should eventually gain a proposal layer consistent with Furniture and State, or whether Worldview's direct-write model is the intended permanent design, is left open. This document describes current reality, not a resolution.
+
+**[^2]:** The "Capabilities, not implementations" subsection is a stated future direction, pending its own dedicated design phase — not yet built and not a description of current infrastructure. It does not grant, imply, or authorize any new tool, external service, or data source; Hearth's current capabilities remain the explicitly approved, bounded tools and data sources already documented elsewhere in this document (see Authority Philosophy, Privacy Philosophy). Whether and how this abstraction is eventually implemented, and how implementation-level security review is structurally enforced under it, is left open for that future design phase.
 
 ---
 
@@ -236,3 +244,4 @@ Hearth's intelligence, wherever and however it is built, exists to interpret, or
 |---|---|---|
 | v1.0 | July 12, 2026 | Initial canonical identity document, recovered during Phase 1 (Canonical Identity) from Phase 0's architectural inventory and the existing codebase's constitutional/philosophical language. Formally resolves `HEARTH_MIND_99` findings #4 (room taxonomy) and #5 (which Reflection table is the Reflection room). Footnotes finding #9 (Worldview/Furniture governance inconsistency) without resolving it. |
 | v1.1 | July 12, 2026 | Targeted amendment following joint review. (1) Section 7: added Building-level Reflection (`hearth_entity_reflection_refs`, via `create_entity_ref()`) to the direct-write list — previously omitted. (2) Section 5: reworded the Canonical Hearth Identity bullet so `hearth_worldview_identity` is described as implementing/serving that layer, not as being synonymous with it. (3) Section 9: added one sentence grounding Success in helping people better support one another, not just information quality. (4) Added new Section 11, "Scope of Intelligence," bridging to future Intelligence Layer work — explicitly flagged as more forward-looking than the rest of the document, since no unified Hearth intelligence capability exists yet as built architecture. |
+| v1.2 | July 19, 2026 | Documentation-only addition. Added "Capabilities, not implementations" subsection to Section 11 (Scope of Intelligence): Hearth's cognitive processes should reason in terms of capabilities it needs, with the underlying platform determining which implementation fulfills each request, while security review, permissions, and trust classification remain strictly per-implementation and are never inherited across implementations of the same capability. Footnoted (new [^2]) as a stated future direction pending its own dedicated design phase — not yet built, and not an authorization of any new tool, service, or data source today. |
