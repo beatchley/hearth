@@ -220,8 +220,12 @@ def main():
 
         # =======================================================================
         print(f"\n\n{'#' * 78}\n# SCENARIO 4a: existing fast path still handles its own case\n{'#' * 78}")
+        # Phase 8, Section 1: authorization is now uniform across every
+        # route, including this fixed pattern — actor_role="manager" is
+        # required here for the same reason every other call in this file
+        # already supplies one.
         result = hearth_ask.answer_question(
-            f"Tell me about {ETHAN_NAME}", memory_conn=conn, gemini_client=gemini_client,
+            f"Tell me about {ETHAN_NAME}", memory_conn=conn, gemini_client=gemini_client, actor_role="manager",
         )
         _print_result("Scenario 4a: fast path (tell_me_about_entity) unaffected", result)
         assert result.status == "success"

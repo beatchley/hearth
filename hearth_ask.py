@@ -58,11 +58,46 @@ routing-eligible human turn into the Conversation Ledger
 (hearth_conversation_ledger.py) — conversations become the Furniture Fact
 Extractor's eighth observational source. Eligibility is decided purely from
 routed.route (== "unsupported", i.e. none of the three fixed patterns
-below matched) and actor authorization, never from message content — see
+below matched), Phase 8's scope classification (must be "organizational"),
+and actor authorization, never from message content — see
 _stage_eligible_conversation_turn() below. This does not change what
 answer_question() returns, does not add a new proposal workflow, and does
 not perform any extraction itself; it only appends to a durable staging
 table that hearth_fact_extractor.py's existing daily batch now also reads.
+
+Phase 8 addition: General Knowledge Lane. Two changes to the request flow,
+both applied once, right after route_question() decides a route and before
+anything retrieves or answers:
+
+  1. Uniform service-layer authorization. Previously, the three fixed
+     patterns below (tell_me_about_entity / connected_to_entity /
+     needs_attention_today) relied only on the Flask page gate
+     (/admin/hearth/ask's own role check) — hearth_manager_advice.py was
+     the only path that independently verified actor_role. Every route now
+     refuses with status="not_authorized" before any retrieval unless
+     actor_role is one of hearth_manager_advice.AUTHORIZED_ACTOR_ROLES
+     ("ceo", "manager", "it") — the exact same role set, reused rather than
+     duplicated. This closes that asymmetry; a direct call into
+     answer_question() can no longer reach organizational data, or the new
+     general lane below, by picking an unauthenticated caller.
+
+  2. For a question that still doesn't match any fixed pattern (routed.route
+     == "unsupported"), hearth_scope_classifier.classify_question_scope()
+     decides whether it is "organizational" (unchanged: staged into the
+     Conversation Ledger, then tried against hearth_manager_advice.py exactly
+     as before), "general_knowledge" (a new, narrow lane —
+     hearth_general_knowledge.py answers directly from the model's own
+     knowledge, with no Building resolution, no retrieval, no Conversation
+     Ledger staging, and no Attention Frame evidence write), or
+     "uncertain_or_mixed" (never treated as general knowledge — falls
+     through to the same conservative unsupported/clarification response
+     the "organizational" branch already produces when its own eligibility
+     gate declines). See that module's docstring for the conservative
+     failure rule this rests on.
+
+Every AskHearthResult now also carries a required `provenance` field
+(grounded_organizational / general_model_knowledge / none) — see the
+dataclass docstring below.
 """
 
 import logging
@@ -73,8 +108,10 @@ from typing import Optional
 import hearth_attention_frame
 import hearth_context
 import hearth_conversation_ledger
+import hearth_general_knowledge
 import hearth_manager_advice
 import hearth_memory
+import hearth_scope_classifier
 import hearth_traversal
 from hearth_entity_resolution import EntityResolution, resolve_entity
 from hearth_gemini_config import GEMINI_MODEL_NAME
@@ -92,21 +129,51 @@ class RoutedQuestion:
     entity_query: Optional[str] = None
 
 
+# ---------------------------------------------------------------------------
+# Provenance (Phase 8) — a closed, machine-readable set. Every
+# AskHearthResult carries exactly one of these; never inferred from
+# entity_id, plan, or validation being present/absent, and never expressed
+# only in source_summary prose. See AskHearthResult.provenance docstring.
+# ---------------------------------------------------------------------------
+
+PROVENANCE_GROUNDED_ORGANIZATIONAL = "grounded_organizational"
+PROVENANCE_GENERAL_MODEL_KNOWLEDGE = "general_model_knowledge"
+PROVENANCE_NONE = "none"
+
+VALID_PROVENANCE_VALUES = {
+    PROVENANCE_GROUNDED_ORGANIZATIONAL, PROVENANCE_GENERAL_MODEL_KNOWLEDGE, PROVENANCE_NONE,
+}
+
+
 @dataclass
 class AskHearthResult:
     """The structured result the future Flask layer renders.
 
     status is one of: success, unsupported, ambiguous, not_found, error,
-    not_authorized. not_authorized (Phase 6) is returned only by the
-    manager-advice cognitive path when actor_role isn't one of
+    not_authorized. not_authorized is returned by the service-layer
+    authorization gate (Phase 8, see module docstring) before any route
+    runs, whenever actor_role isn't one of
     hearth_manager_advice.AUTHORIZED_ACTOR_ROLES — distinct from
-    unsupported (the question shape wasn't recognized) and from error (a
-    retrieval failure): this specifically means the actor isn't allowed to
-    ask this kind of question at all, regardless of content.
+    unsupported (the question shape wasn't recognized, or Phase 8's scope
+    classifier could not confidently place it) and from error (a retrieval
+    or answer-generation failure): this specifically means the actor isn't
+    allowed to ask this kind of question at all, regardless of content.
     entity_id is populated whenever a specific Building was resolved (success
     or a retrieval error after resolution), so a future Inspector link can be
     built from it — it is None for needs_attention_today, unsupported,
-    ambiguous, not_found, and not_authorized.
+    ambiguous, not_found, not_authorized, and every Phase 8 general-knowledge
+    result.
+    provenance (Phase 8) is a required, closed-set field — one of
+    PROVENANCE_GROUNDED_ORGANIZATIONAL, PROVENANCE_GENERAL_MODEL_KNOWLEDGE,
+    or PROVENANCE_NONE (see those constants above). It is set explicitly at
+    every construction site in this module, never inferred from whether
+    entity_id/plan/validation happen to be populated. grounded_organizational
+    covers every successful fixed-route, needs-attention, and manager-advice
+    answer; general_model_knowledge covers only a successful Phase 8
+    general-knowledge-lane answer (no Building resolved, no organizational
+    retrieval, no cognitive tool run, no Grounded Assertions validation);
+    none covers everything else — unsupported, ambiguous, not_found, error,
+    not_authorized, and a failed general-knowledge attempt.
     plan is populated only by the manager-advice cognitive path
     (hearth_manager_advice.run_manager_advice_path()) — the structured
     retrieval plan (goal/known/to_verify) it produced, made inspectable
@@ -119,6 +186,7 @@ class AskHearthResult:
     status: str
     answer: str
     source_summary: str
+    provenance: str
     entity_id: Optional[int] = None
     plan: Optional[dict] = None
     validation: Optional[dict] = None
@@ -128,7 +196,10 @@ class AskHearthResult:
 # returned by hearth_manager_advice.py before constructing the dataclass,
 # so an internal-only key that module adds for its own purposes (Phase 7a:
 # "evidence", stashed in the Attention Frame, never rendered to a manager)
-# can never leak into, or break, this dataclass's fixed shape.
+# can never leak into, or break, this dataclass's fixed shape. "provenance"
+# is deliberately excluded here (Phase 8): hearth_manager_advice.py's
+# result dicts never set it — answer_question() below always computes and
+# injects it itself, from status, after this filter runs.
 _ASKHEARTHRESULT_FIELDS = {"status", "answer", "source_summary", "entity_id", "plan", "validation"}
 
 
@@ -140,6 +211,24 @@ _UNSUPPORTED_MESSAGE = (
     "I can currently answer questions about a specific creator/building, or "
     "who needs attention today. I don't know how to answer that yet."
 )
+
+# Phase 8, Section 3: returned when the scope classifier lands on
+# uncertain_or_mixed — deliberately worded as a clarification prompt, not a
+# flat refusal, since the goal here is a safe conservative fallback, not a
+# dead end. Never used for a genuinely organizational question the
+# manager-advice gate simply declined — that case keeps using
+# _UNSUPPORTED_MESSAGE above, unchanged.
+_UNCERTAIN_SCOPE_MESSAGE = (
+    "I want to make sure I don't miss anything organizational here — could you say a "
+    "little more, or let me know if this is about a specific person or Building?"
+)
+
+# Phase 8, Section 1: the uniform service-layer authorization gate's refusal
+# message — same wording as hearth_manager_advice._NOT_AUTHORIZED_MESSAGE,
+# kept as its own local constant rather than importing that module's
+# private name, since the two gates are independent checks that happen to
+# share a role set and a message, not one gate calling the other.
+_SERVICE_NOT_AUTHORIZED_MESSAGE = "This isn't something Hearth can help with for this account."
 
 # Deliberately narrow, deterministic patterns — routing must never depend on
 # LLM judgment. Anything not matched here is unsupported by design, not by
@@ -495,6 +584,7 @@ def _answer_entity_question(entity_id: int, emphasize_connections: bool, gemini_
             status="error",
             answer="I found a matching Building but couldn't assemble its context right now.",
             source_summary=f"Traversal error: {context['error']}",
+            provenance=PROVENANCE_NONE,
             entity_id=entity_id,
         )
 
@@ -515,6 +605,7 @@ def _answer_entity_question(entity_id: int, emphasize_connections: bool, gemini_
         status="success",
         answer=polished if polished else raw_text,
         source_summary=source_summary,
+        provenance=PROVENANCE_GROUNDED_ORGANIZATIONAL,
         entity_id=entity_id,
     )
 
@@ -542,12 +633,13 @@ def _answer_needs_attention_today(memory_conn, gemini_client) -> AskHearthResult
         status="success",
         answer=polished if polished else raw_text,
         source_summary=source_summary,
+        provenance=PROVENANCE_GROUNDED_ORGANIZATIONAL,
         entity_id=None,
     )
 
 
 # ---------------------------------------------------------------------------
-# 6. Conversation Ledger staging (Phase 7b)
+# 6. Conversation Ledger staging (Phase 7b; scope-gated since Phase 8)
 #
 # Scope is enforced here by routing, not message content, per the Phase 7b
 # build brief: eligible = routed.route == "unsupported" (none of the three
@@ -556,7 +648,14 @@ def _answer_needs_attention_today(memory_conn, gemini_client) -> AskHearthResult
 # (the same ceo/manager/it check hearth_manager_advice.is_actor_authorized()
 # applies, checked independently here so an unauthorized actor's text is
 # never even written to staging, regardless of what hearth_manager_advice.py
-# itself would go on to do with it).
+# itself would go on to do with it). Phase 8 adds one more gate at the call
+# site below (not in this function): the scope classifier must have placed
+# the turn in the "organizational" lane. A "general_knowledge" turn never
+# reaches this function at all — it's answered and returned before staging
+# would happen. A "uncertain_or_mixed" turn also never reaches it — see
+# answer_question()'s uncertain_or_mixed branch, which returns a
+# conservative response without calling this function. Neither becomes
+# Furniture-extraction material "merely because it was asked."
 #
 # This deliberately does NOT additionally require hearth_manager_advice's
 # own internal eligibility gate (entity-mention scan + advice-seeking
@@ -565,8 +664,11 @@ def _answer_needs_attention_today(memory_conn, gemini_client) -> AskHearthResult
 # Furniture-extraction material. A plain self-fact statement ("My favorite
 # food is cheeseburgers.") names no Building and is not advice-seeking, so
 # hearth_manager_advice's gate would reject it — but it is exactly the kind
-# of open, conversational turn this phase exists to capture. Staging
-# therefore runs before, and independently of, that inner gate.
+# of open, conversational turn this phase exists to capture (and exactly
+# the kind of message hearth_scope_classifier.py's prompt is written to
+# call "organizational", not "general_knowledge" — see that module's
+# docstring). Staging therefore runs before, and independently of, that
+# inner gate.
 # ---------------------------------------------------------------------------
 
 def _stage_eligible_conversation_turn(
@@ -657,14 +759,16 @@ def answer_question(
     connection. gemini_client is optional — if not provided (or if it fails),
     the raw retrieved summary is returned instead of prose, never nothing.
 
-    actor_role (Phase 6): the calling user's role (e.g. "ceo", "manager",
-    "it", "coach"), passed straight through to the manager-advice cognitive
-    path, which independently refuses to run unless it's one of
-    hearth_manager_advice.AUTHORIZED_ACTOR_ROLES — the same role set
-    /admin/hearth/ask already gates on at the Flask route level. This is an
-    additional check, not a replacement for that route-level gate. The
-    three fixed patterns below are unaffected by actor_role — that gap, if
-    any, is out of this phase's scope (see completion report).
+    actor_role (Phase 6, uniform since Phase 8): the calling user's role
+    (e.g. "ceo", "manager", "it", "coach"). Since Phase 8, this function
+    itself refuses with status="not_authorized" before running ANY
+    route — fixed pattern, manager-advice, or general-knowledge — unless
+    it's one of hearth_manager_advice.AUTHORIZED_ACTOR_ROLES, the same
+    role set /admin/hearth/ask already gates on at the Flask route level.
+    This is an additional, structural check, not a replacement for that
+    route-level gate. hearth_manager_advice.py also independently
+    re-verifies actor_role for its own cognitive path, unchanged
+    defense-in-depth from Phase 6.
 
     attention_frame (Phase 7a, optional, default None): the caller's
     session-scoped hearth_attention_frame.AttentionFrame, if a conversation
@@ -698,13 +802,102 @@ def answer_question(
 
         routed = route_question(resolved_text)
 
+        # Phase 8, Section 1: uniform service-layer authorization. Runs once,
+        # immediately after routing decides which branch would otherwise
+        # execute, and before ANY of them retrieve or answer anything —
+        # gating the three fixed patterns below exactly the same way it
+        # gates the unmatched branch's manager-advice and general-knowledge
+        # lanes. route_question() itself is unaffected (pure text
+        # classification, no retrieval, no privileged data). See module
+        # docstring's "Phase 8 addition" for why this closes a real
+        # asymmetry rather than only tightening an existing check: before
+        # this, an unauthorized/omitted actor_role could still get a real
+        # "Tell me about X" or "Who needs attention today?" answer, since
+        # only hearth_manager_advice.py independently verified actor_role.
+        if not hearth_manager_advice.is_actor_authorized(actor_role):
+            result = AskHearthResult(
+                status="not_authorized",
+                answer=_SERVICE_NOT_AUTHORIZED_MESSAGE,
+                source_summary=(
+                    "Ask Hearth service boundary — refused before any retrieval: actor is "
+                    "not authorized."
+                ),
+                provenance=PROVENANCE_NONE,
+                entity_id=None,
+            )
+            _update_attention_frame(attention_frame, memory_conn, question_text, result)
+            return result
+
         if routed.route == "unsupported":
-            # Phase 4: before giving up, try the bounded manager-advice
-            # cognitive path (docs/HEARTH_TOOLSET_MANAGER_ADVICE_SCENARIO.md).
-            # This does not change routing for anything the three routes
-            # above already handle — route_question()'s patterns are tried
-            # first, unconditionally, and are untouched by this branch.
-            # Passes the same pronoun-resolved, normalized text
+            # Phase 8, Section 3: decide whether this unmatched question
+            # needs organizational knowledge, is confidently pure general
+            # knowledge, or is uncertain/mixed — before doing anything else.
+            # See hearth_scope_classifier.py's module docstring for the
+            # conservative failure rule this rests on.
+            scope = hearth_scope_classifier.classify_question_scope(
+                memory_conn, resolved_text, gemini_client, attention_frame=attention_frame,
+            )
+            logger.info(
+                "[ask_hearth] scope classification for unmatched question: scope=%s"
+                " confidence=%.2f reason=%s", scope.scope, scope.confidence, scope.reason,
+            )
+
+            if scope.scope == hearth_scope_classifier.SCOPE_GENERAL_KNOWLEDGE:
+                # Phase 8, Section 4: one direct model call, no Building
+                # resolution, no get_connected_context(), no retrieval
+                # planning, no cognitive tools, no evidence pool, no
+                # Grounded Assertions — see hearth_general_knowledge.py.
+                # Never staged into the Conversation Ledger (Section 8):
+                # _stage_eligible_conversation_turn() is simply never called
+                # on this path.
+                general = hearth_general_knowledge.answer_general_knowledge_question(
+                    resolved_text, gemini_client,
+                )
+                if general.ok:
+                    result = AskHearthResult(
+                        status="success",
+                        answer=general.answer,
+                        source_summary="General knowledge — no Pathway or Hearth records were checked.",
+                        provenance=PROVENANCE_GENERAL_MODEL_KNOWLEDGE,
+                        entity_id=None,
+                    )
+                else:
+                    # Model unavailable/failed: an honest inability answer,
+                    # never a fabricated deterministic fallback.
+                    result = AskHearthResult(
+                        status="error",
+                        answer=general.answer,
+                        source_summary="General-knowledge answer attempt failed.",
+                        provenance=PROVENANCE_NONE,
+                        entity_id=None,
+                    )
+                # entity_id=None and no evidence/plan passed below means
+                # _update_attention_frame() cannot write organizational
+                # state for this turn — see Section 7 (Attention Frame
+                # isolation) in that function's docstring.
+                _update_attention_frame(attention_frame, memory_conn, question_text, result)
+                return result
+
+            if scope.scope == hearth_scope_classifier.SCOPE_UNCERTAIN_OR_MIXED:
+                # Phase 8, Section 3: never treated as general knowledge,
+                # and never routed into manager-advice either — a
+                # conservative unsupported/clarification response, with no
+                # retrieval and no Conversation Ledger staging.
+                result = AskHearthResult(
+                    status="unsupported",
+                    answer=_UNCERTAIN_SCOPE_MESSAGE,
+                    source_summary="",
+                    provenance=PROVENANCE_NONE,
+                    entity_id=None,
+                )
+                _update_attention_frame(attention_frame, memory_conn, question_text, result)
+                return result
+
+            # scope.scope == SCOPE_ORGANIZATIONAL: everything below this
+            # point is unchanged from before Phase 8 — the bounded
+            # manager-advice cognitive path (docs/
+            # HEARTH_TOOLSET_MANAGER_ADVICE_SCENARIO.md), tried before
+            # giving up. Passes the same pronoun-resolved, normalized text
             # route_question() itself matched against — the shared
             # normalization step (outer-quote stripping, whitespace
             # collapse, Phase 7a pronoun resolution) applies once, to every
@@ -730,11 +923,16 @@ def answer_question(
                 evidence = advice_result.get("evidence")
                 plan = advice_result.get("plan")
                 filtered = {k: v for k, v in advice_result.items() if k in _ASKHEARTHRESULT_FIELDS}
+                filtered["provenance"] = (
+                    PROVENANCE_GROUNDED_ORGANIZATIONAL if filtered.get("status") == "success"
+                    else PROVENANCE_NONE
+                )
                 result = AskHearthResult(**filtered)
                 _update_attention_frame(attention_frame, memory_conn, question_text, result, evidence=evidence, plan=plan)
                 return result
             result = AskHearthResult(
-                status="unsupported", answer=_UNSUPPORTED_MESSAGE, source_summary="", entity_id=None,
+                status="unsupported", answer=_UNSUPPORTED_MESSAGE, source_summary="",
+                provenance=PROVENANCE_NONE, entity_id=None,
             )
             _update_attention_frame(attention_frame, memory_conn, question_text, result)
             return result
@@ -752,6 +950,7 @@ def answer_question(
                 status="not_found",
                 answer=f"I couldn't find a Building matching '{routed.entity_query}'.",
                 source_summary="",
+                provenance=PROVENANCE_NONE,
                 entity_id=None,
             )
             _update_attention_frame(attention_frame, memory_conn, question_text, result)
@@ -766,6 +965,7 @@ def answer_question(
                     f"{names}. Which one did you mean?"
                 ),
                 source_summary="",
+                provenance=PROVENANCE_NONE,
                 entity_id=None,
             )
             _update_attention_frame(attention_frame, memory_conn, question_text, result)
@@ -783,6 +983,7 @@ def answer_question(
             status="error",
             answer="Something went wrong answering that question.",
             source_summary=f"Unexpected error: {exc}",
+            provenance=PROVENANCE_NONE,
             entity_id=None,
         )
     finally:
@@ -901,38 +1102,50 @@ if __name__ == "__main__":
         )
 
         print("Step 4: answer_question() end to end, no Gemini client (fallback path)")
-        result = answer_question(f"Tell me about {entity_a_name}", memory_conn=conn, gemini_client=None)
+        # actor_role="manager" (authorized) on every organizational call
+        # below — Phase 8, Section 1 made authorization uniform across all
+        # routes, so an omitted actor_role now fails closed even on these
+        # three fixed patterns (see Step 6).
+        result = answer_question(f"Tell me about {entity_a_name}", memory_conn=conn, gemini_client=None, actor_role="manager")
         assert result.status == "success"
         assert result.entity_id == entity_a_id
         assert "Smoke test summary" in result.answer
         assert entity_b_name in result.answer  # connection should appear
+        assert result.provenance == PROVENANCE_GROUNDED_ORGANIZATIONAL
 
-        result = answer_question(f"What is connected to {entity_a_name}", memory_conn=conn, gemini_client=None)
+        result = answer_question(f"What is connected to {entity_a_name}", memory_conn=conn, gemini_client=None, actor_role="manager")
         assert result.status == "success"
         assert entity_b_name in result.answer
+        assert result.provenance == PROVENANCE_GROUNDED_ORGANIZATIONAL
 
-        result = answer_question("Who needs attention today?", memory_conn=conn, gemini_client=None)
+        result = answer_question("Who needs attention today?", memory_conn=conn, gemini_client=None, actor_role="manager")
         assert result.status == "success"
         assert _MARKER in result.answer  # support_request_waiting concern present
         assert "Creator quiet" not in result.answer  # _NEVER_BRIEF_EPISODE_TYPES suppressed
+        assert result.provenance == PROVENANCE_GROUNDED_ORGANIZATIONAL
 
         # actor_role="manager" (authorized): this question is meant to prove
-        # the *genuinely unsupported* path (no fixed pattern matches, and the
-        # manager-advice gate finds zero entity mentions) — not to
-        # accidentally exercise Phase 6's authorization refusal instead. An
-        # omitted/unauthorized actor_role would fail closed as
-        # "not_authorized" before reaching that gate at all, which is a
-        # different code path than this assertion is testing.
+        # the *genuinely unsupported* path (no fixed pattern matches, no
+        # known Building mentioned, and gemini_client=None so the scope
+        # classifier's own conservative "no signal -> uncertain_or_mixed"
+        # fallback applies deterministically) — not to accidentally
+        # exercise the authorization refusal instead. An omitted/
+        # unauthorized actor_role would fail closed as "not_authorized"
+        # before reaching that gate at all, which is a different code path
+        # than this assertion is testing.
         result = answer_question("What's the weather like?", memory_conn=conn, gemini_client=None, actor_role="manager")
         assert result.status == "unsupported"
-        assert result.answer == _UNSUPPORTED_MESSAGE
+        assert result.answer == _UNCERTAIN_SCOPE_MESSAGE
+        assert result.provenance == PROVENANCE_NONE
 
-        result = answer_question(f"Tell me about {dup_name}", memory_conn=conn, gemini_client=None)
+        result = answer_question(f"Tell me about {dup_name}", memory_conn=conn, gemini_client=None, actor_role="manager")
         assert result.status == "ambiguous"
         assert dup_name in result.answer
+        assert result.provenance == PROVENANCE_NONE
 
-        result = answer_question(f"Tell me about {_MARKER}_GHOST", memory_conn=conn, gemini_client=None)
+        result = answer_question(f"Tell me about {_MARKER}_GHOST", memory_conn=conn, gemini_client=None, actor_role="manager")
         assert result.status == "not_found"
+        assert result.provenance == PROVENANCE_NONE
 
         print("  All end-to-end assertions passed (no-Gemini fallback path).")
 
@@ -946,10 +1159,71 @@ if __name__ == "__main__":
 
         result = answer_question(
             f"Tell me about {entity_a_name}", memory_conn=conn, gemini_client=_ExplodingGeminiClient(),
+            actor_role="manager",
         )
         assert result.status == "success"
         assert "Smoke test summary" in result.answer  # raw text, Gemini never reached the caller
+        assert result.provenance == PROVENANCE_GROUNDED_ORGANIZATIONAL
         print("  Gemini-failure fallback assertion passed.")
+
+        print("Step 6: Phase 8 Section 1 — uniform service-layer authorization")
+        for question in (
+            f"Tell me about {entity_a_name}",
+            f"What is connected to {entity_a_name}",
+            "Who needs attention today?",
+        ):
+            result = answer_question(question, memory_conn=conn, gemini_client=None, actor_role="coach")
+            assert result.status == "not_authorized", (question, result.status)
+            assert result.provenance == PROVENANCE_NONE
+            result = answer_question(question, memory_conn=conn, gemini_client=None, actor_role=None)
+            assert result.status == "not_authorized", (question, result.status)
+        for role in ("ceo", "manager", "it"):
+            result = answer_question(f"Tell me about {entity_a_name}", memory_conn=conn, gemini_client=None, actor_role=role)
+            assert result.status == "success", (role, result.status)
+        print("  All Phase 8 authorization assertions passed.")
+
+        print("Step 7: Phase 8 Section 4 — general-knowledge lane (fake Gemini client)")
+        class _FakeScopeModels:
+            def __init__(self, scope_json):
+                self._scope_json = scope_json
+
+            def generate_content(self, model, contents):
+                class _Resp:
+                    text = self._scope_json
+                return _Resp()
+
+        class _FakeScopeClient:
+            def __init__(self, scope_json):
+                self.models = _FakeScopeModels(scope_json)
+
+        general_knowledge_client = _FakeScopeClient('{"scope": "general_knowledge", "confidence": 0.95}')
+        # This fake client's generate_content() always returns the same
+        # canned scope JSON, so the subsequent general-answer call (a
+        # second, independent generate_content() invocation) would also
+        # receive that same text as its "answer" — fine for this smoke
+        # test, which only checks the lane taken and provenance, not
+        # answer content (real answer-content coverage lives in
+        # test_general_knowledge_scenario.py against the real model).
+        result = answer_question(
+            "What's the capital of Tennessee?", memory_conn=conn,
+            gemini_client=general_knowledge_client, actor_role="manager",
+        )
+        assert result.status == "success", result.answer
+        assert result.provenance == PROVENANCE_GENERAL_MODEL_KNOWLEDGE
+        assert result.entity_id is None
+        assert result.plan is None
+        assert result.validation is None
+
+        uncertain_client = _FakeScopeClient('{"scope": "uncertain_or_mixed", "confidence": 0.9}')
+        result = answer_question(
+            "Is Ethan a common name?", memory_conn=conn,
+            gemini_client=uncertain_client, actor_role="manager",
+        )
+        assert result.status == "unsupported"
+        assert result.answer == _UNCERTAIN_SCOPE_MESSAGE
+        assert result.provenance == PROVENANCE_NONE
+
+        print("  All Phase 8 general-knowledge-lane smoke assertions passed.")
 
         print("\nAll hearth_ask smoke test assertions passed.")
     finally:
