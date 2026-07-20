@@ -212,6 +212,18 @@ _UNSUPPORTED_MESSAGE = (
     "who needs attention today. I don't know how to answer that yet."
 )
 
+# Distinct from _UNSUPPORTED_MESSAGE above: used only when the manager-advice
+# eligibility gate's classifier itself failed (missing Gemini client, call
+# exception, malformed JSON, invalid field types) rather than genuinely
+# declining the question — see hearth_manager_advice.EligibilityResult.
+# classifier_failure. A genuine decline keeps _UNSUPPORTED_MESSAGE unchanged;
+# this message is honest that the question may well be answerable, but
+# something on Hearth's side prevented it from being answered right now.
+_CLASSIFIER_FAILURE_MESSAGE = (
+    "I ran into a temporary issue trying to understand that question, so I "
+    "wasn't able to answer it just now — please try asking again."
+)
+
 # Phase 8, Section 3: returned when the scope classifier lands on
 # uncertain_or_mixed — deliberately worded as a clarification prompt, not a
 # flat refusal, since the goal here is a safe conservative fallback, not a
@@ -913,7 +925,7 @@ def answer_question(
             _stage_eligible_conversation_turn(
                 memory_conn, attention_frame, actor_role, actor_user_id, resolved_text,
             )
-            advice_result, _gate = hearth_manager_advice.answer_manager_advice_question(
+            advice_result, gate = hearth_manager_advice.answer_manager_advice_question(
                 resolved_text, memory_conn, gemini_client, actor_role,
                 fallback_entity_name=fallback_name,
                 prior_evidence=prior_evidence,
@@ -930,10 +942,24 @@ def answer_question(
                 result = AskHearthResult(**filtered)
                 _update_attention_frame(attention_frame, memory_conn, question_text, result, evidence=evidence, plan=plan)
                 return result
-            result = AskHearthResult(
-                status="unsupported", answer=_UNSUPPORTED_MESSAGE, source_summary="",
-                provenance=PROVENANCE_NONE, entity_id=None,
-            )
+            # advice_result is None: the eligibility gate did not pass. Two
+            # distinct causes collapsed to the same generic message before
+            # this fix — a genuine classification of "not advice-seeking"
+            # (or below-threshold confidence) vs. the classifier/model
+            # itself failing (missing client, call exception, malformed
+            # JSON, invalid fields). gate.classifier_failure (see
+            # hearth_manager_advice.EligibilityResult) distinguishes them;
+            # only the latter gets the honest "temporary issue" message.
+            if gate is not None and gate.classifier_failure:
+                result = AskHearthResult(
+                    status="error", answer=_CLASSIFIER_FAILURE_MESSAGE, source_summary=gate.reason,
+                    provenance=PROVENANCE_NONE, entity_id=None,
+                )
+            else:
+                result = AskHearthResult(
+                    status="unsupported", answer=_UNSUPPORTED_MESSAGE, source_summary="",
+                    provenance=PROVENANCE_NONE, entity_id=None,
+                )
             _update_attention_frame(attention_frame, memory_conn, question_text, result)
             return result
 

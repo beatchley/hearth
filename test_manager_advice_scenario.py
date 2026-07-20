@@ -419,6 +419,63 @@ def main():
         assert advice_result["status"] == "not_authorized"
         assert gate is None, "eligibility gate must never run when authorization fails first"
 
+        # =======================================================================
+        print(f"\n\n{'#' * 78}\n# SCENARIO 11: expanded advice-intent examples classify as eligible (real Gemini)\n{'#' * 78}")
+        # Reliability fix coverage: these four judgment-seeking phrasings
+        # previously risked being declined by the classifier. Called
+        # directly against the real classifier (not through the full
+        # cognitive path, to avoid spending extra retrieval/assertion
+        # Gemini calls per phrasing) against the real "Ethan" Building
+        # already seeded above.
+        _new_phrasings = [
+            f"What concerns you about {ETHAN_NAME}?",
+            f"What concerns you most about {ETHAN_NAME}?",
+            f"What stands out about {ETHAN_NAME}?",
+            f"How worried should I be about {ETHAN_NAME}?",
+        ]
+        for phrasing in _new_phrasings:
+            is_seeking, confidence, genuine = hearth_manager_advice.classify_manager_advice_intent(
+                phrasing, ETHAN_NAME, gemini_client,
+            )
+            print(f"  {phrasing!r} -> is_seeking={is_seeking} confidence={confidence:.2f} genuine={genuine}")
+            assert genuine, f"expected a genuine model classification for {phrasing!r}"
+            assert is_seeking is True, f"expected is_manager_advice_seeking=True for {phrasing!r}, got {is_seeking}"
+            assert confidence >= hearth_manager_advice.CLASSIFIER_CONFIDENCE_THRESHOLD, (
+                f"expected confidence >= {hearth_manager_advice.CLASSIFIER_CONFIDENCE_THRESHOLD} "
+                f"for {phrasing!r}, got {confidence}"
+            )
+
+        # =======================================================================
+        print(f"\n\n{'#' * 78}\n# SCENARIO 12: classifier/model failure is distinguished from a genuine decline\n{'#' * 78}")
+        # No real Gemini call needed here — the classifier is patched to
+        # deterministically simulate its own fallback-on-failure path
+        # (genuine=False), the same shape a missing client, a raised
+        # exception, or malformed JSON would already produce.
+        original_classify = hearth_manager_advice.classify_manager_advice_intent
+
+        def _failing_classify(text, candidate_name, client):
+            return False, 0.0, False
+
+        hearth_manager_advice.classify_manager_advice_intent = _failing_classify
+        try:
+            result = hearth_ask.answer_question(
+                "I noticed Ethan has not been going live much lately and I was "
+                "thinking about reaching out to him. What do you think?",
+                memory_conn=conn, gemini_client=gemini_client, actor_role="manager",
+            )
+        finally:
+            hearth_manager_advice.classify_manager_advice_intent = original_classify
+
+        _print_result("Scenario 12: classifier/model failure", result)
+        assert result.status == "error", f"expected error, got {result.status}: {result.answer}"
+        assert result.answer == hearth_ask._CLASSIFIER_FAILURE_MESSAGE, (
+            f"expected the distinct classifier-failure message, got: {result.answer!r}"
+        )
+        assert result.provenance == hearth_ask.PROVENANCE_NONE
+        assert result.answer != hearth_ask._UNSUPPORTED_MESSAGE, (
+            "classifier/model failure must not be indistinguishable from a genuine decline"
+        )
+
         print("\n\nAll manager-advice scenario assertions passed.")
 
     finally:

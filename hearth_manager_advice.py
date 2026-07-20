@@ -417,6 +417,15 @@ class EligibilityResult:
     candidate_name: Optional[str] = None
     reason: str = ""
     confidence: float = 0.0
+    # True only when ineligibility was caused by classify_manager_advice_intent()
+    # falling back on a genuine failure (missing client, call exception,
+    # malformed JSON, invalid field types) rather than a real model response —
+    # see that function's docstring. False whenever the classifier gave a
+    # genuine answer (even a declining one) or never ran at all (e.g. the
+    # entity-mention check itself failed). Lets a caller give an honest
+    # "something went wrong" message instead of implying the question itself
+    # is unsupported.
+    classifier_failure: bool = False
 
 
 # Part 1 falls back to this heuristic only when find_entity_mentions() (which
@@ -513,9 +522,18 @@ def check_entity_mentions(memory_conn, text: str, fallback_entity_name: Optional
 _ADVICE_CLASSIFIER_PROMPT = """You are classifying one manager message for Hearth, the organizational intelligence system used by Pathway Portal.
 Your ONLY job is to decide whether this message is a manager seeking Hearth's advice, opinion, or judgment about a specific person ("{name}").
 
+Answer "true" for a message asking Hearth to weigh in with its own judgment or opinion about {name}, including (but not limited to) phrasings like:
+- "What do you think about {name}?"
+- "What concerns you about {name}?"
+- "What concerns you most about {name}?"
+- "What stands out about {name}?"
+- "How worried should I be about {name}?"
+These are all judgment/opinion-seeking, not plain factual lookups — they ask Hearth to form and share a view, not just recite recorded facts.
+
 Answer "false" if the message is instead:
 - a request Hearth's existing fixed question types already handle, such as "tell me about {name}", "what's connected to {name}", or "who needs attention today"
 - ordinary conversation, small talk, or a plain statement about {name} with no advice-seeking intent (e.g. praise, a simple factual note, a question about something unrelated)
+- a plain factual question about {name} that has a factual answer, not a request for Hearth's judgment (e.g. "when did {name} last go live?")
 
 You are NOT deciding whether the advice can actually be given. You are NOT answering the message. You are NOT extracting or verifying any facts about {name}.
 
@@ -541,15 +559,33 @@ def classify_manager_advice_intent(text: str, candidate_name: str, gemini_client
     modeled directly on hearth_comment_classifier.classify_training_comment()
     (structured JSON output, conservative bias, confidence score).
 
-    Never raises. Returns (is_advice_seeking: bool, confidence: float);
-    (False, 0.0) on any failure, missing client, or unparsable response —
-    same conservative-default discipline as the comment classifier.
+    Never raises. Returns (is_advice_seeking: bool, confidence: float,
+    genuine: bool); (False, 0.0, False) on any failure, missing client, or
+    unparsable response — same conservative-default discipline as the
+    comment classifier. `genuine` is True only when a real Gemini call
+    returned a parseable, well-typed response; False for every
+    fallback-on-failure path (missing client, call exception, malformed
+    JSON, invalid field types). This is what lets a caller distinguish "the
+    model genuinely said no" from "the classifier itself failed" — the
+    (False, 0.0) pair alone cannot express that difference.
+
+    Every call path logs exactly one result line (see _log below),
+    including the successful ones — previously only failures were logged,
+    which made it impossible to reconstruct why a past request was
+    declined.
 
     Does NOT count against this path's tool-call budget — it is a gate, not
     retrieval; it reads no Hearth memory or organizational data at all.
     """
+    def _log(is_seeking, confidence, genuine, reason):
+        logger.info(
+            "[manager_advice] classifier result: candidate=%r is_seeking=%s confidence=%.2f genuine=%s reason=%s",
+            candidate_name, is_seeking, confidence, genuine, reason,
+        )
+
     if gemini_client is None:
-        return False, 0.0
+        _log(False, 0.0, False, "no_gemini_client")
+        return False, 0.0, False
 
     prompt = _ADVICE_CLASSIFIER_PROMPT.format(name=candidate_name, text=text)
     try:
@@ -557,24 +593,29 @@ def classify_manager_advice_intent(text: str, candidate_name: str, gemini_client
         raw = response.text.strip() if response.text else ""
     except Exception as exc:
         logger.warning("[manager_advice] classifier Gemini call failed: %s", exc)
-        return False, 0.0
+        _log(False, 0.0, False, "call_failed")
+        return False, 0.0, False
 
     try:
         parsed = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         logger.warning("[manager_advice] classifier response not valid JSON: %r", raw[:200])
-        return False, 0.0
+        _log(False, 0.0, False, "malformed_json")
+        return False, 0.0, False
 
     is_seeking = parsed.get("is_manager_advice_seeking")
     confidence = parsed.get("confidence")
     if not isinstance(is_seeking, bool):
-        return False, 0.0
+        _log(False, 0.0, False, "invalid_is_seeking_type")
+        return False, 0.0, False
     try:
         confidence = float(confidence)
     except (TypeError, ValueError):
-        return False, 0.0
+        _log(False, 0.0, False, "invalid_confidence_type")
+        return False, 0.0, False
     confidence = max(0.0, min(1.0, confidence))
-    return is_seeking, confidence
+    _log(is_seeking, confidence, True, "model_classification")
+    return is_seeking, confidence, True
 
 
 def check_eligibility(
@@ -595,11 +636,12 @@ def check_eligibility(
     if mention_status != "one":
         return EligibilityResult(eligible=False, reason=f"entity_mention_check={mention_status}")
 
-    is_seeking, confidence = classify_manager_advice_intent(text, name, gemini_client)
+    is_seeking, confidence, genuine = classify_manager_advice_intent(text, name, gemini_client)
     if not is_seeking or confidence < CLASSIFIER_CONFIDENCE_THRESHOLD:
         return EligibilityResult(
             eligible=False, candidate_name=name, confidence=confidence,
-            reason=f"classifier_declined(is_seeking={is_seeking}, confidence={confidence:.2f})",
+            reason=f"classifier_declined(is_seeking={is_seeking}, confidence={confidence:.2f}, genuine={genuine})",
+            classifier_failure=not genuine,
         )
 
     return EligibilityResult(eligible=True, candidate_name=name, confidence=confidence, reason="eligible")
