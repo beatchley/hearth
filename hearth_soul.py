@@ -245,6 +245,17 @@ _CREATOR_QUIET_SIGNIFICANT_SEVERITIES = frozenset({"medium", "high"})
 
 _SINGLE_SIGNIFICANCE_CONFIDENCE = 0.5
 
+# Deterministic question-family identity, stamped only for the one episode
+# type Build 1 of the manager-answer learning loop covers. Keyed by
+# episode_type (the same ground-truth string this module already branches on
+# to build uncertainty text) so adding a family for another
+# _SINGLE_SIGNIFICANCE_TYPES member later is a one-line addition here, never
+# inferred from rendered question/uncertainty text. Absent entries stay
+# (None, None) — i.e. NULL, identical to today's behavior.
+_QUESTION_FAMILIES_BY_EPISODE_TYPE = {
+    "checkin_feedback_waiting": ("checkin_feedback_waiting", 1),
+}
+
 
 def _group_episode_counts(episodes):
     """Return (entity_counts, type_counts) dicts from a list of episode dicts/Rows."""
@@ -417,6 +428,16 @@ def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run, e
     episode_id (the triggering episode's real hearth_episodes.id, if known) is
     passed through as source_episode_id; source_run still carries which scan
     produced the write.
+
+    This function is shared across every type in _SINGLE_SIGNIFICANCE_TYPES
+    (support_request_waiting, checkin_feedback_waiting, training_comment_waiting,
+    new_creator_stuck, onboarding_engagement, missing_discord) — question_family/
+    question_version are looked up from _QUESTION_FAMILIES_BY_EPISODE_TYPE keyed
+    on the same trusted episode_type this function already uses to build the
+    uncertainty text, so only episode_type values explicitly registered there
+    (currently just checkin_feedback_waiting) are stamped; every other type
+    continues to get NULL family/version exactly as before this identity
+    metadata existed.
     """
     subject_id = f"{episode_type}:{entity}"
     label = episode_type.replace("_", " ")
@@ -424,6 +445,9 @@ def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run, e
     text = (
         f"It is unclear whether the {label} episode for {display_name} reflects"
         " a meaningful pattern or an isolated event — worth watching."
+    )
+    question_family, question_version = _QUESTION_FAMILIES_BY_EPISODE_TYPE.get(
+        episode_type, (None, None)
     )
     result_id, created = hearth_worldview.upsert_uncertainty(
         conn,
@@ -438,6 +462,8 @@ def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run, e
         confidence=_SINGLE_SIGNIFICANCE_CONFIDENCE,
         source_episode_id=episode_id,
         source_run=source_run,
+        question_family=question_family,
+        question_version=question_version,
     )
     if created:
         hearth_worldview.create_entity_ref(

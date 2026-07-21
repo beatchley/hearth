@@ -22,10 +22,13 @@ Tables (created by migrate_add_hearth_worldview.py):
     hearth_worldview_recent_lessons
 """
 
+import logging
 import sqlite3
 from datetime import datetime, timezone
 
 from hearth_memory import MEMORY_DB_PATH
+
+logger = logging.getLogger("hearth.worldview")
 
 _CONFIRM_BUMP = 0.05
 _CHALLENGE_BUMP = 0.05
@@ -121,7 +124,9 @@ def ensure_worldview_tables(conn=None):
                 resolved_at       TEXT,
                 source_episode_id TEXT,
                 source_signal_id  TEXT,
-                source_run        TEXT
+                source_run        TEXT,
+                question_family   TEXT,
+                question_version INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS hearth_worldview_changes (
@@ -224,6 +229,64 @@ def _update_row(conn, table, row_id, fields):
     params = list(fields.values()) + [row_id]
     conn.execute(f"UPDATE {table} SET {set_clause} WHERE id = ?;", params)
     conn.commit()
+
+
+def _has_question_family_columns(conn):
+    """Read-only detector — never mutates schema.
+
+    question_family/question_version are added to an existing database only
+    by the explicit migrate_add_question_family_fields.py script, or created
+    directly by ensure_worldview_tables() for a genuinely fresh database
+    (that CREATE TABLE IF NOT EXISTS already includes both columns). This
+    function only *detects* which situation a given connection is in, so
+    open_uncertainty()/upsert_uncertainty() below can degrade gracefully
+    (skip stamping, log a warning) on an existing database that hasn't run
+    the migration yet, rather than either crashing or silently ALTERing the
+    table at runtime. Deliberately not a self-healing guard — see the
+    Build 1 review notes for why an automatic ALTER TABLE was rejected here
+    even though CREATE TABLE IF NOT EXISTS (a materially different, already
+    zero-risk operation) remains standard practice elsewhere in this module.
+    """
+    try:
+        existing = {
+            row["name"] for row in conn.execute(
+                "PRAGMA table_info(hearth_worldview_uncertainties);"
+            ).fetchall()
+        }
+        return "question_family" in existing and "question_version" in existing
+    except sqlite3.OperationalError:
+        return False  # table itself doesn't exist yet — caller's ensure_worldview_tables() handles that
+
+
+def _with_question_family_columns(conn, base_columns, base_placeholders, base_params,
+                                   question_family, question_version):
+    """Extend an INSERT's column list/placeholders/params with
+    question_family/question_version only when the columns actually exist.
+
+    If the caller didn't ask to stamp identity (both None — true for every
+    uncertainty type except checkin_feedback_waiting today, and for every
+    historical row), this is a silent no-op regardless of schema state: the
+    INSERT looks exactly like it did before Build 1 existed. If the caller
+    did ask to stamp identity but the columns are missing (migration not yet
+    run), log one clear warning and still insert the row — without the
+    identity metadata — rather than raising and breaking Reflection.
+    """
+    if question_family is None and question_version is None:
+        return base_columns, base_placeholders, base_params
+    if _has_question_family_columns(conn):
+        return (
+            base_columns + ", question_family, question_version",
+            base_placeholders + ", ?, ?",
+            base_params + (question_family, question_version),
+        )
+    logger.warning(
+        "question_family=%r/question_version=%r requested but"
+        " hearth_worldview_uncertainties has no question_family/question_version"
+        " columns yet — run migrate_add_question_family_fields.py. Creating this"
+        " uncertainty without identity metadata for now.",
+        question_family, question_version,
+    )
+    return base_columns, base_placeholders, base_params
 
 
 # ---------------------------------------------------------------------------
@@ -442,20 +505,36 @@ def update_relationship_understanding(conn, relationship_id, relationship_summar
 
 def open_uncertainty(conn, subject_type=None, subject_id=None, uncertainty_text=None,
                       why_it_matters=None, possible_question=None, confidence=0.5,
-                      priority="normal", source_episode_id=None, source_signal_id=None):
-    """Insert a new open uncertainty and return its id."""
+                      priority="normal", source_episode_id=None, source_signal_id=None,
+                      question_family=None, question_version=None):
+    """Insert a new open uncertainty and return its id.
+
+    question_family/question_version are optional deterministic identity metadata
+    stamped by the caller (the generator that knows why it's opening this
+    uncertainty) — never inferred here from text. Omit both for uncertainty
+    types that don't yet participate in the manager-answer learning loop; they
+    stay NULL, same as every historical row.
+    """
     if not uncertainty_text:
         raise ValueError("uncertainty_text is required")
     _validate_source_episode_id(source_episode_id)
     now = _now()
+    base_columns = (
+        "subject_type, subject_id, uncertainty_text, why_it_matters, possible_question,"
+        " confidence, priority, status, created_at, updated_at,"
+        " source_episode_id, source_signal_id"
+    )
+    base_placeholders = "?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?"
+    base_params = (
+        subject_type, subject_id, uncertainty_text, why_it_matters, possible_question,
+        _clamp_confidence(confidence), priority, now, now, source_episode_id, source_signal_id,
+    )
+    columns, placeholders, params = _with_question_family_columns(
+        conn, base_columns, base_placeholders, base_params, question_family, question_version,
+    )
     cur = conn.execute(
-        "INSERT INTO hearth_worldview_uncertainties"
-        " (subject_type, subject_id, uncertainty_text, why_it_matters, possible_question,"
-        "  confidence, priority, status, created_at, updated_at,"
-        "  source_episode_id, source_signal_id)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?);",
-        (subject_type, subject_id, uncertainty_text, why_it_matters, possible_question,
-         _clamp_confidence(confidence), priority, now, now, source_episode_id, source_signal_id),
+        f"INSERT INTO hearth_worldview_uncertainties ({columns}) VALUES ({placeholders});",
+        params,
     )
     conn.commit()
     return cur.lastrowid
@@ -520,7 +599,7 @@ def get_living_uncertainties(conn, subject_type=None, subject_id=None, priority=
 def upsert_uncertainty(conn, subject_type=None, subject_id=None, uncertainty_text=None,
                        why_it_matters=None, possible_question=None, confidence=0.5,
                        priority="normal", source_episode_id=None, source_signal_id=None,
-                       source_run=None):
+                       source_run=None, question_family=None, question_version=None):
     """Find or create a living uncertainty for (subject_type, subject_id).
 
     Searches for an existing row with status IN ('open', 'question_surfaced').
@@ -538,6 +617,13 @@ def upsert_uncertainty(conn, subject_type=None, subject_id=None, uncertainty_tex
     source_run for scan-level provenance (e.g. "morning"/"midday"/"evening")
     when the uncertainty is drawn from an aggregate pattern rather than one
     specific episode. See _validate_source_episode_id.
+
+    question_family/question_version are optional deterministic identity
+    metadata, stamped by the caller only. They are written on INSERT only —
+    the refresh (existing-row) path never sets or overwrites them, on
+    purpose: a living row created before its generator started stamping
+    identity stays NULL rather than being silently backfilled the next time
+    it happens to be re-observed.
     """
     if not uncertainty_text:
         raise ValueError("uncertainty_text is required")
@@ -558,15 +644,23 @@ def upsert_uncertainty(conn, subject_type=None, subject_id=None, uncertainty_tex
         _update_row(conn, "hearth_worldview_uncertainties", row["id"], refresh_fields)
         return row["id"], False
 
+    base_columns = (
+        "subject_type, subject_id, uncertainty_text, why_it_matters, possible_question,"
+        " confidence, priority, status, created_at, updated_at, last_seen_at,"
+        " source_episode_id, source_signal_id, source_run"
+    )
+    base_placeholders = "?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?"
+    base_params = (
+        subject_type, subject_id, uncertainty_text, why_it_matters, possible_question,
+        _clamp_confidence(confidence), priority, now, now, now,
+        source_episode_id, source_signal_id, source_run,
+    )
+    columns, placeholders, params = _with_question_family_columns(
+        conn, base_columns, base_placeholders, base_params, question_family, question_version,
+    )
     cur = conn.execute(
-        "INSERT INTO hearth_worldview_uncertainties"
-        " (subject_type, subject_id, uncertainty_text, why_it_matters, possible_question,"
-        "  confidence, priority, status, created_at, updated_at, last_seen_at,"
-        "  source_episode_id, source_signal_id, source_run)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?);",
-        (subject_type, subject_id, uncertainty_text, why_it_matters, possible_question,
-         _clamp_confidence(confidence), priority, now, now, now,
-         source_episode_id, source_signal_id, source_run),
+        f"INSERT INTO hearth_worldview_uncertainties ({columns}) VALUES ({placeholders});",
+        params,
     )
     conn.commit()
     return cur.lastrowid, True

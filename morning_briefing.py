@@ -23,6 +23,7 @@ CT = ZoneInfo("America/Chicago")
 from google import genai
 from dotenv import load_dotenv
 
+import hearth_answer_interpreter
 import hearth_identity
 import hearth_memory
 import hearth_questions
@@ -2053,6 +2054,7 @@ def run_pipeline(db_path=None, gemini_api_key=None, scan_mode="morning",
         hearth_memory.init_tables(memory_conn)
         hearth_soul.ensure_reflections_table(memory_conn)
         hearth_questions.ensure_questions_table(memory_conn)
+        hearth_answer_interpreter.ensure_answer_interpretations_table(memory_conn)
 
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
@@ -2133,6 +2135,18 @@ def run_pipeline(db_path=None, gemini_api_key=None, scan_mode="morning",
                 f"[HEARTH QUESTIONS] question_id={r['question_id']} left untouched"
                 f" (needs manual review): {r['reason']}"
             )
+
+        # Build 1 of the manager-answer learning loop: bounded, background-only
+        # interpretation of newly answered checkin_feedback_waiting questions.
+        # Never calls a model on the live Ask Hearth path or the answer-save
+        # route — only here, in the scheduled Reflection pass — and never
+        # raises into it (process_eligible_answers() catches everything
+        # per-row internally; this try/except is an extra guarantee that a
+        # bug in this still-new subsystem can never take down Reflection).
+        try:
+            hearth_answer_interpreter.process_eligible_answers(memory_conn)
+        except Exception as exc:
+            print(f"[HEARTH INTERPRETER] batch failed unexpectedly, Reflection continuing: {exc}")
 
         if not effective_send_brief:
             print("[HEARTH BRIEF] skipped: non-morning scan")
