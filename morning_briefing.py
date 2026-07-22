@@ -207,6 +207,7 @@ def query_missing_discord(conn):
         FROM users u
         JOIN onboarding_records o ON o.user_id = u.id
         WHERE (o.added_discord = 'needed' OR o.added_discord IS NULL)
+          AND o.archived_at IS NULL
           AND u.status != 'inactive'
         ORDER BY o.created_at DESC
         LIMIT 20;
