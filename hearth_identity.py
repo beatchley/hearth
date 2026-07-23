@@ -187,14 +187,16 @@ def normalize_role(role):
 
 
 def is_creator_user(row_or_dict):
-    """True if either creator flag is set — independent of role/staff status.
+    """True if any creator flag is set — independent of role/staff status.
 
-    A staff member with is_pathway_creator or is_shop_creator set is still
-    a creator; being staff does not remove creator identity.
+    A staff member with is_pathway_creator, is_shop_creator, or
+    is_pathway_seller set is still a creator; being staff does not remove
+    creator identity.
     """
     is_pathway_creator = _get_field(row_or_dict, "is_pathway_creator")
     is_shop_creator = _get_field(row_or_dict, "is_shop_creator")
-    return bool(is_pathway_creator) or bool(is_shop_creator)
+    is_pathway_seller = _get_field(row_or_dict, "is_pathway_seller")
+    return bool(is_pathway_creator) or bool(is_shop_creator) or bool(is_pathway_seller)
 
 
 def is_staff_user(row_or_dict):

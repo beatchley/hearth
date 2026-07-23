@@ -341,7 +341,7 @@ def query_training_comment_waiting(conn, cutoff: datetime):
         FROM training_comments tc
         JOIN users u     ON u.id  = tc.user_id
         JOIN trainings t ON t.id  = tc.training_id
-        WHERE (u.is_pathway_creator = 1 OR u.is_shop_creator = 1)
+        WHERE (u.is_pathway_creator = 1 OR u.is_shop_creator = 1 OR u.is_pathway_seller = 1)
           AND u.status = 'approved'
           AND tc.created_at <= ?
           AND tc.acknowledged_at IS NULL
@@ -416,7 +416,7 @@ def query_support_request_waiting(conn, cutoff: datetime):
         JOIN users u ON u.id = st.creator_id
         LEFT JOIN last_msg_detail lmd ON lmd.thread_id = st.id
         WHERE st.status = 'open'
-          AND (u.is_pathway_creator = 1 OR u.is_shop_creator = 1)
+          AND (u.is_pathway_creator = 1 OR u.is_shop_creator = 1 OR u.is_pathway_seller = 1)
           AND u.status = 'approved'
           AND (
               lmd.thread_id IS NULL
@@ -449,7 +449,7 @@ def query_new_creator_stuck(conn):
                    CAST(julianday('now') - julianday(joined_on) AS INTEGER) AS days_since_joining
             FROM users
             WHERE status = 'approved'
-              AND (is_pathway_creator = 1 OR is_shop_creator = 1)
+              AND (is_pathway_creator = 1 OR is_shop_creator = 1 OR is_pathway_seller = 1)
               AND joined_on IS NOT NULL
               AND julianday('now') - julianday(joined_on) >= ?
         ),
@@ -559,7 +559,7 @@ def query_creator_quiet(conn):
                    COALESCE(NULLIF(tiktok_handle, ''), name) AS display_name
             FROM users
             WHERE status = 'approved'
-              AND (is_pathway_creator = 1 OR is_shop_creator = 1)
+              AND (is_pathway_creator = 1 OR is_shop_creator = 1 OR is_pathway_seller = 1)
         ),
         activity AS (
             SELECT user_id,         visited_at                    AS activity_at,
