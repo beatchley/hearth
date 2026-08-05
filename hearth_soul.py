@@ -245,16 +245,66 @@ _CREATOR_QUIET_SIGNIFICANT_SEVERITIES = frozenset({"medium", "high"})
 
 _SINGLE_SIGNIFICANCE_CONFIDENCE = 0.5
 
-# Deterministic question-family identity, stamped only for the one episode
-# type Build 1 of the manager-answer learning loop covers. Keyed by
-# episode_type (the same ground-truth string this module already branches on
-# to build uncertainty text) so adding a family for another
-# _SINGLE_SIGNIFICANCE_TYPES member later is a one-line addition here, never
-# inferred from rendered question/uncertainty text. Absent entries stay
-# (None, None) — i.e. NULL, identical to today's behavior.
+# Deterministic question-family identity. Keyed by episode_type (the same
+# ground-truth string this module already branches on to build uncertainty
+# text) so adding a family for another _SINGLE_SIGNIFICANCE_TYPES member is
+# a one-line addition here, never inferred from rendered question/
+# uncertainty text. Absent entries stay (None, None) — i.e. NULL.
+#
+# Build 2 of the manager-answer learning loop (see hearth_answer_interpreter.py)
+# made interpretation itself family-agnostic — any question_family/version
+# stamped here immediately activates live model interpretation, semantic
+# validation, grouping, and candidate generation for that question, with no
+# further code. Because a stamp is an activation switch and not just a label,
+# the initial rollout deliberately stamps a narrow set rather than every
+# _SINGLE_SIGNIFICANCE_TYPES member that happens to share this question
+# shape — see the rollout-scope review notes below.
+#
+# ACTIVE (rollout scope, reviewed 2026-08-02):
+#   checkin_feedback_waiting, missing_discord, new_creator_stuck all share
+#   the exact question/uncertainty-text template in
+#   _upsert_single_episode_uncertainty ("Is the {label} episode for
+#   {display_name} part of a larger pattern?") and were explicitly approved
+#   for this rollout.
+#
+# NOT YET ACTIVE — reviewed and deliberately excluded from this rollout,
+# not because the mapping is ambiguous (it isn't — same trusted episode_type
+# key, same template, one-line addition would work identically) but because
+# activating interpretation for them wasn't part of the approved scope:
+#   - support_request_waiting: "Is the support request waiting episode for
+#     {name} part of a larger pattern?" — asks whether a creator's unanswered
+#     support thread reflects a broader support-backlog pattern. A
+#     substantive manager answer (e.g. "yes, support is behind on several
+#     threads this week") would teach real organizational knowledge, not
+#     just close the episode — structurally identical in kind to
+#     checkin_feedback_waiting. Held back for a separate rollout decision.
+#   - training_comment_waiting: "Is the training comment waiting episode for
+#     {name} part of a larger pattern?" — same shape, about unanswered
+#     creator comments on training content. Same reasoning as above.
+#   - onboarding_engagement: "Is the onboarding engagement episode for
+#     {name} part of a larger pattern?" — same template, but as of this
+#     review onboarding_engagement has NO active detector anywhere in
+#     morning_briefing.py; it exists only in _SINGLE_SIGNIFICANCE_TYPES as a
+#     placeholder for a watcher that doesn't exist yet. There is currently no
+#     real manager-facing question to interpret for this type at all, so
+#     stamping it would activate machinery for a question nobody is ever
+#     asked. Revisit once (if) a real onboarding_engagement watcher ships.
+#
+# Adding any of the three above later is a one-line addition to this dict —
+# no other code changes required (see hearth_answer_interpreter.py's
+# family-agnostic engine and backfill_question_family_stamps.py, both of
+# which read this same dict as their only source of truth for the mapping).
 _QUESTION_FAMILIES_BY_EPISODE_TYPE = {
     "checkin_feedback_waiting": ("checkin_feedback_waiting", 1),
+    "missing_discord": ("missing_discord", 1),
+    "new_creator_stuck": ("new_creator_stuck", 1),
 }
+
+# The aggregate "is this entity's recent concern volume a pattern?" question
+# (_upsert_entity_repeat_uncertainty below) is not keyed by episode_type —
+# it reasons over counts across ALL episode types for one entity in a single
+# run — so it gets its own fixed family name rather than a dict entry.
+_RECENT_CONCERN_VOLUME_FAMILY = ("recent_concern_volume", 1)
 
 
 def _group_episode_counts(episodes):
@@ -312,6 +362,7 @@ def _upsert_entity_repeat_uncertainty(conn, entity, count, source_run):
         f"{display_name} had {count} new concern episode(s) in a single run —"
         " unclear if this is a meaningful pattern or coincidence."
     )
+    question_family, question_version = _RECENT_CONCERN_VOLUME_FAMILY
     result_id, created = hearth_worldview.upsert_uncertainty(
         conn,
         subject_type="entity",
@@ -324,6 +375,8 @@ def _upsert_entity_repeat_uncertainty(conn, entity, count, source_run):
         possible_question=f"Is {display_name}'s recent concern volume expected or unusual?",
         confidence=_NEW_UNCERTAINTY_CONFIDENCE,
         source_run=source_run,
+        question_family=question_family,
+        question_version=question_version,
     )
     if created:
         hearth_worldview.create_entity_ref(
@@ -434,10 +487,8 @@ def _upsert_single_episode_uncertainty(conn, episode_type, entity, source_run, e
     new_creator_stuck, onboarding_engagement, missing_discord) — question_family/
     question_version are looked up from _QUESTION_FAMILIES_BY_EPISODE_TYPE keyed
     on the same trusted episode_type this function already uses to build the
-    uncertainty text, so only episode_type values explicitly registered there
-    (currently just checkin_feedback_waiting) are stamped; every other type
-    continues to get NULL family/version exactly as before this identity
-    metadata existed.
+    uncertainty text. Any episode_type not registered there continues to get
+    NULL family/version, same as before this identity metadata existed.
     """
     subject_id = f"{episode_type}:{entity}"
     label = episode_type.replace("_", " ")

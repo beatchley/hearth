@@ -1,24 +1,44 @@
 """
-Hearth Answer Interpreter — Build 1 of the manager-answer-to-Worldview
-learning loop.
+Hearth Answer Interpreter — Build 2: the general-purpose manager-answer
+learning engine.
 
-Turns a manager's answer to a surfaced Worldview question into a durable,
-auditable interpretation attempt, using a local model first (Ollama,
-JSON-schema-constrained) and an optional guarded Gemini fallback, gated by
-deterministic (non-model) validation before anything is treated as accepted.
+Turns a manager's answer to ANY properly stamped Worldview question
+(question_family + question_version both non-null) into a durable, auditable
+interpretation attempt, using a local model first (Ollama, JSON-schema-
+constrained) and an optional guarded Gemini fallback, gated by deterministic
+(non-model) validation plus a constrained local-model semantic check before
+anything is treated as accepted.
 
-Scope for Build 1: only question_family="checkin_feedback_waiting",
-question_version=1 is active. See docs/HEARTH_MIND_09_QUESTIONS_AND_MAINTENANCE.md
-and the hearth_worldview_uncertainties/hearth_answer_interpretations schemas
-for the surrounding architecture.
+Build 1 (see git history — the module docstring used to say "Scope for
+Build 1: only question_family='checkin_feedback_waiting'") special-cased one
+family end to end: a hand-authored FAMILY_DEFINITIONS taxonomy, a fixed
+5-value conclusion vocabulary, keyword/phrase trigger lists, and module-level
+_ACTIVE_FAMILY/_ACTIVE_VERSION constants baked into eligibility and stamping.
+None of that exists anymore. This module never branches on question_family —
+it reasons from whatever question_text/why_it_matters/answer_text a given
+row actually contains, and stamps every attempt from that row's own
+question_family/question_version. A brand-new question family with no
+special-cased code anywhere becomes interpretable the moment a generator
+stamps it (see hearth_soul.py's _QUESTION_FAMILIES_BY_EPISODE_TYPE).
 
-This module does NOT create beliefs, candidates, or change Hearth's future
-judgment. It only interprets and durably records — see aggregate_family()
-for the deterministic, model-free reporting layer.
+This module does NOT create beliefs, candidates promoted to beliefs, or
+change Hearth's future judgment, close/resolve uncertainties, or alter
+question-generation behavior. It only interprets and durably records
+structured claims, and (Build 2) surfaces repeated structured claims as
+learning candidates for human review — see compute_learning_candidates().
+Promotion into durable organizational knowledge remains a separate,
+human-reviewed future action.
 
 Runs only from the background Reflection pass (see morning_briefing.py's
-call to process_eligible_answers()). Never called from the live Ask Hearth
-request path, and never called synchronously from the answer-save route.
+call to process_eligible_answers() and compute_learning_candidates()). Never
+called from the live Ask Hearth request path, and never called synchronously
+from the answer-save route.
+
+Historical Build 1 rows remain fully readable: their raw_conclusion/
+conclusion columns (the old closed pattern taxonomy) are untouched, and the
+new universal_status/raw_status/raw_claims_json columns are simply NULL on
+those rows. See get_review_rows() for how both generations are presented
+uniformly.
 """
 
 import json
@@ -65,8 +85,16 @@ HEARTH_INTERPRETER_OLLAMA_MODEL = os.environ.get(
 )
 HEARTH_INTERPRETER_OLLAMA_TIMEOUT = _env_float("HEARTH_INTERPRETER_OLLAMA_TIMEOUT", 60.0)
 HEARTH_INTERPRETER_BATCH_SIZE = _env_int("HEARTH_INTERPRETER_BATCH_SIZE", 10)
+
+# Identifies the engine/schema behavior — NOT a question family. A version
+# bump here means "the interpretation contract changed"; question_family/
+# question_version (stamped per-row by the generator) remain the separate,
+# orthogonal identity of *what was asked*. Build 1's default
+# ("checkin_feedback_waiting_v1") named a family and is gone — see
+# docs/HEARTH_MIND_09_QUESTIONS_AND_MAINTENANCE.md for why that coupling was
+# structural, not cosmetic.
 HEARTH_INTERPRETER_VERSION = os.environ.get(
-    "HEARTH_INTERPRETER_VERSION", "checkin_feedback_waiting_v1"
+    "HEARTH_INTERPRETER_VERSION", "manager_answer_general_v1"
 )
 HEARTH_INTERPRETER_MAX_RETRIES = _env_int("HEARTH_INTERPRETER_MAX_RETRIES", 3)
 HEARTH_INTERPRETER_RETRY_COOLDOWN_SECONDS = _env_int(
@@ -79,339 +107,93 @@ HEARTH_INTERPRETER_GEMINI_MAX_FALLBACK_CALLS_PER_RUN = _env_int(
     "HEARTH_INTERPRETER_GEMINI_MAX_FALLBACK_CALLS_PER_RUN", 5
 )
 
-SCHEMA_VERSION = "v1"
-
-# The only family/version active in Build 1. Deliberately not a generic
-# registry — a future build can add entries here and to FAMILY_DEFINITIONS
-# without touching the ledger, eligibility, or orchestrator plumbing below,
-# but only entries actually present in FAMILY_DEFINITIONS are ever processed.
-_ACTIVE_FAMILY = "checkin_feedback_waiting"
-_ACTIVE_VERSION = 1
-
-
-# ---------------------------------------------------------------------------
-# Shared closed taxonomy
-# ---------------------------------------------------------------------------
-
-TAXONOMY = (
-    "expected_pattern",
-    "meaningful_signal",
-    "context_dependent",
-    "insufficient_information",
-    "unrelated_or_unclear",
+# Constrained local-model (never Gemini) second pass that checks one
+# structurally-valid claim at a time against the manager's actual words —
+# see PART 6 of the Build 2 design doc / _call_ollama_semantic_check(). On by
+# default because deterministic structural checks alone cannot honestly
+# establish semantic entailment (see module docs).
+HEARTH_INTERPRETER_SEMANTIC_CHECK_ENABLED = _env_bool(
+    "HEARTH_INTERPRETER_SEMANTIC_CHECK_ENABLED", "1"
 )
-_TAXONOMY_SET = frozenset(TAXONOMY)
 
-# Family-specific label meanings, grounded in the actual question Hearth asks
-# for this family (see hearth_soul.py's _upsert_single_episode_uncertainty:
-# "Is the checkin feedback waiting episode for {display_name} part of a
-# larger pattern?"). Used verbatim in the model prompt.
-FAMILY_DEFINITIONS = {
-    "checkin_feedback_waiting": {
-        1: {
-            "question_context": (
-                "Hearth flagged that a creator submitted check-in responses "
-                "but has not yet received feedback from their coach/manager, "
-                "and asked: \"Is the checkin feedback waiting episode for "
-                "this creator part of a larger pattern?\""
-            ),
-            # These meanings answer the exact question Hearth asked — "is
-            # this part of a LARGER PATTERN" (recurring/systemic for this
-            # manager, or across other creators/check-ins) — not the nearby
-            # but different question "is this delay itself normal or
-            # concerning". A delay can be perfectly normal-feeling and still
-            # be part of a pattern (this manager is chronically behind), and
-            # a delay can feel worth mentioning while still being a genuine
-            # one-off. Keep that distinction in the model prompt and in the
-            # deterministic trigger vocabulary below — see the Build 1
-            # semantic-contract review notes.
-            "definitions": {
-                "expected_pattern": (
-                    "The manager indicates this occurrence is isolated or a "
-                    "one-off for this manager/creator — NOT part of a broader "
-                    "or recurring pattern. (The delay itself may or may not "
-                    "feel routine; what matters for this label is that it "
-                    "does not reflect a larger pattern.)"
-                ),
-                "meaningful_signal": (
-                    "The manager indicates this occurrence IS part of a "
-                    "larger pattern — e.g. this manager is behind on several "
-                    "check-ins, this keeps happening, it has happened before, "
-                    "or it reflects a systemic/recurring issue rather than a "
-                    "single isolated event."
-                ),
-                "context_dependent": (
-                    "The manager indicates whether this is part of a larger "
-                    "pattern depends on an additional condition — e.g. how "
-                    "many other check-ins this manager currently has "
-                    "outstanding, whether this happens with other creators "
-                    "too, or another specific factor — rather than a direct "
-                    "yes or no."
-                ),
-                "insufficient_information": (
-                    "The manager cannot yet say whether this reflects a "
-                    "larger pattern because they haven't checked other "
-                    "outstanding feedback, other creators, or need more "
-                    "observation before judging."
-                ),
-                "unrelated_or_unclear": (
-                    "The answer does not address whether this is part of a "
-                    "larger pattern, is internally incoherent, is too "
-                    "ambiguous to resolve, or discusses an unrelated topic."
-                ),
-            },
-            "few_shot": [
-                ("Yes, this manager is behind on several check-ins.", "meaningful_signal"),
-                ("No, this is an isolated delay.", "expected_pattern"),
-                ("I cannot tell yet whether this is happening elsewhere.", "insufficient_information"),
-                ("It depends on how many other check-ins this manager currently has outstanding.", "context_dependent"),
-                ("The creator missed yesterday's battle.", "unrelated_or_unclear"),
-            ],
-        },
-    },
-}
+# Emergency operational kill-switch only — a comma-separated list of
+# question_family values to temporarily skip. Deliberately NOT a semantic
+# registry: it carries no meaning about what any family IS (contrast with
+# Build 1's FAMILY_DEFINITIONS), only whether Reflection should currently
+# attempt it. Empty by default: every properly stamped family is eligible.
+HEARTH_INTERPRETER_FAMILY_DENYLIST = os.environ.get(
+    "HEARTH_INTERPRETER_FAMILY_DENYLIST", ""
+)
+
+# Learning-candidate thresholds (Part 11) — conservative defaults requiring
+# repeated, independent evidence before a structured claim surfaces for
+# human review. Configurable for parity with other Hearth threshold configs
+# (e.g. concern-volume thresholds in hearth_soul.py) without importing any
+# concern-specific semantics.
+HEARTH_LEARNING_CANDIDATE_MIN_INTERPRETATIONS = _env_int(
+    "HEARTH_LEARNING_CANDIDATE_MIN_INTERPRETATIONS", 3
+)
+HEARTH_LEARNING_CANDIDATE_MIN_DISTINCT_SUBJECTS = _env_int(
+    "HEARTH_LEARNING_CANDIDATE_MIN_DISTINCT_SUBJECTS", 3
+)
+
+# Ledger contract version (distinct from HEARTH_INTERPRETER_VERSION, which
+# identifies the engine; this identifies the row *shape*). Build 1 rows were
+# written with SCHEMA_VERSION "v1" (closed taxonomy, no claims table). Build
+# 2 rows are "v2" (universal status + structured claims). Never rewritten
+# retroactively on old rows.
+SCHEMA_VERSION = "v2"
 
 
 # ---------------------------------------------------------------------------
-# Deterministic validation vocabulary
-#
-# Small, conservative substring/phrase checks — not a brittle keyword engine.
-# These exist only to gate/downgrade a model's proposed conclusion against
-# textual evidence; they never invent a *more* substantive label than the
-# model proposed (see validate_interpretation() for the exact precedence).
-#
-# Semantic-contract review note: this vocabulary judges PATTERN vs. ISOLATED
-# occurrence — whether this reflects something recurring/systemic for this
-# manager (or across creators), not whether the delay itself feels long or
-# concerning. "Overdue"/"concerning" language alone does not establish a
-# pattern (a first-time delay can still be overdue), so those words are
-# deliberately NOT meaningful_signal triggers here — recurrence/repetition
-# language is. General normalcy language ("normal", "just needs more time")
-# is kept as expected_pattern (isolated/non-pattern) evidence: in practice
-# that phrasing is how managers most often deny a systemic issue exists (see
-# "Managers just need more time" in the labeled test dataset) even though it
-# doesn't name a specific other instance — a defensible but judgment-call
-# boundary, flagged for review against real manager answers post-launch.
+# Universal contract
 # ---------------------------------------------------------------------------
 
-_BARE_ANSWERS = frozenset({
-    "yes", "no", "maybe", "unsure", "not sure", "i don't know", "i dont know",
-    "idk", "possibly", "wait",
+UNIVERSAL_STATUSES = ("supported", "insufficient_information", "unrelated_or_unclear")
+_UNIVERSAL_STATUS_SET = frozenset(UNIVERSAL_STATUSES)
+
+REQUIRED_CLAIM_FIELDS = (
+    "subject", "predicate", "value", "polarity", "scope",
+    "temporal_status", "conclusion_text", "evidence_quote",
+)
+VALID_POLARITIES = frozenset({"affirmed", "negated", "unknown"})
+VALID_TEMPORAL_STATUSES = frozenset({"current", "past", "future", "ongoing", "unknown"})
+MAX_CLAIMS_PER_ANSWER = 3
+
+_NEGATION_MARKERS = (
+    "no", "not", "n't", "never", "without", "none", "neither", "nor",
+    "denies", "denied", "cannot", "can't",
+)
+
+# Common capitalized words that are not proper nouns/entities — kept short
+# and conservative; only exists to reduce false positives in the entity-
+# grounding heuristic below, never to define family-specific vocabulary.
+_ENTITY_GROUNDING_STOPWORDS = frozenset({
+    "the", "this", "that", "these", "those", "it", "is", "are", "was",
+    "were", "a", "an", "manager", "creator", "coach", "yes", "no", "i",
+    "we", "they", "he", "she", "today", "yesterday", "currently",
+    "overall", "generally", "hearth", "there", "here", "so", "but",
+    "and", "or", "if", "when", "while", "since", "because", "however",
 })
-
-_ON_TOPIC_KEYWORDS = (
-    "feedback", "check-in", "checkin", "check in", "wait", "waiting", "delay",
-    "delayed", "overdue", "respond", "response", "coach", "manager", "submit",
-    "submission", "time", "normal", "pattern", "follow up", "follow-up",
-    "review", "late", "week", "weeks", "day", "days", "check-ins", "checkins",
-    "elsewhere", "outstanding", "creators", "history",
-)
-
-_EXPECTED_PATTERN_TRIGGERS = (
-    # direct isolation language — the strongest, most on-point evidence
-    "isolated", "one-off", "one time", "just this once", "first time",
-    "hasn't happened before", "has not happened before", "not otherwise",
-    "only this one", "not a pattern", "no pattern", "not recurring",
-    # general normalcy/timing language — weaker, secondary evidence that a
-    # manager typically uses to imply "nothing systemic going on" (see note above)
-    "normal", "expected", "nothing unusual", "not unusual", "acceptable",
-    "routine", "more time", "need more time", "needs more time", "fine",
-    "not a problem", "just submitted", "only submitted",
-)
-
-_MEANINGFUL_SIGNAL_TRIGGERS = (
-    "behind on several", "behind on multiple", "several check-ins",
-    "multiple check-ins", "repeatedly", "keeps happening", "happens a lot",
-    "happened before", "has happened before", "not the first time",
-    "recurring", "a pattern of", "every time", "always does this",
-    "always late", "with other creators too", "other creators as well",
-    "systemic", "ongoing issue", "chronic", "several times", "multiple times",
-    "this keeps",
-)
-
-_CONTEXT_DEPENDENT_TRIGGERS = (
-    "depends", "only matters if", "matters if", "unless", "more than a week",
-    "more than a day", "a few days is fine", "provided that", "as long as",
-    "if it", "if this", "if the creator", "if the manager",
-    "depends on how many", "depends whether", "depends on whether",
-    "other creators too",
-)
-
-_INSUFFICIENT_TRIGGERS = (
-    "don't know", "do not know", "not sure", "need to check", "can't tell",
-    "cannot tell", "let's wait", "need more info", "need to know",
-    "unclear how long", "unclear", "need to see", "hard to say",
-    "have to check", "may be", "might be", "not certain",
-    "outstanding feedback", "happening elsewhere", "check their other",
-    "yet whether",
-)
+_CAPITALIZED_TOKEN_RE = re.compile(r"\b[A-Z][a-zA-Z]{2,}\b")
 
 
-def _normalize(text):
+def _normalize_ws(text):
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
-def _matches_any(lower_text, phrases):
-    return any(phrase in lower_text for phrase in phrases)
+def _normalize_quotes(text):
+    return (text or "").replace("‘", "'").replace("’", "'") \
+        .replace("“", '"').replace("”", '"')
 
 
-def _has_meaningful_signal_trigger(lower_text):
-    # No negation-neutralization needed: unlike the old "concern"/"concerning"
-    # vocabulary (which "not concerning" could falsely trigger), the current
-    # pattern-confirming phrases below are all multi-word and don't collide
-    # with the expected_pattern (isolation) phrase list.
-    return _matches_any(lower_text, _MEANINGFUL_SIGNAL_TRIGGERS)
+def _normalize_for_quote_match(text):
+    return _normalize_ws(_normalize_quotes(text))
 
 
-# ---------------------------------------------------------------------------
-# Deterministic validation
-# ---------------------------------------------------------------------------
-
-class ValidationOutcome:
-    """Result of deterministic validation.
-
-    status is the ledger processing state this outcome maps to:
-    'succeeded' | 'ambiguous' | 'rejected_by_validation'.
-    conclusion is non-None only when status == 'succeeded'.
-    """
-
-    __slots__ = ("status", "conclusion", "validation_result", "validation_reason")
-
-    def __init__(self, status, conclusion, validation_result, validation_reason):
-        self.status = status
-        self.conclusion = conclusion
-        self.validation_result = validation_result
-        self.validation_reason = validation_reason
-
-
-def validate_interpretation(question_text, answer_text, raw_conclusion, raw_reason):
-    """Deterministically gate/resolve a model's proposed conclusion.
-
-    question_text is accepted (and intended to be used by future families
-    with multiple question variants) even though Build 1's single fixed
-    question means the rules below key almost entirely off answer_text —
-    see the "they need more time" case in the required test dataset, which
-    must be evaluated against the real question context rather than in
-    isolation, hence the explicit parameter rather than answer-only.
-
-    Never trusts raw model confidence as a safety gate (see module docs) —
-    confidence is not consulted anywhere in this function.
-    """
-    answer_norm = _normalize(answer_text)
-    lower = answer_norm.lower()
-
-    if not answer_norm:
-        return ValidationOutcome(
-            "succeeded", "unrelated_or_unclear", "accepted",
-            "empty or whitespace-only answer",
-        )
-
-    bare_key = lower.strip(" .!?")
-    if bare_key in _BARE_ANSWERS:
-        # Even though the generated question is a direct yes/no ("is this
-        # part of a larger pattern?"), a bare "yes"/"no" carries no
-        # corroborating detail (which manager, which other check-ins, how
-        # this was determined) — it lacks the independent semantic evidence
-        # this label needs to safely become a future organizational-learning
-        # input, so it's treated as insufficient regardless of the literal
-        # answer. A non-bare answer that DOES say "yes, ..." with supporting
-        # detail is evaluated normally below, not short-circuited here.
-        return ValidationOutcome(
-            "succeeded", "insufficient_information", "accepted",
-            f"bare/short answer ({bare_key!r}) provides no independent"
-            " semantic evidence to safely ground a substantive conclusion",
-        )
-
-    if raw_conclusion not in _TAXONOMY_SET:
-        return ValidationOutcome(
-            "rejected_by_validation", None, "rejected",
-            f"model returned a conclusion outside the closed taxonomy: {raw_conclusion!r}",
-        )
-
-    on_topic = _matches_any(lower, _ON_TOPIC_KEYWORDS) or any((
-        _matches_any(lower, _EXPECTED_PATTERN_TRIGGERS),
-        _has_meaningful_signal_trigger(lower),
-        _matches_any(lower, _CONTEXT_DEPENDENT_TRIGGERS),
-        _matches_any(lower, _INSUFFICIENT_TRIGGERS),
-    ))
-    if not on_topic:
-        return ValidationOutcome(
-            "succeeded", "unrelated_or_unclear", "accepted",
-            "no discernible connection to check-in feedback waiting",
-        )
-
-    reason_lower = (raw_reason or "").lower()
-    if raw_conclusion == "expected_pattern" and _has_meaningful_signal_trigger(reason_lower) \
-            and not _matches_any(reason_lower, _EXPECTED_PATTERN_TRIGGERS):
-        return ValidationOutcome(
-            "rejected_by_validation", None, "rejected",
-            "model's conclusion (expected_pattern) conflicts with its own stated reason",
-        )
-    if raw_conclusion == "meaningful_signal" and _matches_any(reason_lower, _EXPECTED_PATTERN_TRIGGERS) \
-            and not _has_meaningful_signal_trigger(reason_lower):
-        return ValidationOutcome(
-            "rejected_by_validation", None, "rejected",
-            "model's conclusion (meaningful_signal) conflicts with its own stated reason",
-        )
-
-    # Conservative labels are never risky to accept once we know the answer
-    # is on-topic — accept the model's own cautious call outright rather
-    # than second-guessing it with weaker deterministic evidence.
-    if raw_conclusion in ("insufficient_information", "unrelated_or_unclear"):
-        return ValidationOutcome(
-            "succeeded", raw_conclusion, "accepted",
-            "model's conservative conclusion accepted; no contrary evidence found",
-        )
-
-    ctx = _matches_any(lower, _CONTEXT_DEPENDENT_TRIGGERS)
-    exp = _matches_any(lower, _EXPECTED_PATTERN_TRIGGERS)
-    sig = _has_meaningful_signal_trigger(lower)
-    insuf = _matches_any(lower, _INSUFFICIENT_TRIGGERS)
-
-    if ctx:
-        candidate = "context_dependent"
-    elif exp and sig:
-        # Conflicting signals the answer itself never resolves — per this
-        # family's own taxonomy definition, that's unrelated_or_unclear
-        # ("is internally incoherent ... or too ambiguous to resolve"), not
-        # a ledger-level ambiguous non-result.
-        return ValidationOutcome(
-            "succeeded", "unrelated_or_unclear", "accepted",
-            "answer contains conflicting expected-pattern and meaningful-signal"
-            " language; treated as unclear per taxonomy definition",
-        )
-    elif exp:
-        candidate = "expected_pattern"
-    elif sig:
-        candidate = "meaningful_signal"
-    elif insuf:
-        candidate = "insufficient_information"
-    else:
-        candidate = None
-
-    if candidate is not None and candidate == raw_conclusion:
-        return ValidationOutcome(
-            "succeeded", candidate, "accepted",
-            f"deterministic evidence for {candidate} matches model's conclusion",
-        )
-
-    if candidate is not None and candidate != raw_conclusion:
-        if insuf and candidate != "insufficient_information":
-            return ValidationOutcome(
-                "succeeded", "insufficient_information", "accepted",
-                f"model proposed {raw_conclusion!r} but deterministic evidence"
-                " pointed elsewhere; downgraded to insufficient_information",
-            )
-        return ValidationOutcome(
-            "ambiguous", None, "ambiguous",
-            f"model proposed {raw_conclusion!r} but deterministic evidence"
-            f" supports {candidate!r} instead — could not safely confirm",
-        )
-
-    return ValidationOutcome(
-        "ambiguous", None, "ambiguous",
-        "on-topic answer but no deterministic evidence for any taxonomy label;"
-        " model's substantive conclusion could not be independently confirmed",
+def _family_denylist():
+    return frozenset(
+        f.strip() for f in HEARTH_INTERPRETER_FAMILY_DENYLIST.split(",") if f.strip()
     )
 
 
@@ -428,16 +210,17 @@ def get_interpreter_connection():
 
 
 def ensure_answer_interpretations_table(conn):
-    """Create hearth_answer_interpretations if missing. Safe to call repeatedly.
+    """Create/upgrade every table this module owns. Safe to call repeatedly.
 
-    Mirrors migrate_add_answer_interpretations.py, for a genuinely fresh
-    database — same CREATE TABLE IF NOT EXISTS convention already used by
+    Mirrors migrate_add_answer_interpretations.py and
+    migrate_add_universal_claims_schema.py for a genuinely fresh database —
+    same CREATE TABLE IF NOT EXISTS convention already used by
     hearth_worldview.ensure_worldview_tables()/hearth_soul.ensure_reflections_table()/
-    hearth_questions.ensure_questions_table(). Called once per Reflection pass
-    from morning_briefing.run_pipeline()'s startup block, alongside those
-    siblings — NOT from process_eligible_answers() below, which only ever
-    reads schema state (see _schema_ready()) and skips gracefully rather than
-    creating anything at interpretation time.
+    hearth_questions.ensure_questions_table(). Called once per Reflection
+    pass from morning_briefing.run_pipeline()'s startup block, alongside
+    those siblings — NOT from process_eligible_answers() below, which only
+    ever reads schema state (see _schema_ready()) and skips gracefully
+    rather than creating anything at interpretation time.
     """
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS hearth_answer_interpretations (
@@ -480,6 +263,89 @@ def ensure_answer_interpretations_table(conn):
     """)
     conn.commit()
 
+    for col, typ in (
+        ("universal_status", "TEXT"),
+        ("raw_status", "TEXT"),
+        ("raw_claims_json", "TEXT"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE hearth_answer_interpretations ADD COLUMN {col} {typ};")
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS hearth_answer_interpretation_claims (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            interpretation_id       INTEGER NOT NULL,
+            uncertainty_id          INTEGER NOT NULL,
+            question_family         TEXT    NOT NULL,
+            question_version        INTEGER NOT NULL,
+            claim_index             INTEGER NOT NULL,
+            subject                 TEXT,
+            predicate               TEXT,
+            value                   TEXT,
+            polarity                TEXT,
+            scope                   TEXT,
+            temporal_status         TEXT,
+            conclusion_text         TEXT,
+            evidence_quote          TEXT,
+            accepted                INTEGER NOT NULL DEFAULT 0,
+            rejection_reason        TEXT,
+            semantic_check_provider TEXT,
+            semantic_check_model    TEXT,
+            semantic_check_result   TEXT,
+            semantic_check_reason   TEXT,
+            created_at              TEXT    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_claims_interpretation
+            ON hearth_answer_interpretation_claims (interpretation_id);
+        CREATE INDEX IF NOT EXISTS idx_claims_uncertainty
+            ON hearth_answer_interpretation_claims (uncertainty_id);
+        CREATE INDEX IF NOT EXISTS idx_claims_family_version
+            ON hearth_answer_interpretation_claims (question_family, question_version);
+        CREATE INDEX IF NOT EXISTS idx_claims_predicate_value
+            ON hearth_answer_interpretation_claims (predicate, value);
+        CREATE INDEX IF NOT EXISTS idx_claims_accepted
+            ON hearth_answer_interpretation_claims (accepted);
+
+        CREATE TABLE IF NOT EXISTS hearth_learning_candidates (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            question_family         TEXT    NOT NULL,
+            question_version        INTEGER NOT NULL,
+            predicate_key           TEXT    NOT NULL,
+            value_key               TEXT    NOT NULL,
+            polarity                TEXT    NOT NULL,
+            scope_key               TEXT    NOT NULL,
+            interpretation_count    INTEGER NOT NULL DEFAULT 0,
+            distinct_subject_count  INTEGER NOT NULL DEFAULT 0,
+            first_observed_at       TEXT,
+            last_observed_at        TEXT,
+            sample_conclusion_text  TEXT,
+            sample_evidence_quote   TEXT,
+            status                  TEXT    NOT NULL DEFAULT 'pending',
+            created_at              TEXT    NOT NULL,
+            updated_at              TEXT    NOT NULL,
+            UNIQUE (question_family, question_version, predicate_key, value_key, polarity, scope_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_candidates_family_version
+            ON hearth_learning_candidates (question_family, question_version);
+        CREATE INDEX IF NOT EXISTS idx_candidates_status
+            ON hearth_learning_candidates (status);
+
+        CREATE TABLE IF NOT EXISTS hearth_learning_candidate_members (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_id  INTEGER NOT NULL,
+            claim_id      INTEGER NOT NULL,
+            created_at    TEXT    NOT NULL,
+            UNIQUE (candidate_id, claim_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_candidate_members_candidate
+            ON hearth_learning_candidate_members (candidate_id);
+    """)
+    conn.commit()
+
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
@@ -502,8 +368,10 @@ def create_pending_attempt(conn, uncertainty_id, question_family, question_versi
                             interpreter_version, retry_of_attempt_id=None):
     """Insert a durable pending attempt row before any provider call is made.
 
-    Every model call must create or update a specifically identifiable
-    attempt — this is that row. Returns the new attempt's id.
+    question_family/question_version are always the CALLING row's own
+    stamped identity — never a module-level default — so every attempt
+    carries its own provenance regardless of which family produced it.
+    Returns the new attempt's id.
     """
     now = _now()
     attempt_number = _next_attempt_number(conn, uncertainty_id)
@@ -530,8 +398,8 @@ def mark_attempt_dispatched(conn, attempt_id, provider, model_name, model_identi
     conn.commit()
 
 
-def _finalize_attempt(conn, attempt_id, *, status, raw_conclusion=None, conclusion=None,
-                       model_confidence=None, model_reason=None, validation_result=None,
+def _finalize_attempt(conn, attempt_id, *, status, raw_status=None, universal_status=None,
+                       raw_claims=None, model_reason=None, validation_result=None,
                        validation_reason=None, failure_category=None, failure_detail=None,
                        is_current_accepted=False):
     now = _now()
@@ -547,43 +415,53 @@ def _finalize_attempt(conn, attempt_id, *, status, raw_conclusion=None, conclusi
         )
     conn.execute(
         "UPDATE hearth_answer_interpretations"
-        " SET status = ?, raw_conclusion = ?, conclusion = ?, model_confidence = ?,"
+        " SET status = ?, raw_status = ?, universal_status = ?, raw_claims_json = ?,"
         "     model_reason = ?, validation_result = ?, validation_reason = ?,"
         "     failure_category = ?, failure_detail = ?, is_current_accepted = ?,"
         "     completed_at = ?"
         " WHERE id = ?;",
-        (status, raw_conclusion, conclusion, model_confidence, model_reason,
-         validation_result, validation_reason, failure_category, failure_detail,
-         1 if is_current_accepted else 0, now, attempt_id),
+        (status, raw_status, universal_status,
+         json.dumps(raw_claims) if raw_claims is not None else None,
+         model_reason, validation_result, validation_reason, failure_category,
+         failure_detail, 1 if is_current_accepted else 0, now, attempt_id),
     )
     conn.commit()
 
 
-def mark_attempt_succeeded(conn, attempt_id, raw_conclusion, conclusion, model_confidence,
+def mark_attempt_succeeded(conn, attempt_id, raw_status, universal_status, raw_claims,
                             model_reason, validation_reason):
     _finalize_attempt(
-        conn, attempt_id, status="succeeded", raw_conclusion=raw_conclusion,
-        conclusion=conclusion, model_confidence=model_confidence, model_reason=model_reason,
+        conn, attempt_id, status="succeeded", raw_status=raw_status,
+        universal_status=universal_status, raw_claims=raw_claims, model_reason=model_reason,
         validation_result="accepted", validation_reason=validation_reason,
         is_current_accepted=True,
     )
 
 
-def mark_attempt_ambiguous(conn, attempt_id, raw_conclusion, model_confidence,
-                            model_reason, validation_reason):
+def mark_attempt_ambiguous(conn, attempt_id, raw_status, raw_claims, model_reason,
+                            validation_reason):
+    """Not currently called by the Build 2 orchestrator — a status=supported
+    attempt whose claims all fail validation is now accepted as
+    insufficient_information instead (see _finalize_via_validation), since
+    that is itself a safe, definitive conclusion rather than something
+    requiring human review. Kept for schema completeness/possible future use
+    and because historical Build 1 rows may already carry status='ambiguous'
+    (retry-eligibility logic still treats it as terminal — see
+    get_eligible_answered_uncertainties()).
+    """
     _finalize_attempt(
-        conn, attempt_id, status="ambiguous", raw_conclusion=raw_conclusion,
-        model_confidence=model_confidence, model_reason=model_reason,
-        validation_result="ambiguous", validation_reason=validation_reason,
+        conn, attempt_id, status="ambiguous", raw_status=raw_status, raw_claims=raw_claims,
+        model_reason=model_reason, validation_result="ambiguous",
+        validation_reason=validation_reason,
     )
 
 
-def mark_attempt_rejected(conn, attempt_id, raw_conclusion, model_confidence,
-                           model_reason, validation_reason):
+def mark_attempt_rejected(conn, attempt_id, raw_status, raw_claims, model_reason,
+                           validation_reason):
     _finalize_attempt(
-        conn, attempt_id, status="rejected_by_validation", raw_conclusion=raw_conclusion,
-        model_confidence=model_confidence, model_reason=model_reason,
-        validation_result="rejected", validation_reason=validation_reason,
+        conn, attempt_id, status="rejected_by_validation", raw_status=raw_status,
+        raw_claims=raw_claims, model_reason=model_reason, validation_result="rejected",
+        validation_reason=validation_reason,
     )
 
 
@@ -592,6 +470,45 @@ def mark_attempt_failed(conn, attempt_id, failure_category, failure_detail):
         conn, attempt_id, status="failed", validation_result="not_applicable",
         failure_category=failure_category, failure_detail=failure_detail,
     )
+
+
+def store_claims(conn, interpretation_id, uncertainty_id, question_family, question_version,
+                  claims):
+    """Persist every finalized claim (accepted AND rejected) for one attempt.
+
+    Storing rejected claims too — with their rejection_reason and any
+    semantic-check provenance — is what makes "validation outcome/reasons"
+    reviewable per-claim on the generalized admin page (Part 12), not just
+    as an opaque raw_claims_json blob. Only accepted=1 rows are ever read by
+    grouping/compute_learning_candidates(), so this never inflates learning
+    candidates.
+    """
+    now = _now()
+    for idx, c in enumerate(claims):
+        conn.execute(
+            "INSERT INTO hearth_answer_interpretation_claims"
+            " (interpretation_id, uncertainty_id, question_family, question_version,"
+            "  claim_index, subject, predicate, value, polarity, scope, temporal_status,"
+            "  conclusion_text, evidence_quote, accepted, rejection_reason,"
+            "  semantic_check_provider, semantic_check_model, semantic_check_result,"
+            "  semantic_check_reason, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            (interpretation_id, uncertainty_id, question_family, question_version, idx,
+             c.get("subject"), c.get("predicate"), c.get("value"), c.get("polarity"),
+             c.get("scope"), c.get("temporal_status"), c.get("conclusion_text"),
+             c.get("evidence_quote"), 1 if c.get("accepted") else 0, c.get("rejection_reason"),
+             c.get("semantic_check_provider"), c.get("semantic_check_model"),
+             c.get("semantic_check_result"), c.get("semantic_check_reason"), now),
+        )
+    conn.commit()
+
+
+def get_claims_for_interpretation(conn, interpretation_id):
+    return conn.execute(
+        "SELECT * FROM hearth_answer_interpretation_claims"
+        " WHERE interpretation_id = ? ORDER BY claim_index ASC;",
+        (interpretation_id,),
+    ).fetchall()
 
 
 def get_attempts_for_uncertainty(conn, uncertainty_id):
@@ -639,22 +556,27 @@ def _seconds_since(iso_ts):
 
 
 # ---------------------------------------------------------------------------
-# Eligibility
+# Eligibility — family-agnostic
 # ---------------------------------------------------------------------------
 
 def get_eligible_answered_uncertainties(conn, batch_size=None, interpreter_version=None,
                                          max_retries=None, retry_cooldown_seconds=None):
-    """Return answered checkin_feedback_waiting/v1 uncertainties eligible for
-    interpretation this run, bounded by batch_size, oldest-answered first.
+    """Return answered uncertainties eligible for interpretation this run,
+    across EVERY stamped question_family/version, bounded by batch_size,
+    oldest-answered first.
 
-    Eligible means: answered with non-empty text, correct family/version, no
-    current accepted interpretation, and — if a previous attempt for the
-    current interpreter_version exists — that attempt is either a retryable
-    'failed'/stuck 'pending'/'attempted' row past its cooldown and under the
-    retry cap, never an 'ambiguous' or 'rejected_by_validation' terminal
-    result (those stay put for human review rather than being resent to a
-    model every Reflection run) or an already-successful one (excluded by
-    the NOT EXISTS below).
+    Eligible means: answered with non-empty text, both question_family and
+    question_version stamped (NULL on either means the generator never
+    opted this row into the learning loop — see hearth_soul.py), not on the
+    emergency denylist, no current accepted interpretation, and — if a
+    previous attempt for the current interpreter_version exists — that
+    attempt is either a retryable 'failed'/stuck 'pending'/'attempted' row
+    past its cooldown and under the retry cap, never an 'ambiguous' or
+    'rejected_by_validation' terminal result (those stay put for human
+    review rather than being resent to a model every Reflection run) or an
+    already-successful one (excluded by the NOT IN below, which is
+    intentionally version-agnostic: at most one accepted interpretation per
+    uncertainty, ever, regardless of which interpreter_version produced it).
     """
     batch_size = HEARTH_INTERPRETER_BATCH_SIZE if batch_size is None else batch_size
     interpreter_version = interpreter_version or HEARTH_INTERPRETER_VERSION
@@ -663,22 +585,24 @@ def get_eligible_answered_uncertainties(conn, batch_size=None, interpreter_versi
         HEARTH_INTERPRETER_RETRY_COOLDOWN_SECONDS
         if retry_cooldown_seconds is None else retry_cooldown_seconds
     )
+    denylist = _family_denylist()
 
     candidates = conn.execute(
         "SELECT * FROM hearth_worldview_uncertainties"
         " WHERE status = 'answered'"
         "   AND answer_text IS NOT NULL AND TRIM(answer_text) != ''"
-        "   AND question_family = ? AND question_version = ?"
+        "   AND question_family IS NOT NULL AND question_version IS NOT NULL"
         "   AND id NOT IN ("
         "       SELECT uncertainty_id FROM hearth_answer_interpretations"
         "       WHERE is_current_accepted = 1"
         "   )"
-        " ORDER BY answered_at ASC;",
-        (_ACTIVE_FAMILY, _ACTIVE_VERSION),
+        " ORDER BY answered_at ASC;"
     ).fetchall()
 
     eligible = []
     for row in candidates:
+        if row["question_family"] in denylist:
+            continue
         latest = _latest_attempt_for_version(conn, row["id"], interpreter_version)
         if latest is None:
             eligible.append(row)
@@ -698,79 +622,363 @@ def get_eligible_answered_uncertainties(conn, batch_size=None, interpreter_versi
     return eligible[:batch_size]
 
 
+def list_known_family_versions(conn):
+    """Return distinct (question_family, question_version) pairs seen across
+    stamped uncertainties, for admin filter UIs. Never a semantic registry —
+    purely a reflection of what has actually been stamped so far.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT question_family, question_version"
+        " FROM hearth_worldview_uncertainties"
+        " WHERE question_family IS NOT NULL AND question_version IS NOT NULL"
+        " ORDER BY question_family ASC, question_version ASC;"
+    ).fetchall()
+    return [(r["question_family"], r["question_version"]) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Generic prompt + JSON schemas
+# ---------------------------------------------------------------------------
+
+def _build_prompt(question_text, why_it_matters, context_text, answer_text):
+    """Build the interpretation prompt from ONLY the actual row's content.
+
+    No family name, no unconditional check-in/creator/pattern language, no
+    hand-authored examples — see module docs and PART 3 of the design doc.
+    why_it_matters/context_text are included only when present.
+    """
+    sections = [f'The question Hearth asked: "{question_text}"']
+    if why_it_matters:
+        sections.append(f'Why this question matters to Hearth: "{why_it_matters}"')
+    if context_text and context_text.strip() != (question_text or "").strip():
+        sections.append(f'Background Hearth recorded about this situation: "{context_text}"')
+    sections.append(f'The manager\'s exact answer: "{answer_text}"')
+    context_block = "\n\n".join(sections)
+
+    return f"""You are helping Hearth (an internal organizational memory system for
+Pathway Portal) safely interpret one manager's answer to one question Hearth
+asked. Use ONLY the information below — never outside knowledge, never
+assumptions, never facts not present in the question, its context, or the
+answer.
+
+{context_block}
+
+Decide exactly one status:
+- "supported": the answer contains grounded evidence that establishes at
+  least one claim directly relevant to the question above.
+- "insufficient_information": the answer is relevant or potentially relevant
+  but does not establish a safe conclusion (ambiguous, overly tentative,
+  missing needed detail, or too short to resolve what the question asks).
+- "unrelated_or_unclear": the answer does not meaningfully address the
+  question, is nonsensical in context, or cannot be connected to it.
+
+If the manager's answer is short (e.g. a bare "yes" or "no"): decide based on
+the shape of the question itself. If the question is a direct yes/no
+question with an unambiguous referent, a bare "yes"/"no" MAY be enough to
+establish exactly the proposition the question asked — nothing more. If the
+question asks why, how, who, what happened, what action is needed, or
+otherwise requires explanation, a bare yes/no is insufficient_information
+because it supplies no explanation. Never expand a bare answer into details
+that are not present in the question or answer.
+
+If status is "supported", return one to three (never more than three)
+distinct structured claims the answer actually establishes about this
+specific question. If the answer supports more than three, choose only the
+three most directly relevant to the question — do not produce a sprawling
+summary. If status is anything other than "supported", return zero claims.
+
+Each claim must have:
+- subject: the specific person, project, event, process, or entity this
+  claim concerns. Use only an identity already present in the question,
+  its context, or the answer — never invent a new one.
+- predicate: a short, concise, normalized machine-usable concept you
+  generate from the answer (e.g. "discord_requirement", "onboarding_blocker",
+  "follow_up_owner", "current_status"). You do not need to match any
+  pre-existing vocabulary.
+- value: a short, concise, normalized value you generate from the evidence
+  (e.g. "optional", "waiting_on_staff", "temporary_spike", "resolved"). You
+  do not need to match any pre-existing vocabulary.
+- polarity: "affirmed", "negated", or "unknown" — preserve whether the
+  manager affirmed or denied this claim.
+- scope: whether this is about one individual case or a broad statement
+  (e.g. "this_creator", "this_onboarding", "this_incident", "organizational",
+  or "unknown" if it cannot be determined).
+- temporal_status: "current", "past", "future", "ongoing", or "unknown".
+- conclusion_text: one short, plain-English, grounded sentence stating the
+  claim.
+- evidence_quote: a short excerpt copied VERBATIM from the manager's answer
+  above that directly supports this claim. It must be an exact quote, not a
+  paraphrase.
+
+Do not infer unstated organizational facts. Do not treat your own confidence
+as evidence — ground every claim only in the manager's actual words. If the
+answer is ambiguous, tentative, irrelevant, or insufficient, do not force a
+claim; return status="insufficient_information" or "unrelated_or_unclear"
+with zero claims instead."""
+
+
+def _response_json_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": list(UNIVERSAL_STATUSES)},
+            "claims": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "subject": {"type": "string"},
+                        "predicate": {"type": "string"},
+                        "value": {"type": "string"},
+                        "polarity": {"type": "string", "enum": list(VALID_POLARITIES)},
+                        "scope": {"type": "string"},
+                        "temporal_status": {"type": "string", "enum": list(VALID_TEMPORAL_STATUSES)},
+                        "conclusion_text": {"type": "string"},
+                        "evidence_quote": {"type": "string"},
+                    },
+                    "required": list(REQUIRED_CLAIM_FIELDS),
+                },
+            },
+            "reason": {"type": "string"},
+        },
+        "required": ["status", "claims", "reason"],
+    }
+
+
+def _semantic_check_prompt(question_text, why_it_matters, answer_text, claim):
+    why_line = f'\nWhy this question matters to Hearth: "{why_it_matters}"' if why_it_matters else ""
+    return f"""You previously extracted one proposed claim from a manager's answer to a
+question Hearth asked. Verify ONLY whether the manager's answer actually,
+directly supports this specific claim — using nothing but the manager's own
+words. Do not use outside knowledge or assumptions.
+
+The question Hearth asked: "{question_text}"{why_line}
+The manager's exact answer: "{answer_text}"
+
+Proposed claim:
+- predicate: {claim.get("predicate")}
+- value: {claim.get("value")}
+- polarity: {claim.get("polarity")}
+- conclusion: {claim.get("conclusion_text")}
+- evidence quoted from the answer: "{claim.get("evidence_quote")}"
+
+Does the manager's answer clearly and directly establish this claim? Return
+supported=true only if it does. Return supported=false if the claim
+overstates, misreads, or is not actually grounded in the manager's answer."""
+
+
+def _semantic_check_json_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "supported": {"type": "boolean"},
+            "reason": {"type": "string"},
+        },
+        "required": ["supported", "reason"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Deterministic validation — no model, no family-specific vocabulary
+# ---------------------------------------------------------------------------
+
+def _strip_sentence_initial_words(text):
+    """Drop the first word of every sentence in `text`.
+
+    Free-form prose (conclusion_text) always capitalizes its first word as a
+    matter of ordinary grammar, not because it names an entity — without
+    this, the entity-grounding heuristic below would flag nearly every claim
+    on its opening word alone. A multi-word invented name mid-sentence (or
+    a second+ word of an invented name that starts a sentence) is still
+    caught; only a single-word invented entity used as literally the first
+    word of conclusion_text could slip past this specific check — the
+    constrained semantic check is the backstop for that gap (see module docs).
+    """
+    sentences = re.split(r"(?<=[.!?])\s+", text or "")
+    remainders = []
+    for sentence in sentences:
+        parts = sentence.split(" ", 1)
+        if len(parts) > 1:
+            remainders.append(parts[1])
+    return " ".join(remainders)
+
+
+def _extract_ungrounded_entities(text, source_text):
+    """Conservative heuristic: capitalized tokens in `text` that are not
+    present anywhere (case-insensitive) in `source_text`, excluding a short
+    stoplist of common capitalized non-entity words.
+
+    This is honest about its limits (see module docs / PART 6): it can only
+    catch a NEW capitalized name/entity the model invented out of thin air.
+    It cannot verify deeper semantic entailment — that is what the
+    constrained local-model semantic check exists for.
+    """
+    if not text:
+        return []
+    source_lower = (source_text or "").lower()
+    ungrounded = []
+    for token in _CAPITALIZED_TOKEN_RE.findall(text):
+        if token.lower() in _ENTITY_GROUNDING_STOPWORDS:
+            continue
+        if token.lower() in source_lower:
+            continue
+        ungrounded.append(token)
+    return ungrounded
+
+
+def _claim_key(claim):
+    return (
+        _normalize_ws(str(claim.get("predicate", ""))).lower(),
+        _normalize_ws(str(claim.get("value", ""))).lower(),
+        str(claim.get("polarity", "")).lower(),
+        _normalize_ws(str(claim.get("scope", ""))).lower(),
+    )
+
+
+def deterministic_validate(question_text, why_it_matters, context_text, answer_text,
+                            raw_status, raw_claims):
+    """Pure, model-free validation. Returns a dict:
+        {
+          "contract_violation": str | None,   # if set, the whole attempt is rejected
+          "claim_checks": [
+              {"claim": dict, "structurally_valid": bool, "reason": str | None}, ...
+          ],
+        }
+
+    Never consults model confidence anywhere (see module docs — confidence is
+    not even part of the claim schema). Only decides what deterministic code
+    can honestly guarantee (evidence-quote presence, claim count, required
+    fields, one-directional negation grounding, duplicate detection, a
+    conservative entity-invention heuristic, and top-level status/claim-count
+    consistency). Semantic entailment is intentionally NOT decided here —
+    see _call_ollama_semantic_check.
+    """
+    if raw_status not in _UNIVERSAL_STATUS_SET:
+        return {"contract_violation": f"model returned an invalid status: {raw_status!r}",
+                "claim_checks": []}
+
+    if not isinstance(raw_claims, list):
+        return {"contract_violation": "model's claims field was not a list", "claim_checks": []}
+
+    if raw_status != "supported" and len(raw_claims) > 0:
+        return {
+            "contract_violation": (
+                f"status={raw_status!r} but {len(raw_claims)} claim(s) were returned —"
+                " non-supported statuses must have zero claims"
+            ),
+            "claim_checks": [],
+        }
+
+    if raw_status == "supported" and len(raw_claims) == 0:
+        return {
+            "contract_violation": "status=supported but zero claims were returned",
+            "claim_checks": [],
+        }
+
+    if len(raw_claims) > MAX_CLAIMS_PER_ANSWER:
+        return {
+            "contract_violation": f"{len(raw_claims)} claims proposed — never more than "
+                                   f"{MAX_CLAIMS_PER_ANSWER} are allowed",
+            "claim_checks": [],
+        }
+
+    if raw_status != "supported":
+        return {"contract_violation": None, "claim_checks": []}
+
+    answer_norm = _normalize_for_quote_match(answer_text)
+    source_text = " ".join(filter(None, [question_text, why_it_matters, context_text, answer_text]))
+
+    claim_checks = []
+    seen_keys = set()
+    for claim in raw_claims:
+        if not isinstance(claim, dict):
+            claim_checks.append({"claim": {}, "structurally_valid": False,
+                                  "reason": "claim was not a JSON object"})
+            continue
+
+        missing = [f for f in REQUIRED_CLAIM_FIELDS if not str(claim.get(f, "")).strip()]
+        if missing:
+            claim_checks.append({"claim": claim, "structurally_valid": False,
+                                  "reason": f"missing required field(s): {', '.join(missing)}"})
+            continue
+
+        if claim.get("polarity") not in VALID_POLARITIES:
+            claim_checks.append({"claim": claim, "structurally_valid": False,
+                                  "reason": f"invalid polarity: {claim.get('polarity')!r}"})
+            continue
+
+        if claim.get("temporal_status") not in VALID_TEMPORAL_STATUSES:
+            claim_checks.append({"claim": claim, "structurally_valid": False,
+                                  "reason": f"invalid temporal_status: {claim.get('temporal_status')!r}"})
+            continue
+
+        key = _claim_key(claim)
+        if key in seen_keys:
+            claim_checks.append({"claim": claim, "structurally_valid": False,
+                                  "reason": "duplicate claim within the same answer"
+                                            " (same predicate/value/polarity/scope)"})
+            continue
+
+        # Case-insensitive on top of whitespace/quote normalization — a model
+        # that re-cases a word while copying (e.g. answer says "discord",
+        # claim quotes "Discord") is still quoting verbatim in substance.
+        # This is NOT paraphrase tolerance: the quote must still appear as a
+        # contiguous substring, just without case sensitivity. The ORIGINAL
+        # evidence_quote (and the original answer_text) are preserved as-is
+        # everywhere else — only this comparison folds case.
+        quote_norm = _normalize_for_quote_match(claim.get("evidence_quote"))
+        if not quote_norm or quote_norm.lower() not in answer_norm.lower():
+            claim_checks.append({"claim": claim, "structurally_valid": False,
+                                  "reason": "evidence_quote does not appear verbatim"
+                                            " (after whitespace/quote/case normalization) in"
+                                            " the manager's answer"})
+            continue
+
+        ungrounded = _extract_ungrounded_entities(
+            claim.get("subject", ""), source_text,
+        ) + _extract_ungrounded_entities(
+            _strip_sentence_initial_words(claim.get("conclusion_text", "")), source_text,
+        )
+        if ungrounded:
+            claim_checks.append({"claim": claim, "structurally_valid": False,
+                                  "reason": "introduces entity/name not present in the"
+                                            f" question, context, or answer: {ungrounded[0]!r}"})
+            continue
+
+        if claim.get("polarity") == "negated":
+            quote_lower = str(claim.get("evidence_quote", "")).lower()
+            if not any(f" {m} " in f" {quote_lower} " or quote_lower.startswith(f"{m} ")
+                       or quote_lower.endswith(f" {m}") or quote_lower == m
+                       for m in _NEGATION_MARKERS):
+                claim_checks.append({"claim": claim, "structurally_valid": False,
+                                      "reason": "polarity=negated but evidence_quote contains"
+                                                " no discernible negation marker"})
+                continue
+
+        seen_keys.add(key)
+        claim_checks.append({"claim": claim, "structurally_valid": True, "reason": None})
+
+    return {"contract_violation": None, "claim_checks": claim_checks}
+
+
 # ---------------------------------------------------------------------------
 # Ollama structured-output client
 # ---------------------------------------------------------------------------
 
-def _family_json_schema():
-    return {
-        "type": "object",
-        "properties": {
-            "conclusion": {"type": "string", "enum": list(TAXONOMY)},
-            "confidence": {"type": "number"},
-            "reason": {"type": "string"},
-        },
-        "required": ["conclusion", "confidence", "reason"],
-    }
-
-
-def _build_prompt(family, version, question_text, answer_text):
-    contract = FAMILY_DEFINITIONS[family][version]
-    definitions_text = "\n".join(
-        f"- {label}: {meaning}" for label, meaning in contract["definitions"].items()
-    )
-    few_shot_text = "\n".join(
-        f'  Answer: "{ans}" -> {label}' for ans, label in contract["few_shot"]
-    )
-    return f"""You are classifying one manager's answer to a single Hearth Worldview question for Pathway Portal.
-
-Context: {contract["question_context"]}
-
-The exact question asked: {question_text}
-
-The manager's exact answer: {answer_text}
-
-IMPORTANT: the question is specifically whether this occurrence is part of a
-LARGER, RECURRING PATTERN (e.g. this manager doing this repeatedly, or across
-multiple check-ins/creators) — NOT simply whether this particular delay feels
-long, normal, or concerning in isolation. A delay can feel completely routine
-and still be part of a recurring pattern for this manager; judge pattern vs.
-isolated occurrence specifically, not general normalcy.
-
-Choose exactly one conclusion from this closed set, using ONLY the manager's
-answer and the question context above. Do not invent context, facts, dates,
-or history that are not present in the answer.
-
-{definitions_text}
-
-Examples (for calibration only — do not copy wording):
-{few_shot_text}
-
-Return your conclusion, a confidence between 0.0 and 1.0, and a short (one or
-two sentence) reason grounded only in the manager's actual words."""
-
-
-def _call_ollama_structured(family, version, question_text, answer_text,
-                             host=None, model=None, timeout=None):
-    """Call Ollama's JSON-schema-constrained chat endpoint.
-
-    Returns (parsed_dict_or_None, failure_category_or_None, failure_detail_or_None, latency_seconds).
-    Never raises.
+def _post_ollama(prompt, schema, host, model, timeout):
+    """Shared low-level Ollama call. Returns (parsed_dict_or_None,
+    failure_category_or_None, failure_detail_or_None, latency_seconds,
+    model_identifier_or_None). Never raises.
     """
-    host = host or HEARTH_INTERPRETER_OLLAMA_HOST
-    model = model or HEARTH_INTERPRETER_OLLAMA_MODEL
-    timeout = HEARTH_INTERPRETER_OLLAMA_TIMEOUT if timeout is None else timeout
-
     try:
         import requests
     except ImportError:
-        return None, "provider_unavailable", "requests library not installed", 0.0
+        return None, "provider_unavailable", "requests library not installed", 0.0, None
 
-    prompt = _build_prompt(family, version, question_text, answer_text)
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "format": _family_json_schema(),
+        "format": schema,
         "stream": False,
         "options": {"temperature": 0},
     }
@@ -780,30 +988,21 @@ def _call_ollama_structured(family, version, question_text, answer_text,
         response = requests.post(f"{host}/api/chat", json=payload, timeout=timeout)
     except Exception as exc:
         latency = time.monotonic() - start
-        category = _classify_request_exception(exc)
-        return None, category, str(exc)[:300], latency
+        return None, _classify_request_exception(exc), str(exc)[:300], latency, None
     latency = time.monotonic() - start
 
     if response.status_code != 200:
-        return None, "provider_error", f"HTTP {response.status_code}: {response.text[:300]}", latency
+        return (None, "provider_error", f"HTTP {response.status_code}: {response.text[:300]}",
+                latency, None)
 
     try:
         outer = response.json()
         content = outer["message"]["content"]
         parsed = json.loads(content)
     except Exception as exc:
-        return None, "malformed_output", f"could not parse structured response: {exc}", latency
+        return None, "malformed_output", f"could not parse structured response: {exc}", latency, None
 
-    if not _well_typed(parsed):
-        return None, "malformed_output", f"response missing/invalid required fields: {parsed!r}"[:300], latency
-
-    model_identifier = outer.get("model") or model
-    return {
-        "conclusion": parsed["conclusion"],
-        "confidence": float(parsed["confidence"]),
-        "reason": str(parsed["reason"]),
-        "model_identifier": model_identifier,
-    }, None, None, latency
+    return parsed, None, None, latency, (outer.get("model") or model)
 
 
 def _classify_request_exception(exc):
@@ -815,28 +1014,81 @@ def _classify_request_exception(exc):
     return "provider_error"
 
 
-def _well_typed(parsed):
+def _well_typed_response(parsed):
     if not isinstance(parsed, dict):
         return False
-    if parsed.get("conclusion") not in _TAXONOMY_SET:
+    if parsed.get("status") not in _UNIVERSAL_STATUS_SET:
         return False
-    try:
-        conf = float(parsed.get("confidence"))
-    except (TypeError, ValueError):
-        return False
-    if not (0.0 <= conf <= 1.0):
+    if not isinstance(parsed.get("claims"), list):
         return False
     if not isinstance(parsed.get("reason"), str) or not parsed.get("reason"):
         return False
     return True
 
 
+def _call_ollama_structured(question_text, why_it_matters, context_text, answer_text,
+                             host=None, model=None, timeout=None):
+    """Returns (parsed_dict_or_None, failure_category_or_None,
+    failure_detail_or_None, latency_seconds). Never raises.
+    """
+    host = host or HEARTH_INTERPRETER_OLLAMA_HOST
+    model = model or HEARTH_INTERPRETER_OLLAMA_MODEL
+    timeout = HEARTH_INTERPRETER_OLLAMA_TIMEOUT if timeout is None else timeout
+
+    prompt = _build_prompt(question_text, why_it_matters, context_text, answer_text)
+    parsed, failure_category, failure_detail, latency, model_identifier = _post_ollama(
+        prompt, _response_json_schema(), host, model, timeout,
+    )
+    if parsed is None:
+        return None, failure_category, failure_detail, latency
+    if not _well_typed_response(parsed):
+        return None, "malformed_output", f"response missing/invalid required fields: {parsed!r}"[:300], latency
+
+    return {
+        "status": parsed["status"],
+        "claims": parsed["claims"],
+        "reason": str(parsed["reason"]),
+        "model_identifier": model_identifier,
+    }, None, None, latency
+
+
+def _call_ollama_semantic_check(question_text, why_it_matters, answer_text, claim,
+                                 host=None, model=None, timeout=None):
+    """Constrained local-model second pass for ONE structurally-valid claim.
+
+    Local-model-first per module docs — never Gemini. Sees only the
+    question/context, the manager's answer, and the single proposed claim;
+    returns a tightly constrained supported/not-supported decision; never
+    rewrites the claim. Returns (parsed_dict_or_None, failure_category,
+    failure_detail, latency).
+    """
+    host = host or HEARTH_INTERPRETER_OLLAMA_HOST
+    model = model or HEARTH_INTERPRETER_OLLAMA_MODEL
+    timeout = HEARTH_INTERPRETER_OLLAMA_TIMEOUT if timeout is None else timeout
+
+    prompt = _semantic_check_prompt(question_text, why_it_matters, answer_text, claim)
+    parsed, failure_category, failure_detail, latency, model_identifier = _post_ollama(
+        prompt, _semantic_check_json_schema(), host, model, timeout,
+    )
+    if parsed is None:
+        return None, failure_category, failure_detail, latency
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("supported"), bool) \
+            or not isinstance(parsed.get("reason"), str) or not parsed.get("reason"):
+        return None, "malformed_output", f"response missing/invalid required fields: {parsed!r}"[:300], latency
+
+    return {
+        "supported": parsed["supported"],
+        "reason": parsed["reason"],
+        "model_identifier": model_identifier,
+    }, None, None, latency
+
+
 # ---------------------------------------------------------------------------
-# Optional Gemini fallback (disabled by default)
+# Optional Gemini fallback (disabled by default) — same generic contract
 # ---------------------------------------------------------------------------
 
-def _call_gemini_structured(family, version, question_text, answer_text):
-    """Guarded fallback classifier. Same contract/taxonomy as Ollama.
+def _call_gemini_structured(question_text, why_it_matters, context_text, answer_text):
+    """Guarded fallback classifier. Same generic contract/schema as Ollama.
 
     Returns (parsed_dict_or_None, failure_category_or_None, failure_detail_or_None, latency_seconds).
     Never raises.
@@ -855,9 +1107,9 @@ def _call_gemini_structured(family, version, question_text, answer_text):
     except ImportError:
         GEMINI_MODEL_NAME = "gemini-2.5-flash"
 
-    prompt = _build_prompt(family, version, question_text, answer_text) + (
+    prompt = _build_prompt(question_text, why_it_matters, context_text, answer_text) + (
         "\n\nReturn ONLY valid JSON in this exact format:\n"
-        '{"conclusion": "expected_pattern", "confidence": 0.8, "reason": "..."}\n'
+        '{"status": "supported", "claims": [...], "reason": "..."}\n'
         "Do not include markdown or any other text."
     )
 
@@ -876,41 +1128,93 @@ def _call_gemini_structured(family, version, question_text, answer_text):
     except (json.JSONDecodeError, ValueError) as exc:
         return None, "malformed_output", f"could not parse Gemini response as JSON: {exc}", latency
 
-    if not _well_typed(parsed):
+    if not _well_typed_response(parsed):
         return None, "malformed_output", f"response missing/invalid required fields: {parsed!r}"[:300], latency
 
     return {
-        "conclusion": parsed["conclusion"],
-        "confidence": float(parsed["confidence"]),
+        "status": parsed["status"],
+        "claims": parsed["claims"],
         "reason": str(parsed["reason"]),
         "model_identifier": GEMINI_MODEL_NAME,
     }, None, None, latency
 
 
 # ---------------------------------------------------------------------------
-# Orchestration
+# Orchestration — family-agnostic
 # ---------------------------------------------------------------------------
 
-def _gemini_fallback_eligible(uncertainty_row, ollama_status, ollama_result):
-    """Fallback is only for genuine semantic ambiguity, never for bare/empty/
-    unrelated answers or infrastructure failures (see module docs, section 8)."""
-    if not HEARTH_INTERPRETER_GEMINI_FALLBACK_ENABLED:
-        return False
-    if ollama_status != "ambiguous":
-        return False
-    answer_norm = _normalize(uncertainty_row["answer_text"])
-    if not answer_norm:
-        return False
-    if answer_norm.lower().strip(" .!?") in _BARE_ANSWERS:
-        return False
-    return True
+def _gemini_fallback_eligible():
+    """Fallback is only for the genuine-ambiguity case (a supported status
+    whose claims all failed validation — see _finalize_via_validation's
+    zero_claims_survived signal), never for infrastructure failures or hard
+    contract violations (see module docs). The call site is the sole gate on
+    *which* case counts as eligible; this only gates the enabled/disabled
+    switch and cap.
+    """
+    return HEARTH_INTERPRETER_GEMINI_FALLBACK_ENABLED
+
+
+def _resolve_claims(conn, question_text, why_it_matters, answer_text, claim_checks):
+    """Run the semantic check on every structurally-valid claim and return
+    (final_claims, accepted_count). final_claims includes BOTH accepted and
+    rejected claims, each carrying its own accepted flag and rejection
+    reason/semantic-check provenance — see store_claims().
+    """
+    final_claims = []
+    accepted_count = 0
+    for cc in claim_checks:
+        claim = cc["claim"]
+        if not cc["structurally_valid"]:
+            final_claims.append({**claim, "accepted": False, "rejection_reason": cc["reason"]})
+            continue
+
+        if not HEARTH_INTERPRETER_SEMANTIC_CHECK_ENABLED:
+            final_claims.append({**claim, "accepted": True, "rejection_reason": None,
+                                  "semantic_check_result": "skipped"})
+            accepted_count += 1
+            continue
+
+        sem_result, sem_fail_cat, sem_fail_detail, _lat = _call_ollama_semantic_check(
+            question_text, why_it_matters, answer_text, claim,
+        )
+        if sem_result is None:
+            final_claims.append({
+                **claim, "accepted": False,
+                "rejection_reason": f"semantic_check_unavailable: {sem_fail_detail}",
+                "semantic_check_provider": "ollama", "semantic_check_result": "unavailable",
+            })
+            continue
+
+        if sem_result["supported"]:
+            final_claims.append({
+                **claim, "accepted": True, "rejection_reason": None,
+                "semantic_check_provider": "ollama",
+                "semantic_check_model": sem_result.get("model_identifier"),
+                "semantic_check_result": "supported",
+                "semantic_check_reason": sem_result["reason"],
+            })
+            accepted_count += 1
+        else:
+            final_claims.append({
+                **claim, "accepted": False,
+                "rejection_reason": f"semantic_check_failed: {sem_result['reason']}",
+                "semantic_check_provider": "ollama",
+                "semantic_check_model": sem_result.get("model_identifier"),
+                "semantic_check_result": "not_supported",
+                "semantic_check_reason": sem_result["reason"],
+            })
+
+    return final_claims, accepted_count
 
 
 def process_one_uncertainty(conn, uncertainty_row, interpreter_version=None,
                              gemini_calls_remaining=0):
     """Process a single eligible uncertainty end-to-end: create a durable
-    pending attempt, call the local model, validate, persist the outcome,
-    and (only if genuinely warranted) attempt the guarded Gemini fallback.
+    pending attempt (stamped from the ROW's own question_family/version —
+    never a module default), call the local model, deterministically
+    validate, run the constrained semantic check on surviving claims,
+    persist the outcome and claims, and (only if genuinely warranted)
+    attempt the guarded Gemini fallback.
 
     Returns a dict summarizing what happened, for batch-level logging/counts.
     Never raises — any unexpected error is caught and recorded as a failed
@@ -918,14 +1222,18 @@ def process_one_uncertainty(conn, uncertainty_row, interpreter_version=None,
     """
     interpreter_version = interpreter_version or HEARTH_INTERPRETER_VERSION
     uncertainty_id = uncertainty_row["id"]
+    question_family = uncertainty_row["question_family"]
+    question_version = uncertainty_row["question_version"]
     question_text = uncertainty_row["possible_question"] or uncertainty_row["uncertainty_text"]
+    why_it_matters = uncertainty_row["why_it_matters"]
+    context_text = uncertainty_row["uncertainty_text"]
     answer_text = uncertainty_row["answer_text"]
 
     latest = _latest_attempt_for_version(conn, uncertainty_id, interpreter_version)
     retry_of = latest["id"] if latest is not None else None
 
     attempt_id = create_pending_attempt(
-        conn, uncertainty_id, _ACTIVE_FAMILY, _ACTIVE_VERSION,
+        conn, uncertainty_id, question_family, question_version,
         interpreter_version, retry_of_attempt_id=retry_of,
     )
 
@@ -938,7 +1246,7 @@ def process_one_uncertainty(conn, uncertainty_row, interpreter_version=None,
 
     mark_attempt_dispatched(conn, attempt_id, "ollama", HEARTH_INTERPRETER_OLLAMA_MODEL, None)
     result, failure_category, failure_detail, latency = _call_ollama_structured(
-        _ACTIVE_FAMILY, _ACTIVE_VERSION, question_text, answer_text,
+        question_text, why_it_matters, context_text, answer_text,
     )
     outcome["latency"] = latency
 
@@ -954,42 +1262,21 @@ def process_one_uncertainty(conn, uncertainty_row, interpreter_version=None,
     )
     conn.commit()
 
-    validated = validate_interpretation(
-        question_text, answer_text, result["conclusion"], result["reason"]
+    outcome_result = _finalize_via_validation(
+        conn, attempt_id, uncertainty_id, question_family, question_version,
+        question_text, why_it_matters, context_text, answer_text, result,
     )
+    outcome.update(outcome_result)
 
-    if validated.status == "succeeded":
-        mark_attempt_succeeded(
-            conn, attempt_id, result["conclusion"], validated.conclusion,
-            result["confidence"], result["reason"], validated.validation_reason,
-        )
-        outcome["status"] = "succeeded"
-        outcome["conclusion"] = validated.conclusion
-        return outcome
-
-    if validated.status == "rejected_by_validation":
-        mark_attempt_rejected(
-            conn, attempt_id, result["conclusion"], result["confidence"],
-            result["reason"], validated.validation_reason,
-        )
-        outcome["status"] = "rejected_by_validation"
-        return outcome
-
-    # ambiguous — consider the guarded Gemini fallback before finalizing
-    if gemini_calls_remaining > 0 and _gemini_fallback_eligible(
-        uncertainty_row, validated.status, result
-    ):
+    if outcome_result.get("zero_claims_survived") and gemini_calls_remaining > 0 \
+            and _gemini_fallback_eligible():
         fb_attempt_id = create_pending_attempt(
-            conn, uncertainty_id, _ACTIVE_FAMILY, _ACTIVE_VERSION,
+            conn, uncertainty_id, question_family, question_version,
             interpreter_version, retry_of_attempt_id=attempt_id,
-        )
-        mark_attempt_ambiguous(
-            conn, attempt_id, result["conclusion"], result["confidence"],
-            result["reason"], validated.validation_reason,
         )
         mark_attempt_dispatched(conn, fb_attempt_id, "gemini", None, None)
         fb_result, fb_fail_cat, fb_fail_detail, fb_latency = _call_gemini_structured(
-            _ACTIVE_FAMILY, _ACTIVE_VERSION, question_text, answer_text,
+            question_text, why_it_matters, context_text, answer_text,
         )
         outcome["gemini_used"] = True
         outcome["gemini_latency"] = fb_latency
@@ -998,41 +1285,78 @@ def process_one_uncertainty(conn, uncertainty_row, interpreter_version=None,
             outcome["status"] = "failed"
             outcome["failure_category"] = fb_fail_cat
             return outcome
+
         conn.execute(
             "UPDATE hearth_answer_interpretations SET model_identifier = ? WHERE id = ?;",
             (fb_result["model_identifier"], fb_attempt_id),
         )
         conn.commit()
-        fb_validated = validate_interpretation(
-            question_text, answer_text, fb_result["conclusion"], fb_result["reason"]
-        )
-        if fb_validated.status == "succeeded":
-            mark_attempt_succeeded(
-                conn, fb_attempt_id, fb_result["conclusion"], fb_validated.conclusion,
-                fb_result["confidence"], fb_result["reason"], fb_validated.validation_reason,
-            )
-            outcome["status"] = "succeeded"
-            outcome["conclusion"] = fb_validated.conclusion
-        elif fb_validated.status == "rejected_by_validation":
-            mark_attempt_rejected(
-                conn, fb_attempt_id, fb_result["conclusion"], fb_result["confidence"],
-                fb_result["reason"], fb_validated.validation_reason,
-            )
-            outcome["status"] = "rejected_by_validation"
-        else:
-            mark_attempt_ambiguous(
-                conn, fb_attempt_id, fb_result["conclusion"], fb_result["confidence"],
-                fb_result["reason"], fb_validated.validation_reason,
-            )
-            outcome["status"] = "ambiguous"
-        return outcome
 
-    mark_attempt_ambiguous(
-        conn, attempt_id, result["conclusion"], result["confidence"],
-        result["reason"], validated.validation_reason,
-    )
-    outcome["status"] = "ambiguous"
+        fb_outcome = _finalize_via_validation(
+            conn, fb_attempt_id, uncertainty_id, question_family, question_version,
+            question_text, why_it_matters, context_text, answer_text, fb_result,
+        )
+        outcome.update(fb_outcome)
+
     return outcome
+
+
+def _finalize_via_validation(conn, attempt_id, uncertainty_id, question_family, question_version,
+                              question_text, why_it_matters, context_text, answer_text, result):
+    """Shared deterministic-validate -> (semantic-check) -> persist path,
+    used for both the primary Ollama attempt and any Gemini fallback attempt.
+    """
+    raw_status = result["status"]
+    raw_claims = result["claims"]
+    model_reason = result["reason"]
+
+    det = deterministic_validate(question_text, why_it_matters, context_text, answer_text,
+                                  raw_status, raw_claims)
+
+    if det["contract_violation"]:
+        mark_attempt_rejected(conn, attempt_id, raw_status, raw_claims, model_reason,
+                               det["contract_violation"])
+        return {"status": "rejected_by_validation"}
+
+    if raw_status != "supported":
+        mark_attempt_succeeded(conn, attempt_id, raw_status, raw_status, raw_claims,
+                                model_reason, "model's conservative status accepted as-is;"
+                                              " no claims to validate")
+        return {"status": "succeeded", "universal_status": raw_status}
+
+    final_claims, accepted_count = _resolve_claims(
+        conn, question_text, why_it_matters, answer_text, det["claim_checks"],
+    )
+
+    if accepted_count >= 1:
+        mark_attempt_succeeded(
+            conn, attempt_id, raw_status, "supported", raw_claims, model_reason,
+            f"{accepted_count} of {len(final_claims)} proposed claim(s) passed deterministic"
+            " and semantic validation",
+        )
+        store_claims(conn, attempt_id, uncertainty_id, question_family, question_version,
+                      final_claims)
+        return {"status": "succeeded", "universal_status": "supported"}
+
+    # The model proposed status=supported but none of its claims survived
+    # deterministic/semantic validation. This is NOT the same as an
+    # unresolved/ambiguous state needing human review: "none of what you
+    # said actually held up" is itself a safe, definitive conclusion — the
+    # accepted SYSTEM status is downgraded to insufficient_information while
+    # the model's RAW status (supported) and every rejected claim + reason
+    # are preserved for audit. Never accept a "supported" interpretation
+    # with zero accepted claims (see module docs).
+    mark_attempt_succeeded(
+        conn, attempt_id, raw_status, "insufficient_information", raw_claims, model_reason,
+        f"all_proposed_claims_failed_validation: {len(final_claims)} claim(s) proposed,"
+        " 0 passed deterministic/semantic validation — raw model status was 'supported'"
+        " but no claim could be safely grounded, so the accepted status was downgraded"
+        " to insufficient_information",
+    )
+    store_claims(conn, attempt_id, uncertainty_id, question_family, question_version,
+                  final_claims)
+    return {"status": "succeeded", "universal_status": "insufficient_information",
+            "zero_claims_survived": True}
 
 
 def _ledger_table_exists(conn):
@@ -1042,39 +1366,46 @@ def _ledger_table_exists(conn):
     ).fetchone())
 
 
+def _claims_table_exists(conn):
+    return bool(conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+        " AND name='hearth_answer_interpretation_claims';"
+    ).fetchone())
+
+
 def _schema_ready(conn):
     """Read-only precondition check — never mutates schema.
 
-    hearth_answer_interpretations is created for a fresh database by the
-    same routine "ensure tables" startup call every other Hearth table uses
-    (see morning_briefing.run_pipeline(), which calls
-    ensure_answer_interpretations_table() alongside ensure_reflections_table()/
-    ensure_questions_table() — that's CREATE TABLE IF NOT EXISTS, identical
-    in kind and risk to what those siblings already do on every single
-    Reflection pass, so it is retained rather than treated as a hazard).
-
-    question_family/question_version on hearth_worldview_uncertainties are a
-    different kind of schema change (ALTER TABLE on a table that may already
-    hold live rows) with no such routine-startup precedent anywhere in this
-    module's own core library — see hearth_worldview._has_question_family_columns.
-    An existing database that hasn't run migrate_add_question_family_fields.py
-    yet is a real, expected possibility, and this function's job is to detect
-    that and let the caller skip gracefully instead of crashing Reflection.
+    hearth_answer_interpretations/claims/candidates tables are created for a
+    fresh database by ensure_answer_interpretations_table(), called from
+    morning_briefing.run_pipeline() alongside its siblings. question_family/
+    question_version on hearth_worldview_uncertainties are a different kind
+    of schema change (ALTER TABLE on a table that may already hold live
+    rows) with no such routine-startup precedent — see
+    hearth_worldview._has_question_family_columns. An existing database that
+    hasn't run migrate_add_question_family_fields.py yet is a real, expected
+    possibility, and this function's job is to detect that and let the
+    caller skip gracefully instead of crashing Reflection.
     """
     import hearth_worldview
-    return _ledger_table_exists(conn) and hearth_worldview._has_question_family_columns(conn)
+    return (
+        _ledger_table_exists(conn) and _claims_table_exists(conn)
+        and hearth_worldview._has_question_family_columns(conn)
+    )
 
 
 def process_eligible_answers(conn, batch_size=None, interpreter_version=None):
-    """Bounded background pass: find eligible answered uncertainties, durably
-    record and validate an interpretation attempt for each, never raising
-    into the caller (Reflection). This is the only entry point the Reflection
-    pass should call.
+    """Bounded background pass: find eligible answered uncertainties ACROSS
+    EVERY stamped question_family, durably record and validate an
+    interpretation attempt for each, never raising into the caller
+    (Reflection). This is the only entry point the Reflection pass should
+    call for interpretation.
     """
     summary = {
         "eligible_found": 0, "processed": 0, "succeeded": 0, "ambiguous": 0,
         "rejected_by_validation": 0, "failed": 0, "gemini_calls": 0, "skipped": 0,
         "enabled": HEARTH_INTERPRETER_ENABLED, "schema_missing": False,
+        "families_processed": set(),
     }
 
     if not HEARTH_INTERPRETER_ENABLED:
@@ -1083,15 +1414,15 @@ def process_eligible_answers(conn, batch_size=None, interpreter_version=None):
 
     if not _schema_ready(conn):
         logger.warning(
-            "[interpreter] Build 1 schema not present yet (run"
-            " migrate_add_question_family_fields.py and"
-            " migrate_add_answer_interpretations.py against this database) —"
+            "[interpreter] Build 2 schema not present yet (run"
+            " migrate_add_question_family_fields.py, migrate_add_answer_interpretations.py,"
+            " and migrate_add_universal_claims_schema.py against this database) —"
             " skipping this batch; Reflection continues normally."
         )
         print(
             "[HEARTH INTERPRETER] schema not migrated yet — run"
-            " migrate_add_question_family_fields.py and"
-            " migrate_add_answer_interpretations.py; skipping this batch."
+            " migrate_add_question_family_fields.py, migrate_add_answer_interpretations.py,"
+            " and migrate_add_universal_claims_schema.py; skipping this batch."
         )
         summary["schema_missing"] = True
         return summary
@@ -1106,10 +1437,8 @@ def process_eligible_answers(conn, batch_size=None, interpreter_version=None):
         return summary
 
     summary["eligible_found"] = len(eligible)
-    print(
-        f"[HEARTH INTERPRETER] batch start: family={_ACTIVE_FAMILY} version={_ACTIVE_VERSION}"
-        f" eligible={len(eligible)}"
-    )
+    families_found = sorted({row["question_family"] for row in eligible})
+    print(f"[HEARTH INTERPRETER] batch start: eligible={len(eligible)} families={families_found}")
 
     gemini_calls_remaining = (
         HEARTH_INTERPRETER_GEMINI_MAX_FALLBACK_CALLS_PER_RUN
@@ -1124,14 +1453,15 @@ def process_eligible_answers(conn, batch_size=None, interpreter_version=None):
             )
         except Exception as exc:
             logger.warning(
-                "[interpreter] unexpected error processing uncertainty_id=%s: %s",
-                row["id"], exc,
+                "[interpreter] unexpected error processing uncertainty_id=%s (family=%s): %s",
+                row["id"], row["question_family"], exc,
             )
             summary["failed"] += 1
             summary["skipped"] += 1
             continue
 
         summary["processed"] += 1
+        summary["families_processed"].add(row["question_family"])
         if outcome.get("gemini_used"):
             gemini_calls_remaining -= 1
             summary["gemini_calls"] += 1
@@ -1139,11 +1469,12 @@ def process_eligible_answers(conn, batch_size=None, interpreter_version=None):
         if status in summary:
             summary[status] += 1
 
+    summary["families_processed"] = sorted(summary["families_processed"])
     print(
         f"[HEARTH INTERPRETER] batch end: processed={summary['processed']}"
         f" succeeded={summary['succeeded']} ambiguous={summary['ambiguous']}"
         f" rejected={summary['rejected_by_validation']} failed={summary['failed']}"
-        f" gemini_calls={summary['gemini_calls']}"
+        f" gemini_calls={summary['gemini_calls']} families={summary['families_processed']}"
         + (" (batch limit reached)" if summary["eligible_found"] >= (
             batch_size or HEARTH_INTERPRETER_BATCH_SIZE
           ) else "")
@@ -1155,12 +1486,22 @@ def process_eligible_answers(conn, batch_size=None, interpreter_version=None):
 # Deterministic aggregation — model-free, ordinary SQL/Python only
 # ---------------------------------------------------------------------------
 
-def aggregate_family(conn, family=_ACTIVE_FAMILY, version=_ACTIVE_VERSION):
+def aggregate_family(conn, family, version, interpreter_version=None):
     """Deterministic, model-free aggregate report for one question family.
 
     Never creates a belief, candidate, or lesson — purely observational
     counting over hearth_worldview_uncertainties + hearth_answer_interpretations.
+    interpreter_version defaults to the CURRENT engine version (never a
+    family-specific one) — passed explicitly so callers reviewing an older
+    interpreter_version's pending/attempted counts can override it.
+
+    by_label spans both generations of accepted rows: legacy Build 1 rows
+    (5-value pattern taxonomy, stored in `conclusion`) and Build 2 rows
+    (3-value universal status, stored in `universal_status`) — whichever is
+    populated on the accepted row is used as the label, so historical
+    check-in-feedback data keeps reporting exactly as it did before.
     """
+    interpreter_version = interpreter_version or HEARTH_INTERPRETER_VERSION
     uncertainties = conn.execute(
         "SELECT * FROM hearth_worldview_uncertainties"
         " WHERE status = 'answered' AND question_family = ? AND question_version = ?;",
@@ -1177,16 +1518,13 @@ def aggregate_family(conn, family=_ACTIVE_FAMILY, version=_ACTIVE_VERSION):
         "total_attempted": 0,
         "total_failed": 0,
         "total_ambiguous_or_rejected": 0,
-        "by_label": {label: 0 for label in TAXONOMY},
+        "by_label": {},
         "distinct_subjects_total": 0,
-        "distinct_subjects_by_label": {label: set() for label in TAXONOMY},
+        "distinct_subjects_by_label": {},
         "distinct_answering_managers": 0,
     }
 
     if not eligible_ids:
-        report["distinct_subjects_by_label"] = {
-            label: 0 for label in report["distinct_subjects_by_label"]
-        }
         return report
 
     placeholders = ",".join("?" for _ in eligible_ids)
@@ -1201,6 +1539,7 @@ def aggregate_family(conn, family=_ACTIVE_FAMILY, version=_ACTIVE_VERSION):
 
     subjects_seen = set()
     answering_managers = set()
+    subjects_by_label = {}
     for uid in eligible_ids:
         unc = unc_by_id[uid]
         if unc["subject_id"] is not None:
@@ -1211,16 +1550,16 @@ def aggregate_family(conn, family=_ACTIVE_FAMILY, version=_ACTIVE_VERSION):
         accepted = accepted_by_uncertainty.get(uid)
         if accepted is not None:
             report["total_accepted"] += 1
-            label = accepted["conclusion"]
-            if label in report["by_label"]:
-                report["by_label"][label] += 1
+            label = accepted["universal_status"] or accepted["conclusion"]
+            if label:
+                report["by_label"][label] = report["by_label"].get(label, 0) + 1
                 if unc["subject_id"] is not None:
-                    report["distinct_subjects_by_label"][label].add(
+                    subjects_by_label.setdefault(label, set()).add(
                         (unc["subject_type"], unc["subject_id"])
                     )
             continue
 
-        latest = _latest_attempt_for_version(conn, uid, HEARTH_INTERPRETER_VERSION)
+        latest = _latest_attempt_for_version(conn, uid, interpreter_version)
         if latest is None:
             report["total_pending"] += 1
         elif latest["status"] in ("pending", "attempted"):
@@ -1234,8 +1573,250 @@ def aggregate_family(conn, family=_ACTIVE_FAMILY, version=_ACTIVE_VERSION):
 
     report["distinct_subjects_total"] = len(subjects_seen)
     report["distinct_subjects_by_label"] = {
-        label: len(subject_set)
-        for label, subject_set in report["distinct_subjects_by_label"].items()
+        label: len(subject_set) for label, subject_set in subjects_by_label.items()
     }
     report["distinct_answering_managers"] = len(answering_managers)
     return report
+
+
+# ---------------------------------------------------------------------------
+# Generalized review query — family-neutral admin support
+# ---------------------------------------------------------------------------
+
+def get_review_rows(conn, question_family=None, question_version=None, universal_status=None,
+                     attempt_status=None, interpreter_version=None, provider=None, limit=200):
+    """Return uncertainty+attempt+claims rows for the generalized admin
+    review page, across every family unless filtered. Pure read, no model
+    calls. Presents both Build 1 (legacy taxonomy) and Build 2 (universal
+    status/claims) rows uniformly — legacy rows simply have empty claims and
+    a legacy `conclusion` label instead of `universal_status`.
+    """
+    clauses = ["u.question_family IS NOT NULL", "u.question_version IS NOT NULL"]
+    params = []
+    if question_family:
+        clauses.append("u.question_family = ?")
+        params.append(question_family)
+    if question_version:
+        clauses.append("u.question_version = ?")
+        params.append(question_version)
+
+    rows = conn.execute(
+        "SELECT u.* FROM hearth_worldview_uncertainties u"
+        f" WHERE {' AND '.join(clauses)}"
+        " ORDER BY COALESCE(u.answered_at, u.updated_at) DESC"
+        " LIMIT ?;",
+        params + [limit],
+    ).fetchall()
+
+    results = []
+    for unc in rows:
+        attempts = get_attempts_for_uncertainty(conn, unc["id"])
+        if not attempts:
+            continue
+        accepted = get_current_accepted(conn, unc["id"])
+        latest = attempts[-1]
+        reference = accepted or latest
+
+        if attempt_status and latest["status"] != attempt_status:
+            continue
+        ref_universal = reference["universal_status"] or reference["conclusion"]
+        if universal_status and ref_universal != universal_status:
+            continue
+        if interpreter_version and latest["interpreter_version"] != interpreter_version:
+            continue
+        if provider and reference["provider"] != provider:
+            continue
+
+        claims = get_claims_for_interpretation(conn, reference["id"]) if reference else []
+        results.append({
+            "uncertainty_id": unc["id"],
+            "question_family": unc["question_family"],
+            "question_version": unc["question_version"],
+            "subject_type": unc["subject_type"],
+            "subject_id": unc["subject_id"],
+            "question_text": unc["possible_question"] or unc["uncertainty_text"],
+            "why_it_matters": unc["why_it_matters"],
+            "answer_text": unc["answer_text"],
+            "answered_by": unc["answered_by"],
+            "answered_at": unc["answered_at"],
+            "status": unc["status"],
+            "interpretation_state": latest["status"],
+            "universal_status": ref_universal,
+            "provider": reference["provider"] if reference else None,
+            "model_reason": reference["model_reason"] if reference else None,
+            "validation_result": reference["validation_result"] if reference else None,
+            "validation_reason": reference["validation_reason"] if reference else None,
+            "interpreter_version": latest["interpreter_version"],
+            "failure_category": latest["failure_category"],
+            "failure_detail": latest["failure_detail"],
+            "attempt_count": len(attempts),
+            "last_attempt_at": latest["attempted_at"],
+            "claims": [dict(c) for c in claims],
+            "attempts": [dict(a) for a in attempts],
+        })
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# PART 10/11 — simple structured grouping + durable learning candidates
+# ---------------------------------------------------------------------------
+
+def normalize_claim_group_key(predicate, value, scope):
+    """Conservative structural normalization for grouping — lowercase, trim,
+    collapse whitespace/separators, and a narrow deterministic singular/
+    plural fold. No synonym invention, no embeddings.
+    """
+    def _norm(text):
+        text = _normalize_ws(text or "").lower()
+        text = re.sub(r"[\s\-]+", "_", text)
+        text = re.sub(r"[^\w]", "", text)
+        if len(text) > 4 and text.endswith("s") and not text.endswith("ss"):
+            text = text[:-1]
+        return text
+
+    return _norm(predicate), _norm(value), _norm(scope)
+
+
+def compute_learning_candidates(conn, min_interpretations=None, min_distinct_subjects=None):
+    """Recompute durable learning-candidate rollups from every currently
+    ACCEPTED structured claim. Idempotent — safe to call every Reflection
+    pass. Never deletes an existing candidate, never overwrites a human-set
+    review status; only grows counts/timestamps/membership.
+
+    Duplicate claims from one answer cannot inflate a candidate's count
+    because deterministic_validate() already rejects duplicates within one
+    attempt before they are ever stored as accepted=1. Repeated claims from
+    one subject alone cannot satisfy the distinct-subject threshold because
+    distinct_subject_count is computed over DISTINCT (subject_type,
+    subject_id), not over claim/interpretation rows.
+    """
+    min_interpretations = (
+        HEARTH_LEARNING_CANDIDATE_MIN_INTERPRETATIONS
+        if min_interpretations is None else min_interpretations
+    )
+    min_distinct_subjects = (
+        HEARTH_LEARNING_CANDIDATE_MIN_DISTINCT_SUBJECTS
+        if min_distinct_subjects is None else min_distinct_subjects
+    )
+
+    claim_rows = conn.execute(
+        "SELECT c.*, u.subject_type AS unc_subject_type, u.subject_id AS unc_subject_id,"
+        "       i.is_current_accepted AS interp_is_current_accepted"
+        " FROM hearth_answer_interpretation_claims c"
+        " JOIN hearth_answer_interpretations i ON i.id = c.interpretation_id"
+        " JOIN hearth_worldview_uncertainties u ON u.id = c.uncertainty_id"
+        " WHERE c.accepted = 1 AND i.is_current_accepted = 1;"
+    ).fetchall()
+
+    groups = {}
+    for row in claim_rows:
+        predicate_key, value_key, scope_key = normalize_claim_group_key(
+            row["predicate"], row["value"], row["scope"],
+        )
+        polarity = (row["polarity"] or "unknown").lower()
+        gkey = (row["question_family"], row["question_version"], predicate_key, value_key,
+                polarity, scope_key)
+        g = groups.setdefault(gkey, {"claim_ids": [], "uncertainty_ids": set(), "subjects": set(),
+                                      "sample_conclusion_text": row["conclusion_text"],
+                                      "sample_evidence_quote": row["evidence_quote"]})
+        g["claim_ids"].append(row["id"])
+        g["uncertainty_ids"].add(row["uncertainty_id"])
+        if row["unc_subject_id"] is not None:
+            g["subjects"].add((row["unc_subject_type"], row["unc_subject_id"]))
+
+    now = _now()
+    surfaced = []
+    for (family, version, predicate_key, value_key, polarity, scope_key), g in groups.items():
+        interpretation_count = len(g["uncertainty_ids"])
+        distinct_subject_count = len(g["subjects"])
+        if interpretation_count < min_interpretations or distinct_subject_count < min_distinct_subjects:
+            continue
+
+        existing = conn.execute(
+            "SELECT * FROM hearth_learning_candidates"
+            " WHERE question_family = ? AND question_version = ? AND predicate_key = ?"
+            "   AND value_key = ? AND polarity = ? AND scope_key = ?;",
+            (family, version, predicate_key, value_key, polarity, scope_key),
+        ).fetchone()
+
+        if existing:
+            candidate_id = existing["id"]
+            conn.execute(
+                "UPDATE hearth_learning_candidates"
+                " SET interpretation_count = ?, distinct_subject_count = ?,"
+                "     last_observed_at = ?, updated_at = ?"
+                " WHERE id = ?;",
+                (interpretation_count, distinct_subject_count, now, now, candidate_id),
+            )
+        else:
+            cur = conn.execute(
+                "INSERT INTO hearth_learning_candidates"
+                " (question_family, question_version, predicate_key, value_key, polarity,"
+                "  scope_key, interpretation_count, distinct_subject_count, first_observed_at,"
+                "  last_observed_at, sample_conclusion_text, sample_evidence_quote, status,"
+                "  created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?);",
+                (family, version, predicate_key, value_key, polarity, scope_key,
+                 interpretation_count, distinct_subject_count, now, now,
+                 g["sample_conclusion_text"], g["sample_evidence_quote"], now, now),
+            )
+            candidate_id = cur.lastrowid
+
+        for claim_id in g["claim_ids"]:
+            conn.execute(
+                "INSERT OR IGNORE INTO hearth_learning_candidate_members"
+                " (candidate_id, claim_id, created_at) VALUES (?, ?, ?);",
+                (candidate_id, claim_id, now),
+            )
+
+        surfaced.append(candidate_id)
+
+    conn.commit()
+    return surfaced
+
+
+def get_learning_candidates(conn, question_family=None, question_version=None, status=None):
+    clauses = []
+    params = []
+    if question_family:
+        clauses.append("question_family = ?")
+        params.append(question_family)
+    if question_version:
+        clauses.append("question_version = ?")
+        params.append(question_version)
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    sql = "SELECT * FROM hearth_learning_candidates"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY last_observed_at DESC;"
+    return conn.execute(sql, params).fetchall()
+
+
+def get_learning_candidate_examples(conn, candidate_id, limit=5):
+    """Contributing claim/interpretation examples for one candidate, for
+    human review — joined back to the uncertainty/answer they came from.
+    """
+    return conn.execute(
+        "SELECT c.*, u.possible_question, u.uncertainty_text, u.answer_text, u.answered_by,"
+        "       u.subject_type, u.subject_id"
+        " FROM hearth_learning_candidate_members m"
+        " JOIN hearth_answer_interpretation_claims c ON c.id = m.claim_id"
+        " JOIN hearth_worldview_uncertainties u ON u.id = c.uncertainty_id"
+        " WHERE m.candidate_id = ?"
+        " ORDER BY c.created_at DESC"
+        " LIMIT ?;",
+        (candidate_id, limit),
+    ).fetchall()
+
+
+def set_learning_candidate_status(conn, candidate_id, status):
+    if status not in ("pending", "reviewed", "rejected", "promoted"):
+        raise ValueError(f"invalid learning candidate status: {status!r}")
+    conn.execute(
+        "UPDATE hearth_learning_candidates SET status = ?, updated_at = ? WHERE id = ?;",
+        (status, _now(), candidate_id),
+    )
+    conn.commit()

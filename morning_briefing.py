@@ -2137,8 +2137,9 @@ def run_pipeline(db_path=None, gemini_api_key=None, scan_mode="morning",
                 f" (needs manual review): {r['reason']}"
             )
 
-        # Build 1 of the manager-answer learning loop: bounded, background-only
-        # interpretation of newly answered checkin_feedback_waiting questions.
+        # Manager-answer learning loop: bounded, background-only interpretation
+        # of newly answered questions across EVERY stamped question_family
+        # (Build 2 made this family-agnostic — see hearth_answer_interpreter.py).
         # Never calls a model on the live Ask Hearth path or the answer-save
         # route — only here, in the scheduled Reflection pass — and never
         # raises into it (process_eligible_answers() catches everything
@@ -2148,6 +2149,18 @@ def run_pipeline(db_path=None, gemini_api_key=None, scan_mode="morning",
             hearth_answer_interpreter.process_eligible_answers(memory_conn)
         except Exception as exc:
             print(f"[HEARTH INTERPRETER] batch failed unexpectedly, Reflection continuing: {exc}")
+
+        # Deterministic, model-free rollup of repeated structured claims into
+        # durable learning candidates for human review (Part 11) — never
+        # creates a belief or writes Furniture/State, only surfaces a
+        # candidate row once independent-evidence thresholds are met. Runs
+        # every pass so candidates stay current as new interpretations land;
+        # idempotent (see compute_learning_candidates() docs).
+        try:
+            hearth_answer_interpreter.compute_learning_candidates(memory_conn)
+        except Exception as exc:
+            print(f"[HEARTH INTERPRETER] learning-candidate rollup failed unexpectedly,"
+                  f" Reflection continuing: {exc}")
 
         if not effective_send_brief:
             print("[HEARTH BRIEF] skipped: non-morning scan")
